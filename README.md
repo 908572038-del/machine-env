@@ -4,9 +4,9 @@ A native Windows MCP server that reports observed machine facts to coding
 agents: CPU instruction-set support, installed developer tools, Windows and
 shell details, filesystem paths, and optional network reachability.
 
-The MCP server and probes are implemented in C++17 with no Python runtime
-dependency and no Python process invocation. The PowerShell scripts are Windows
-build/setup glue only; Python may still appear as one of the discovered tools.
+The MCP server and probes are implemented in C++17. The PowerShell scripts are
+used only as Windows build/setup glue; Python may still appear as one of the
+discovered tools.
 
 ## Tools
 
@@ -41,8 +41,7 @@ configuration. It refuses to overwrite malformed JSON. It then starts the
 configured executable, performs the MCP handshake, lists tools, and calls the
 hardware tool over stdio.
 
-The MCP config points directly to the native executable; it needs no Python
-path or Python environment variables.
+The MCP config points directly to the native executable.
 
 ## Cache and latency
 
