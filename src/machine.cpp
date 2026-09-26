@@ -196,6 +196,65 @@ std::wstring search_executable(const wchar_t* name) {
                                         : std::wstring{};
 }
 
+bool is_windows_apps_path(const std::wstring& path) {
+    std::wstring normalized = path;
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                   [](wchar_t ch) { return std::towlower(ch); });
+    return normalized.find(L"\\microsoft\\windowsapps\\") != std::wstring::npos;
+}
+
+bool is_python_install_directory(const std::wstring& name) {
+    std::wstring normalized = name;
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                   [](wchar_t ch) { return std::towlower(ch); });
+    if (normalized.rfind(L"pythoncore", 0) == 0) return true;
+    if (normalized.rfind(L"python", 0) != 0 || normalized.size() <= 6)
+        return false;
+    return std::iswdigit(normalized[6]) != 0;
+}
+
+std::wstring discover_python_executable() {
+    const std::wstring local_app_data = environment_variable(L"LOCALAPPDATA");
+    const std::wstring user_profile = environment_variable(L"USERPROFILE");
+    std::vector<fs::path> roots;
+    if (!local_app_data.empty()) {
+        roots.emplace_back(fs::path(local_app_data) / L"Python");
+        roots.emplace_back(fs::path(local_app_data) / L"Programs" / L"Python");
+        roots.emplace_back(fs::path(local_app_data) / L"anaconda3");
+        roots.emplace_back(fs::path(local_app_data) / L"miniconda3");
+    }
+    if (!user_profile.empty()) {
+        roots.emplace_back(fs::path(user_profile) / L"anaconda3");
+        roots.emplace_back(fs::path(user_profile) / L"miniconda3");
+    }
+
+    for (const auto& root : roots) {
+        const fs::path direct = root / L"python.exe";
+        std::error_code ec;
+        if (fs::is_regular_file(direct, ec)) return direct.wstring();
+
+        ec.clear();
+        std::vector<fs::path> candidates;
+        for (fs::directory_iterator it(root, ec), end; !ec && it != end;
+             it.increment(ec)) {
+            std::error_code entry_error;
+            if (it->is_directory(entry_error) &&
+                is_python_install_directory(it->path().filename().wstring()))
+                candidates.push_back(it->path());
+        }
+        std::sort(candidates.rbegin(), candidates.rend());
+        for (const auto& candidate : candidates) {
+            const fs::path executable = candidate / L"python.exe";
+            ec.clear();
+            if (fs::is_regular_file(executable, ec))
+                return executable.wstring();
+        }
+    }
+
+    const std::wstring on_path = search_executable(L"python.exe");
+    return is_windows_apps_path(on_path) ? std::wstring{} : on_path;
+}
+
 std::wstring visual_studio_root() {
     std::wstring program_files_x86 = environment_variable(L"ProgramFiles(x86)");
     if (program_files_x86.empty())
@@ -704,7 +763,9 @@ Json probe_toolchain() {
     int tool_count = 0;
 
     for (const auto& tool : tools) {
-        std::wstring path = search_executable(tool.second);
+        std::wstring path = tool.first == std::wstring(L"python")
+                                ? discover_python_executable()
+                                : search_executable(tool.second);
         if (path.empty() && tool.first == std::wstring(L"npm"))
             path = search_executable(L"npm.cmd");
         bool off_path = false;

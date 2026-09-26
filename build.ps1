@@ -1,3 +1,7 @@
+param(
+    [string]$BuildDirectory
+)
+
 $ErrorActionPreference = 'Stop'
 
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -24,7 +28,11 @@ if (-not $CMake) {
     throw 'CMake was not found on PATH. Install CMake or Visual Studio CMake tools.'
 }
 
-$BuildDir = Join-Path $Root 'build'
+$BuildDir = if ([string]::IsNullOrWhiteSpace($BuildDirectory)) {
+    Join-Path $Root 'build'
+} else {
+    [System.IO.Path]::GetFullPath($BuildDirectory)
+}
 $Output = Join-Path $BuildDir 'machine-env-cpp.exe'
 
 $Command = 'call "' + $VcVars + '" >nul 2>&1 && "' + $CMake +

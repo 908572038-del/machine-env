@@ -25,12 +25,13 @@ WMI is not used for CPU capabilities.
 ## Build and install
 
 Requirements: Windows x64 and Visual Studio with the C++ workload.
-The build also requires CMake; the installer checks for it before configuring
-the native target.
+Building from source also requires CMake and Ninja. End users can use the
+per-user desktop installer without installing the C++ build tools.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 powershell -ExecutionPolicy Bypass -File .\install.ps1
+powershell -ExecutionPolicy Bypass -File .\build-installer.ps1
 ```
 
 `CMakeLists.txt` defines the C++17 target and Windows system libraries.
@@ -42,6 +43,21 @@ configured executable, performs the MCP handshake, lists tools, and calls the
 hardware tool over stdio.
 
 The MCP config points directly to the native executable.
+
+Tool calls return concise text by default. `get_toolchain` uses a stable,
+memory-friendly format headed by the computer name and machine GUID, followed
+by discovered tool paths in a fixed order; tools found outside PATH are marked.
+Pass `detail: true` to `get_hardware`, `get_toolchain`, `get_environment`,
+`refresh_env`, or `get_cache_status` to receive the full JSON data, including
+cache metadata and detailed CPU/environment fields.
+
+`build-installer.ps1` creates `build\installer\machine-env-cpp-setup.exe`
+using NSIS. The installer is per-user, includes the prebuilt server, registers
+an uninstaller, and adds the MCP entry to the user's Copilot configuration.
+Uninstalling removes only the MCP entry that points to that installation and
+preserves other servers and configuration fields. Close VS Code before
+upgrading an installation that is currently running, then reload VS Code after
+installing or uninstalling to refresh its server list.
 
 ## Cache and latency
 

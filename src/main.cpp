@@ -5,26 +5,199 @@
 
 #include "machine.hpp"
 
+#include <algorithm>
+#include <array>
+#include <cwctype>
 #include <iostream>
+#include <iomanip>
 #include <limits>
+#include <map>
+#include <sstream>
 #include <string>
+#include <utility>
 
 namespace machine_env {
 namespace {
 
-Json text_content(const Json& value) {
+Json text_content(const std::string& text) {
     Json item = Json::object();
     item["type"] = "text";
-    item["text"] = dump_json(value);
+    item["text"] = text;
     Json content = Json::array();
     content.as_array().push_back(item);
     return content;
 }
 
-Json tool_result(Json value) {
+std::string string_field(const Json& value, const std::string& key) {
+    const Json& field = value.get(key);
+    return field.is_string() ? field.as_string() : std::string();
+}
+
+std::string first_line(const std::string& value) {
+    const auto end = value.find_first_of("\r\n");
+    return value.substr(0, end);
+}
+
+bool is_windows_app_alias(const std::string& path) {
+    std::string normalized = path;
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                   [](unsigned char ch) {
+                       return static_cast<char>(std::towlower(ch));
+                   });
+    return normalized.find("\\microsoft\\windowsapps\\") != std::string::npos;
+}
+
+std::string memory_gb(const Json& value, const std::string& key) {
+    const Json& field = value.get(key);
+    if (!field.is_number()) return {};
+    std::ostringstream output;
+    output << std::fixed << std::setprecision(1)
+           << static_cast<double>(field.as_integer()) / 1024.0 << " GB";
+    return output.str();
+}
+
+std::string summarize_toolchain(const Json& value) {
+    std::ostringstream output;
+    output << "## 机器: " << string_field(value, "computer_name") << " ["
+           << string_field(value, "machine_guid") << "]";
+    const Json& tools = value.get("tools");
+    const Json& not_on_path = value.get("not_on_path");
+    static const std::array<std::pair<const char*, const char*>, 12> order{{
+        {"python", "PYTHON"}, {"pip", "PIP"}, {"uv", "UV"}, {"git", "GIT"},
+        {"node", "NODE"}, {"npm", "NPM"}, {"cargo", "CARGO"}, {"go", "GO"},
+        {"java", "JAVA"}, {"cmake", "CMAKE"}, {"ninja", "NINJA"},
+        {"cl", "CL"}}};
+
+    const auto is_off_path = [&not_on_path](const std::string& name) {
+        if (!not_on_path.is_array()) return false;
+        for (const auto& item : not_on_path.as_array()) {
+            if (item.is_string() && item.as_string() == name) return true;
+        }
+        return false;
+    };
+
+    if (tools.is_object()) {
+        for (const auto& tool : order) {
+            const std::string name = tool.first;
+            const std::string path = string_field(tools, name);
+            if (path.empty() || is_windows_app_alias(path)) continue;
+            output << "\n- " << tool.second << " = " << path;
+            if (is_off_path(name)) output << " (不在PATH)";
+        }
+    }
+    return output.str();
+}
+
+std::string summarize_payload(const std::string& name, const Json& value) {
+    if (!value.is_object()) return dump_json(value);
+    if (value.contains("error")) return dump_json(value);
+
+    if (name == "get_hardware" || name == "hardware") {
+        std::ostringstream output;
+        output << "系统配置";
+        const std::string brand = string_field(value, "brand");
+        if (!brand.empty()) output << "\nCPU：" << brand;
+        const Json& memory = value.get("memory");
+        if (memory.is_object()) {
+            const auto total = memory_gb(memory, "total_mem_mb");
+            if (!total.empty()) output << "\n内存：" << total;
+            const Json& cpus = memory.get("logical_cpu");
+            if (cpus.is_number())
+                output << "\n逻辑处理器：" << cpus.as_integer();
+        }
+        const Json& width = value.get("vector_width_bits");
+        if (width.is_number())
+            output << "\n可用向量宽度：" << width.as_integer() << " 位";
+        return output.str();
+    }
+    if (name == "get_toolchain" || name == "toolchain")
+        return summarize_toolchain(value);
+    if (name == "get_environment" || name == "environment") {
+        std::ostringstream output;
+        output << "系统配置";
+        const Json& os = value.get("os");
+        if (os.is_object()) {
+            const std::string caption = string_field(os, "caption");
+            if (!caption.empty()) output << "\n操作系统：" << caption;
+            const std::string version = string_field(os, "version");
+            const Json& build = os.get("build");
+            if (!version.empty()) {
+                output << " " << version;
+                if (build.is_number()) output << " (build " << build.as_integer() << ")";
+            }
+            const std::string arch = string_field(os, "arch");
+            if (!arch.empty()) output << "\n架构：" << arch;
+            const std::string cpu = string_field(os, "cpu_name");
+            if (!cpu.empty()) output << "\nCPU：" << cpu;
+            const auto total = memory_gb(os, "total_mem_mb");
+            if (!total.empty()) output << "\n内存：" << total;
+        }
+        const Json& shell = value.get("shell");
+        if (shell.is_object()) {
+            const std::string version = string_field(shell, "ps_version");
+            const std::string clean_version = first_line(version);
+            if (!clean_version.empty())
+                output << "\nPowerShell：" << clean_version;
+        }
+        const Json& network = value.get("network");
+        if (network.is_object()) {
+            int reachable = 0;
+            for (const auto& endpoint : network.as_object()) {
+                if (endpoint.second.get("ok").is_bool() &&
+                    endpoint.second.get("ok").as_bool())
+                    ++reachable;
+            }
+            output << "\n网络连通性：" << reachable << "/"
+                   << network.as_object().size() << " 个目标可达";
+        }
+        return output.str();
+    }
+    if (name == "get_cache_status") {
+        std::ostringstream output;
+        output << "缓存状态";
+        const Json& categories = value.get("categories");
+        if (categories.is_object()) {
+            static const std::map<std::string, std::string> labels{
+                {"environment", "环境"}, {"hardware", "硬件"},
+                {"toolchain", "开发工具"}};
+            for (const auto& category : categories.as_object()) {
+                const auto label = labels.find(category.first);
+                output << "\n"
+                       << (label == labels.end() ? category.first : label->second)
+                       << "：" << string_field(category.second, "reason");
+            }
+        }
+        return output.str();
+    }
+    if (name == "refresh_env") {
+        std::ostringstream output;
+        output << "环境刷新结果";
+        for (const auto& category : {
+                 std::pair<const char*, const char*>{"hardware", "硬件"},
+                 {"toolchain", "开发工具"},
+                 {"environment", "系统环境"}}) {
+            const Json& item = value.get(category.first);
+            if (item.is_object())
+                output << "\n\n" << category.second << "\n"
+                       << summarize_payload(category.first, item);
+        }
+        return output.str();
+    }
+    return dump_json(value);
+}
+
+Json tool_result(const std::string& name, Json value, bool detail) {
     Json result = Json::object();
-    result["content"] = text_content(value);
-    result["structuredContent"] = value;
+    if (detail) {
+        result["content"] = text_content(dump_json(value));
+        result["structuredContent"] = value;
+    } else {
+        const std::string summary = summarize_payload(name, value);
+        Json compact = Json::object();
+        compact["summary"] = summary;
+        result["content"] = text_content(summary);
+        result["structuredContent"] = compact;
+    }
     return result;
 }
 
@@ -65,6 +238,8 @@ Json tools() {
     Json hardware = object_schema();
     hardware["properties"]["refresh"] =
         boolean_schema("Bypass the cache and re-probe.");
+    hardware["properties"]["detail"] =
+        boolean_schema("Return the full JSON result instead of a concise summary.");
     list.as_array().push_back(tool_definition(
         "get_hardware",
         "CPU identity and OS-usable ISA capabilities from CPUID/XCR0, plus memory.",
@@ -73,6 +248,8 @@ Json tools() {
     Json toolchain = object_schema();
     toolchain["properties"]["refresh"] =
         boolean_schema("Bypass the cache and re-probe.");
+    toolchain["properties"]["detail"] =
+        boolean_schema("Return the full JSON result instead of a concise summary.");
     list.as_array().push_back(tool_definition(
         "get_toolchain",
         "Locate installed compilers, interpreters, and developer tools.",
@@ -81,6 +258,8 @@ Json tools() {
     Json environment = object_schema();
     environment["properties"]["refresh"] =
         boolean_schema("Bypass the cache and re-probe.");
+    environment["properties"]["detail"] =
+        boolean_schema("Return the full JSON result instead of a concise summary.");
     environment["properties"]["include_network"] = boolean_schema(
         "Check GitHub, Hugging Face, and PyPI reachability. False skips network.");
     list.as_array().push_back(tool_definition(
@@ -95,10 +274,14 @@ Json tools() {
         scope_enum.as_array().emplace_back(name);
     scope["enum"] = scope_enum;
     refresh["properties"]["scope"] = scope;
+    refresh["properties"]["detail"] =
+        boolean_schema("Return full JSON results instead of concise summaries.");
     list.as_array().push_back(tool_definition(
         "refresh_env", "Force a fresh probe for one or all categories.", refresh));
 
     Json status = object_schema();
+    status["properties"]["detail"] =
+        boolean_schema("Return the full cache metadata.");
     list.as_array().push_back(tool_definition(
         "get_cache_status", "Report per-category cache freshness.", status));
     return list;
@@ -207,9 +390,13 @@ Json dispatch(const Json& request, bool& has_response) {
 
         Json payload;
         std::string validation_error;
+        bool detail = false;
         bool refresh = false;
         if (name == "get_hardware" || name == "get_toolchain" ||
             name == "get_environment") {
+            if (!optional_boolean(arguments, "detail", false, detail,
+                                  validation_error))
+                return rpc_error(id, -32602, validation_error);
             if (!optional_boolean(arguments, "refresh", false, refresh,
                                   validation_error))
                 return rpc_error(id, -32602, validation_error);
@@ -225,6 +412,9 @@ Json dispatch(const Json& request, bool& has_response) {
                                        refresh, true);
             }
         } else if (name == "refresh_env") {
+            if (!optional_boolean(arguments, "detail", false, detail,
+                                  validation_error))
+                return rpc_error(id, -32602, validation_error);
             std::string scope = "all";
             if (arguments.contains("scope")) {
                 const Json& value = arguments.get("scope");
@@ -234,6 +424,9 @@ Json dispatch(const Json& request, bool& has_response) {
             }
             payload = refresh_environment(scope);
         } else if (name == "get_cache_status") {
+            if (!optional_boolean(arguments, "detail", false, detail,
+                                  validation_error))
+                return rpc_error(id, -32602, validation_error);
             payload = probe_cache_status();
         } else {
             return rpc_error(id, -32602, "unknown tool: " + name);
@@ -242,7 +435,7 @@ Json dispatch(const Json& request, bool& has_response) {
         Json response = Json::object();
         response["jsonrpc"] = "2.0";
         response["id"] = id;
-        response["result"] = tool_result(payload);
+        response["result"] = tool_result(name, std::move(payload), detail);
         return response;
     }
     if (method == "resources/list") {
@@ -309,6 +502,35 @@ int selftest() {
     if (!has_response ||
         listing.get("result").get("tools").as_array().size() != 5)
         throw std::runtime_error("MCP tools/list dispatch test failed");
+    const Json summary = tool_result("get_hardware", hardware, false);
+    if (!summary.get("structuredContent").get("summary").is_string() ||
+        summary.get("structuredContent").get("summary").as_string().find("CPU：") ==
+            std::string::npos ||
+        dump_json(summary).size() >= dump_json(hardware).size())
+        throw std::runtime_error("concise hardware summary test failed");
+    const Json detailed = tool_result("get_hardware", hardware, true);
+    if (!detailed.get("structuredContent").get("isa").is_object())
+        throw std::runtime_error("detailed tool result test failed");
+    Json sample_toolchain = Json::object();
+    sample_toolchain["computer_name"] = "TEST-PC";
+    sample_toolchain["machine_guid"] = "test-guid";
+    sample_toolchain["tools"]["cl"] = "C:\\VS\\cl.exe";
+    sample_toolchain["tools"]["git"] = "C:\\Git\\git.exe";
+    sample_toolchain["tools"]["python"] =
+        "C:\\Python\\python.exe";
+    sample_toolchain["tools"]["node"] =
+        "C:\\Users\\Test\\AppData\\Local\\Microsoft\\WindowsApps\\node.exe";
+    sample_toolchain["not_on_path"] = Json::array();
+    sample_toolchain["not_on_path"].as_array().emplace_back("cl");
+    const std::string toolchain_summary =
+        summarize_payload("get_toolchain", sample_toolchain);
+    const std::string expected_toolchain_summary =
+        "## 机器: TEST-PC [test-guid]\n"
+        "- PYTHON = C:\\Python\\python.exe\n"
+        "- GIT = C:\\Git\\git.exe\n"
+        "- CL = C:\\VS\\cl.exe (不在PATH)";
+    if (toolchain_summary != expected_toolchain_summary)
+        throw std::runtime_error("toolchain memory format/order test failed");
 
     std::cout << "JSON parser: OK\n";
     std::cout << "CPUID probe: " << hardware.get("brand").as_string() << "\n";
@@ -316,6 +538,8 @@ int selftest() {
     std::cout << "Cache write/read: OK\n";
     std::cout << "MCP initialize: OK\n";
     std::cout << "MCP tools/list: OK\n";
+    std::cout << "Concise and detailed tool results: OK\n";
+    std::cout << "Toolchain memory format and order: OK\n";
     std::cout << "Protocol negotiation: OK\n";
     std::cout << "SELFTEST: PASS\n";
     return 0;

@@ -100,7 +100,7 @@ $requests = @(
         jsonrpc = '2.0'
         id = 3
         method = 'tools/call'
-        params = @{ name = 'get_hardware'; arguments = @{} }
+        params = @{ name = 'get_hardware'; arguments = @{ detail = $true } }
     } | ConvertTo-Json -Depth 20 -Compress),
     ([ordered]@{
         jsonrpc = '2.0'
@@ -108,7 +108,7 @@ $requests = @(
         method = 'tools/call'
         params = @{
             name = 'get_environment'
-            arguments = @{ include_network = $false }
+            arguments = @{ include_network = $false; detail = $true }
         }
     } | ConvertTo-Json -Depth 20 -Compress)
 )
