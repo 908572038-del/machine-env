@@ -31,8 +31,12 @@ if (-not (Test-Path $vcvars)) {
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $out) | Out-Null
 
 # /MT keeps the CRT static so the exe runs without redistributable concerns.
+# /Fo pins the object file next to the binary: without it cl.exe writes the .obj
+# into the *caller's* working directory, which scattered build artefacts into the
+# repository root when install.ps1 invoked this script from there.
+$obj = Join-Path (Split-Path -Parent $out) 'probe_hw.obj'
 $cmd = 'call "' + $vcvars + '" >nul 2>&1 && cl /nologo /O2 /MT /EHsc /W4 /std:c++17 "' +
-       $src + '" /Fe:"' + $out + '"'
+       $src + '" /Fo:"' + $obj + '" /Fe:"' + $out + '"'
 
 & $env:ComSpec /c $cmd
 if ($LASTEXITCODE -ne 0) {
@@ -40,8 +44,12 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
-# cl drops object files next to the source by default; keep the tree clean.
-Get-ChildItem $here -Filter '*.obj' -File -ErrorAction SilentlyContinue | Remove-Item -Force
+# Sweep strays from earlier builds that predate the /Fo pinning above.
+foreach ($dir in @($here, (Split-Path -Parent $here), (Get-Location).Path)) {
+    Get-ChildItem $dir -Filter '*.obj' -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -ne $obj } |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+}
 
 if (Test-Path $out) {
     Write-Host "Built: $out"

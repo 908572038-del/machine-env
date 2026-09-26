@@ -331,17 +331,64 @@ def probe_environment(*, include_network: bool = True) -> dict[str, Any]:
     return data
 
 
+def _is_cacheable(kind: str, payload: dict[str, Any]) -> tuple[bool, str]:
+    """Decide whether a probe result is worth persisting.
+
+    A probe can succeed yet return a degraded result — for example the
+    toolchain sweep run while its script was being overwritten returned 4/12
+    tools with no `error` key. Caching that pinned the bad answer for the whole
+    TTL, and the cache looked healthy because the fingerprint still matched.
+    """
+    if "error" in payload:
+        return False, payload["error"]
+
+    if kind == "hardware":
+        # A real CPUID probe always reports a brand and an ISA table.
+        if not payload.get("brand") or not payload.get("isa"):
+            return False, "missing brand or isa"
+        return True, ""
+
+    if kind == "toolchain":
+        found = payload.get("tool_count")
+        total = payload.get("tool_total")
+        if not isinstance(found, int) or not isinstance(total, int) or total <= 0:
+            return False, "missing tool counts"
+        # Python is the floor: without it nothing else in this project runs, and
+        # its absence means the sweep ran in a broken environment.
+        if "python" not in (payload.get("tools") or {}):
+            return False, "python not found — probe ran in a broken environment"
+        # vswhere only returns empty when the sweep ran in a degraded
+        # environment. A machine with Visual Studio installed always resolves
+        # it, and this machine has it, so an empty value means the sweep was
+        # incomplete rather than that no compiler exists.
+        if not payload.get("vs_path"):
+            return False, "vs_path empty — vswhere did not resolve"
+        return True, ""
+
+    if kind == "environment":
+        if not payload.get("os") or not payload.get("paths"):
+            return False, "missing os or paths"
+        return True, ""
+
+    return True, ""
+
+
 def _cached(kind: str, probe, ttl: int = DEFAULT_TTL_SECONDS) -> dict[str, Any]:
     payload, meta = _read_cache(kind, ttl)
     if payload is not None:
         payload["_cache"] = meta
         return payload
     fresh = probe()
-    # Never cache a failed probe: a transient error would otherwise be pinned
-    # for the full TTL.
-    if "error" not in fresh:
+    cacheable, reason = _is_cacheable(kind, fresh)
+    if cacheable:
         _write_cache(kind, fresh)
-    fresh["_cache"] = meta
+    else:
+        # Surface why the result is not persisted, so a degraded probe is
+        # visible rather than silently repeated on every call.
+        fresh.setdefault("_cache", {})
+        fresh["_cache"]["cached"] = False
+        fresh["_cache"]["not_cached_because"] = reason
+    fresh["_cache"] = meta | fresh.get("_cache", {})
     return fresh
 
 
@@ -359,7 +406,7 @@ def get_hardware(refresh: bool = False) -> dict[str, Any]:
     """
     if refresh:
         fresh = probe_hardware()
-        if "error" not in fresh:
+        if _is_cacheable("hardware", fresh)[0]:
             _write_cache("hardware", fresh)
         return fresh
     return _cached("hardware", probe_hardware)
@@ -375,7 +422,7 @@ def get_toolchain(refresh: bool = False) -> dict[str, Any]:
     """
     if refresh:
         fresh = probe_toolchain()
-        if "error" not in fresh:
+        if _is_cacheable("toolchain", fresh)[0]:
             _write_cache("toolchain", fresh)
         return fresh
     return _cached("toolchain", probe_toolchain)
@@ -390,7 +437,7 @@ def get_environment(refresh: bool = False) -> dict[str, Any]:
     """
     if refresh:
         fresh = probe_environment()
-        if "error" not in fresh:
+        if _is_cacheable("environment", fresh)[0]:
             _write_cache("environment", fresh)
         return fresh
     return _cached("environment", probe_environment, ttl=NETWORK_TTL_SECONDS)
@@ -409,19 +456,19 @@ def refresh_env(scope: str = "all") -> dict[str, Any]:
     out: dict[str, Any] = {"scope": scope, "refreshed": []}
     if scope in ("all", "hardware"):
         r = probe_hardware()
-        if "error" not in r:
+        if _is_cacheable("hardware", r)[0]:
             _write_cache("hardware", r)
             out["refreshed"].append("hardware")
         out["hardware"] = r
     if scope in ("all", "toolchain"):
         r = probe_toolchain()
-        if "error" not in r:
+        if _is_cacheable("toolchain", r)[0]:
             _write_cache("toolchain", r)
             out["refreshed"].append("toolchain")
         out["toolchain"] = r
     if scope in ("all", "environment"):
         r = probe_environment()
-        if "error" not in r:
+        if _is_cacheable("environment", r)[0]:
             _write_cache("environment", r)
             out["refreshed"].append("environment")
         out["environment"] = r
