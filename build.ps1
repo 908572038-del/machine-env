@@ -25,7 +25,7 @@ if (-not $CMake) {
 }
 
 $BuildDir = Join-Path $Root 'build'
-$Output = Join-Path $BuildDir 'machine-env.exe'
+$Output = Join-Path $BuildDir 'machine-env-cpp.exe'
 
 $Command = 'call "' + $VcVars + '" >nul 2>&1 && "' + $CMake +
     '" -S "' + $Root + '" -B "' + $BuildDir +

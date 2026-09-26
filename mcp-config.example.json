@@ -1,8 +1,8 @@
 {
   "mcpServers": {
-    "machine-env": {
+    "machine-env-cpp": {
       "type": "stdio",
-      "command": "C:\\path\\to\\mcp-machine-env\\build\\machine-env.exe",
+      "command": "C:\\path\\to\\mcp-machine-env\\build\\machine-env-cpp.exe",
       "env": {}
     }
   }

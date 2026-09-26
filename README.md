@@ -1,4 +1,4 @@
-# machine-env MCP server
+# machine-env-cpp MCP server
 
 A native Windows MCP server that reports observed machine facts to coding
 agents: CPU instruction-set support, installed developer tools, Windows and
@@ -35,7 +35,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 `CMakeLists.txt` defines the C++17 target and Windows system libraries.
 `build.ps1` locates Visual Studio and Ninja, configures/builds with CMake,
-produces `build\machine-env.exe`, and runs its native self-test. `install.ps1` updates
+produces `build\machine-env-cpp.exe`, and runs its native self-test. `install.ps1` updates
 `~\.copilot\mcp-config.json`, preserving other servers and backing up the prior
 configuration. It refuses to overwrite malformed JSON. It then starts the
 configured executable, performs the MCP handshake, lists tools, and calls the

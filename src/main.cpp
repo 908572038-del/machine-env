@@ -166,7 +166,7 @@ Json dispatch(const Json& request, bool& has_response) {
         result["protocolVersion"] =
             supported ? requested_version : "2025-11-25";
         result["capabilities"]["tools"]["listChanged"] = false;
-        result["serverInfo"]["name"] = "machine-env";
+        result["serverInfo"]["name"] = "machine-env-cpp";
         result["serverInfo"]["version"] = "0.2.0";
         result["instructions"] =
             "Observed Windows machine facts: CPU ISA, toolchain, OS, shell, paths, "
@@ -299,7 +299,9 @@ int selftest() {
     const Json init = dispatch(
         parse_json(R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}})"),
         has_response);
-    if (!has_response || !init.get("result").get("serverInfo").is_object())
+    if (!has_response ||
+        init.get("result").get("serverInfo").get("name").as_string() !=
+            "machine-env-cpp")
         throw std::runtime_error("MCP initialize dispatch test failed");
     const Json listing = dispatch(
         parse_json(R"({"jsonrpc":"2.0","id":2,"method":"tools/list"})"),
@@ -329,19 +331,19 @@ int wmain(int argc, wchar_t** argv) {
 
     try {
         if (argc > 1 && std::wstring(argv[1]) == L"--version") {
-            std::cout << "machine-env 0.2.0\n";
+            std::cout << "machine-env-cpp 0.2.0\n";
             return 0;
         }
         if (argc > 1 && std::wstring(argv[1]) == L"--selftest")
             return selftest();
 
-        std::cerr << "machine-env MCP server ready (fingerprint "
+        std::cerr << "machine-env-cpp MCP server ready (fingerprint "
                   << source_fingerprint() << ")\n";
         std::string line;
         while (std::getline(std::cin, line)) {
             if (line.empty()) continue;
             if (line.size() > 8 * 1024 * 1024) {
-                std::cerr << "machine-env: rejected oversized JSON-RPC message\n";
+                std::cerr << "machine-env-cpp: rejected oversized JSON-RPC message\n";
                 continue;
             }
             try {
@@ -362,7 +364,7 @@ int wmain(int argc, wchar_t** argv) {
             }
         }
     } catch (const std::exception& error) {
-        std::cerr << "machine-env fatal: " << error.what() << '\n';
+        std::cerr << "machine-env-cpp fatal: " << error.what() << '\n';
         return 1;
     }
     return 0;

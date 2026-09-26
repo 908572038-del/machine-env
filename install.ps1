@@ -2,6 +2,8 @@ $ErrorActionPreference = 'Stop'
 
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $Root
+$serverName = 'machine-env-cpp'
+$previousServerName = 'machine-env'
 
 function Write-Step([string]$Text) {
     Write-Host "`n== $Text" -ForegroundColor Cyan
@@ -17,7 +19,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "Native build failed with exit code $LASTEXITCODE"
 }
 
-$server = Join-Path $Root 'build\machine-env.exe'
+$server = Join-Path $Root 'build\machine-env-cpp.exe'
 if (-not (Test-Path -LiteralPath $server)) {
     throw "Native MCP server was not produced: $server"
 }
@@ -51,10 +53,11 @@ if (Test-Path -LiteralPath $configPath) {
 $servers = [ordered]@{}
 if ($existing -and $existing.mcpServers) {
     foreach ($property in $existing.mcpServers.PSObject.Properties) {
+        if ($property.Name -eq $previousServerName) { continue }
         $servers[$property.Name] = $property.Value
     }
 }
-$servers['machine-env'] = [ordered]@{
+$servers[$serverName] = [ordered]@{
     type = 'stdio'
     command = $server
     env = [ordered]@{}
@@ -153,7 +156,7 @@ try {
         $byId[[string]$response.id] = $response
     }
     $initialize = $byId['1']
-    if ($initialize.result.serverInfo.name -ne 'machine-env') {
+    if ($initialize.result.serverInfo.name -ne $serverName) {
         throw "Unexpected MCP server identity: $($initialize | ConvertTo-Json -Compress -Depth 6)"
     }
     $listing = $byId['2']
@@ -186,4 +189,4 @@ try {
     Remove-Item -LiteralPath $wirePath -Force -ErrorAction SilentlyContinue
 }
 
-Write-Host "`nINSTALL COMPLETE — native C++ MCP is configured." -ForegroundColor Green
+Write-Host "`nINSTALL COMPLETE — machine-env-cpp MCP is configured." -ForegroundColor Green
