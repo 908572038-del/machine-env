@@ -1,0 +1,5 @@
+# machine-env MCP server dependencies
+#
+# mcp 2.x renamed FastMCP -> MCPServer; server.py handles both via a
+# try/except import, so either major version works.
+mcp>=1.2

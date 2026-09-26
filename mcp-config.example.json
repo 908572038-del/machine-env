@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "machine-env": {
+      "type": "stdio",
+      "command": "D:\\ai记忆设置\\mcp-machine-env\\machine-env.cmd",
+      "env": {
+        "PYTHONUTF8": "1",
+        "PYTHONUNBUFFERED": "1"
+      }
+    }
+  }
+}
