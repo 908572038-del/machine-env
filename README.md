@@ -5,8 +5,8 @@ agents: CPU instruction-set support, installed developer tools, Windows and
 shell details, filesystem paths, and optional network reachability.
 
 The MCP server and probes are implemented in C++17. The PowerShell scripts are
-used only as Windows build/setup glue; Python may still appear as one of the
-discovered tools.
+used as Windows build/setup glue, and the server can discover installed
+development tools and other relevant environment details.
 
 ## Tools
 
