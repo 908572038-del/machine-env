@@ -161,22 +161,43 @@ foreach ($t in $targets) {
 # --------------------------------------------------------------------------- #
 Write-Step 'Verifying end to end'
 
-# Invoke through cmd so the launcher itself is exercised, not just the script.
-# stderr is merged deliberately: the server logs its startup line there, so a
-# native-command failure must be judged by the exit code, not by output noise.
+# The server writes its startup line to stderr, which PowerShell surfaces as a
+# NativeCommandError and can abort the script before the result is read. Send
+# everything to a file instead, then judge by the sentinel the verifier prints.
 $verify = Join-Path $Root 'verify_config.py'
-$out = & $py.Exe $verify 2>&1
-$verifyExit = $LASTEXITCODE
-$out | Where-Object {
-    $_ -notmatch 'NativeCommandError|CategoryInfo|FullyQualifiedErrorId|^\+ |^At line'
-}
+$logFile = Join-Path $env:TEMP "machine-env-verify-$PID.log"
+
+$psi = New-Object System.Diagnostics.ProcessStartInfo
+$psi.FileName = $py.Exe
+$psi.Arguments = '"' + $verify + '"'
+$psi.RedirectStandardOutput = $true
+$psi.RedirectStandardError = $true
+$psi.UseShellExecute = $false
+$psi.WorkingDirectory = $Root
+$psi.EnvironmentVariables['PYTHONUTF8'] = '1'
+
+$proc = [System.Diagnostics.Process]::Start($psi)
+$stdout = $proc.StandardOutput.ReadToEnd()
+$stderr = $proc.StandardError.ReadToEnd()
+$proc.WaitForExit()
+$verifyExit = $proc.ExitCode
+
+$combined = @($stdout -split "`r?`n") + @($stderr -split "`r?`n")
+$combined | Set-Content $logFile -Encoding UTF8
+
+$combined | Where-Object { $_ -match '\S' } | ForEach-Object { Write-Host "   $_" }
+
+$passed = @($combined | Where-Object { $_ -match 'RESULT: CONFIG VERIFIED' }).Count -gt 0
 
 Write-Host ''
-if ($verifyExit -eq 0) {
+if ($passed) {
     Write-Host 'INSTALL COMPLETE' -ForegroundColor Green
     Write-Host 'The machine-env tools appear in new chat sessions.'
-} else {
-    Write-Warn2 "verification exited $verifyExit — inspect the output above."
+    Remove-Item $logFile -Force -ErrorAction SilentlyContinue
+    exit 0
 }
 
-exit $verifyExit
+Write-Warn2 "Verification failed (exit $verifyExit). Full log: $logFile"
+$combined | Where-Object { $_ -match '^FAIL|^Traceback|^json\.|Error:' } |
+    Select-Object -First 5 | ForEach-Object { Write-Host "   $_" }
+exit 1

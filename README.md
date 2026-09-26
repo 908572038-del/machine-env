@@ -41,16 +41,21 @@ mcp-machine-env/
 
 ## Install
 
+The repository is public, so installation needs no credentials.
+
 ```powershell
-git clone <this-repo> mcp-machine-env
-cd mcp-machine-env
-powershell -ExecutionPolicy Bypass -File install.ps1
+$dst = "$env:USERPROFILE\.machine-env"
+git clone --depth 1 https://github.com/908572038-del/machine-env.git $dst
+powershell -ExecutionPolicy Bypass -File "$dst\install.ps1"
 ```
 
 `install.ps1` is idempotent and does everything: finds a real Python (rejecting
 the Microsoft Store stub), installs `mcp` if missing, builds the native probe,
 merges the MCP entry into `~/.copilot/mcp-config.json` (backing up any previous
 version), and verifies the result end to end.
+
+The clone destination is arbitrary — `install.ps1` resolves its own location, so
+the repository can live anywhere. `~/.machine-env` is only a convention.
 
 Manual equivalent:
 
@@ -60,6 +65,13 @@ powershell -ExecutionPolicy Bypass -File native\build.ps1
 py server.py --selftest      # tool logic + cache behaviour
 py verify_config.py          # the configuration VS Code will actually read
 ```
+
+### Automated install from an agent
+
+`~/.copilot/instructions/本机环境.instructions.md` tells an agent to install this
+server when its tools are missing: clone, run `install.ps1`, then tell the user
+to start a new conversation. The last step is required — MCP configuration is
+read at session start, so the current session cannot see newly registered tools.
 
 ## Configure VS Code
 
