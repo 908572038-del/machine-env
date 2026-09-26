@@ -21,6 +21,7 @@
 #include <map>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace machine_env {
@@ -141,6 +142,21 @@ ProcessResult run_process(const std::wstring& executable,
         return result;
     }
 
+    std::string bytes;
+    std::thread reader([&] {
+        std::array<char, 4096> buffer{};
+        DWORD read = 0;
+        while (ReadFile(read_pipe, buffer.data(),
+                        static_cast<DWORD>(buffer.size()), &read, nullptr) &&
+               read) {
+            if (bytes.size() < 1024 * 1024) {
+                const std::size_t remaining = 1024 * 1024 - bytes.size();
+                bytes.append(buffer.data(),
+                             std::min<std::size_t>(read, remaining));
+            }
+        }
+    });
+
     const DWORD wait = WaitForSingleObject(process.hProcess, timeout_ms);
     if (wait == WAIT_TIMEOUT) {
         TerminateProcess(process.hProcess, ERROR_TIMEOUT);
@@ -150,19 +166,9 @@ ProcessResult run_process(const std::wstring& executable,
         result.error = "process wait failed";
     }
     GetExitCodeProcess(process.hProcess, &result.exit_code);
-
-    std::string bytes;
-    std::array<char, 4096> buffer{};
-    DWORD read = 0;
-    while (ReadFile(read_pipe, buffer.data(),
-                    static_cast<DWORD>(buffer.size()), &read, nullptr) &&
-           read) {
-        bytes.append(buffer.data(), read);
-        if (bytes.size() > 1024 * 1024) {
-            result.error = "process output exceeded 1 MiB";
-            break;
-        }
-    }
+    reader.join();
+    if (bytes.size() >= 1024 * 1024 && result.error.empty())
+        result.error = "process output exceeded 1 MiB";
     CloseHandle(read_pipe);
     CloseHandle(process.hThread);
     CloseHandle(process.hProcess);

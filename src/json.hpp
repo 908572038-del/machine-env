@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cmath>
 #include <cstdio>
 #include <cstddef>
 #include <cstdlib>
@@ -314,7 +315,8 @@ private:
             }
             std::size_t used = 0;
             const double number = std::stod(token, &used);
-            if (used != token.size()) fail("invalid number");
+            if (used != token.size() || !std::isfinite(number))
+                fail("invalid number");
             return number;
         } catch (const std::exception&) {
             fail("invalid number");
@@ -363,6 +365,8 @@ inline void serialize_json(const Json& json, std::string& out) {
     } else if (std::holds_alternative<std::int64_t>(json.value)) {
         out += std::to_string(std::get<std::int64_t>(json.value));
     } else if (std::holds_alternative<double>(json.value)) {
+        if (!std::isfinite(std::get<double>(json.value)))
+            throw std::runtime_error("cannot serialize non-finite JSON number");
         std::ostringstream stream;
         stream << std::setprecision(17) << std::get<double>(json.value);
         out += stream.str();
