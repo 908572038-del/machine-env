@@ -1,18 +1,8 @@
 # Build output
-native/build/
+build/
 *.exe
 *.obj
 *.pdb
-
-# Per-machine probe cache. Keyed on MachineGuid, so it is meaningless on
-# another machine and would only cause noise in diffs.
-cache/
-
-# Python
-__pycache__/
-*.py[cod]
-.venv/
-venv/
 
 # Editor
 .vscode/

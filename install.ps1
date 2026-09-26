@@ -1,203 +1,189 @@
-# install.ps1 — one-time setup for the machine-env MCP server.
-#
-# Idempotent: safe to re-run after `git pull`.
-#
-# What it does:
-#   1. Checks for a usable Python (the Microsoft Store stub does not count).
-#   2. Installs the `mcp` package if missing.
-#   3. Builds the native CPUID probe if it is missing or out of date.
-#   4. Writes the MCP configuration, using the launcher so the entry is
-#      machine-independent and safe to sync.
-#   5. Runs an end-to-end verification.
-
 $ErrorActionPreference = 'Stop'
 
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $Root
 
-function Write-Step([string]$Text) { Write-Host "`n== $Text" -ForegroundColor Cyan }
-function Write-Ok([string]$Text)   { Write-Host "   OK  $Text" -ForegroundColor Green }
-function Write-Warn2([string]$Text) { Write-Host "   !!  $Text" -ForegroundColor Yellow }
-function Write-Err([string]$Text)  { Write-Host "   XX  $Text" -ForegroundColor Red }
-
-# --------------------------------------------------------------------------- #
-Write-Step 'Locating Python'
-
-function Resolve-Python {
-    # py.exe resolves real installations and ignores the Store stub.
-    $candidates = @()
-    if ($env:MACHINE_ENV_PYTHON) { $candidates += $env:MACHINE_ENV_PYTHON }
-    if (Test-Path "$env:SystemRoot\py.exe") { $candidates += "$env:SystemRoot\py.exe" }
-    $onPath = Get-Command python -ErrorAction SilentlyContinue
-    if ($onPath) { $candidates += $onPath.Source }
-
-    foreach ($c in $candidates) {
-        try {
-            $exe = & $c -c "import sys; print(sys.executable)" 2>$null
-            if (-not $exe) { continue }
-            $exe = $exe.Trim()
-            # The Store stub lives under WindowsApps and cannot import packages.
-            if ($exe -like '*\WindowsApps\*') {
-                Write-Warn2 "skipping Store stub: $exe"
-                continue
-            }
-            return @{ Launcher = $c; Exe = $exe }
-        } catch { continue }
-    }
-    return $null
+function Write-Step([string]$Text) {
+    Write-Host "`n== $Text" -ForegroundColor Cyan
 }
 
-$py = Resolve-Python
-if (-not $py) {
-    Write-Err 'No usable Python found.'
-    Write-Host '   Install Python 3.10+ from https://python.org, or set MACHINE_ENV_PYTHON.'
-    exit 1
+function Write-Ok([string]$Text) {
+    Write-Host "   OK  $Text" -ForegroundColor Green
 }
-Write-Ok "interpreter : $($py.Exe)"
-Write-Ok "via         : $($py.Launcher)"
 
-# --------------------------------------------------------------------------- #
-Write-Step 'Checking the mcp package'
-
-& $py.Launcher -c "import mcp" 2>$null
+Write-Step 'Building native C++ MCP server'
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Root 'build.ps1')
 if ($LASTEXITCODE -ne 0) {
-    Write-Host '   installing mcp...'
-    & $py.Launcher -m pip install --quiet "mcp>=1.2"
-    if ($LASTEXITCODE -ne 0) {
-        Write-Err 'pip install failed.'
-        exit 1
+    throw "Native build failed with exit code $LASTEXITCODE"
+}
+
+$server = Join-Path $Root 'build\machine-env.exe'
+if (-not (Test-Path -LiteralPath $server)) {
+    throw "Native MCP server was not produced: $server"
+}
+
+Write-Step 'Updating VS Code MCP configuration'
+$configPath = Join-Path $env:USERPROFILE '.copilot\mcp-config.json'
+$configDir = Split-Path -Parent $configPath
+if (-not (Test-Path -LiteralPath $configDir)) {
+    New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+}
+
+$existing = $null
+if (Test-Path -LiteralPath $configPath) {
+    try {
+        $existing = Get-Content -LiteralPath $configPath -Raw |
+            ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        throw "Refusing to overwrite invalid MCP config '$configPath': $($_.Exception.Message)"
+    }
+    if ($null -eq $existing -or $existing -is [array]) {
+        throw "Refusing to overwrite '$configPath': expected a JSON object."
+    }
+    if ($existing.PSObject.Properties.Name -contains 'mcpServers' -and
+        $null -ne $existing.mcpServers -and
+        $existing.mcpServers -isnot [System.Management.Automation.PSCustomObject]) {
+        throw "Refusing to overwrite '$configPath': 'mcpServers' must be a JSON object."
+    }
+    Copy-Item -LiteralPath $configPath -Destination "$configPath.bak" -Force
+}
+
+$servers = [ordered]@{}
+if ($existing -and $existing.mcpServers) {
+    foreach ($property in $existing.mcpServers.PSObject.Properties) {
+        $servers[$property.Name] = $property.Value
     }
 }
-$mcpVer = (& $py.Launcher -c "import mcp; print(getattr(mcp,'__version__','?'))" 2>$null).Trim()
-Write-Ok "mcp $mcpVer"
-
-# --------------------------------------------------------------------------- #
-Write-Step 'Building the native CPUID probe'
-
-$bin = Join-Path $Root 'native\build\probe_hw.exe'
-$src = Join-Path $Root 'native\probe_hw.cpp'
-$needsBuild = -not (Test-Path $bin)
-if (-not $needsBuild) {
-    # Rebuild when the source is newer than the binary.
-    $needsBuild = (Get-Item $src).LastWriteTime -gt (Get-Item $bin).LastWriteTime
+$servers['machine-env'] = [ordered]@{
+    type = 'stdio'
+    command = $server
+    env = [ordered]@{}
 }
 
-if ($needsBuild) {
-    Write-Host '   compiling...'
-    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Root 'native\build.ps1') | Out-Null
-    if (-not (Test-Path $bin)) {
-        Write-Err 'Build failed. get_hardware will report an error until this is fixed.'
-        Write-Host '   Needs Visual Studio with the C++ workload.'
-    } else {
-        Write-Ok 'probe_hw.exe built'
-    }
-} else {
-    Write-Ok 'probe_hw.exe is up to date'
-}
-
-# --------------------------------------------------------------------------- #
-Write-Step 'Writing MCP configuration'
-
-# The `command` is the launcher next to this script, so the entry contains no
-# machine-specific paths and can be synced across devices as-is.
-$launcher = Join-Path $Root 'machine-env.cmd'
-if (-not (Test-Path $launcher)) {
-    Write-Err "launcher missing: $launcher"
-    exit 1
-}
-
-$config = [ordered]@{
-    mcpServers = [ordered]@{
-        'machine-env' = [ordered]@{
-            type    = 'stdio'
-            command = $launcher
-            env     = [ordered]@{
-                PYTHONUTF8     = '1'
-                PYTHONUNBUFFERED = '1'
-            }
+$merged = [ordered]@{}
+if ($existing) {
+    foreach ($property in $existing.PSObject.Properties) {
+        if ($property.Name -ne 'mcpServers') {
+            $merged[$property.Name] = $property.Value
         }
     }
 }
+$merged['mcpServers'] = $servers
+$json = $merged | ConvertTo-Json -Depth 20
+$encoding = New-Object System.Text.UTF8Encoding $false
+[System.IO.File]::WriteAllText($configPath, $json, $encoding)
+Write-Ok "wrote $configPath"
+if (Test-Path -LiteralPath "$configPath.bak") {
+    Write-Host "        prior config backed up to $configPath.bak"
+}
 
-$targets = @(
-    (Join-Path $env:USERPROFILE '.copilot\mcp-config.json')
+Write-Step 'Verifying actual MCP stdio connection'
+$wirePath = Join-Path $env:TEMP "machine-env-install-$PID.jsonl"
+$requests = @(
+    ([ordered]@{
+        jsonrpc = '2.0'
+        id = 1
+        method = 'initialize'
+        params = @{
+            protocolVersion = '2025-11-25'
+            capabilities = @{}
+            clientInfo = @{ name = 'machine-env-installer'; version = '1' }
+        }
+    } | ConvertTo-Json -Depth 20 -Compress),
+    '{"jsonrpc":"2.0","method":"notifications/initialized"}',
+    ([ordered]@{ jsonrpc = '2.0'; id = 2; method = 'tools/list'; params = @{} } |
+        ConvertTo-Json -Depth 20 -Compress),
+    ([ordered]@{
+        jsonrpc = '2.0'
+        id = 3
+        method = 'tools/call'
+        params = @{ name = 'get_hardware'; arguments = @{} }
+    } | ConvertTo-Json -Depth 20 -Compress),
+    ([ordered]@{
+        jsonrpc = '2.0'
+        id = 4
+        method = 'tools/call'
+        params = @{
+            name = 'get_environment'
+            arguments = @{ include_network = $false }
+        }
+    } | ConvertTo-Json -Depth 20 -Compress)
 )
-# The VS Code profile location is only written when one already exists, so this
-# script never invents configuration for a setup the user does not have.
+[System.IO.File]::WriteAllLines(
+    $wirePath, $requests, [System.Text.Encoding]::ASCII
+)
 
-foreach ($t in $targets) {
-    $dir = Split-Path -Parent $t
-    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
-
-    # Merge rather than overwrite: other MCP servers must survive a reinstall.
-    $existing = $null
-    if (Test-Path $t) {
-        try { $existing = Get-Content $t -Raw | ConvertFrom-Json } catch { $existing = $null }
-        if ($existing) {
-            Copy-Item $t "$t.bak" -Force
-        }
+$start = New-Object System.Diagnostics.ProcessStartInfo
+$start.FileName = $env:ComSpec
+$start.Arguments = '/d /c type "' + $wirePath + '" | "' + $server + '"'
+$start.WorkingDirectory = $Root
+$start.UseShellExecute = $false
+$start.RedirectStandardOutput = $true
+$start.RedirectStandardError = $true
+$utf8 = New-Object System.Text.UTF8Encoding $false
+$start.StandardOutputEncoding = $utf8
+$start.StandardErrorEncoding = $utf8
+$process = New-Object System.Diagnostics.Process
+$process.StartInfo = $start
+try {
+    if (-not $process.Start()) {
+        throw 'Could not start the native MCP server.'
     }
-
-    if ($existing -and $existing.mcpServers) {
-        $existing.mcpServers | Add-Member -NotePropertyName 'machine-env' `
-            -NotePropertyValue $config.mcpServers.'machine-env' -Force
-        $merged = [ordered]@{ mcpServers = $existing.mcpServers }
-        if ($existing.PSObject.Properties.Name -contains 'inputs') {
-            $merged['inputs'] = $existing.inputs
-        }
-        $json = $merged | ConvertTo-Json -Depth 10
-    } else {
-        $json = $config | ConvertTo-Json -Depth 10
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    if (-not $process.WaitForExit(30000)) {
+        $process.Kill()
+        throw 'MCP stdio verification timed out.'
     }
-
-    # Write without a BOM: JSON parsers reject a leading BOM, and
-    # Set-Content -Encoding UTF8 emits one on Windows PowerShell.
-    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
-    [System.IO.File]::WriteAllText($t, $json, $utf8NoBom)
-    Write-Ok "wrote $t"
-    if (Test-Path "$t.bak") { Write-Host "        previous version saved as $t.bak" }
+    $stdout = $stdoutTask.GetAwaiter().GetResult()
+    $stderr = $stderrTask.GetAwaiter().GetResult()
+    $responses = @(
+        $stdout -split "`r?`n" |
+            Where-Object { $_ } |
+            ForEach-Object { $_ | ConvertFrom-Json -ErrorAction Stop }
+    )
+    if ($responses.Count -ne 4) {
+        throw "Expected 4 JSON-RPC responses; received $($responses.Count). stderr: $stderr"
+    }
+    $byId = @{}
+    foreach ($response in $responses) {
+        if ($response.error) {
+            throw "MCP request $($response.id) failed: $($response.error.message)"
+        }
+        $byId[[string]$response.id] = $response
+    }
+    $initialize = $byId['1']
+    if ($initialize.result.serverInfo.name -ne 'machine-env') {
+        throw "Unexpected MCP server identity: $($initialize | ConvertTo-Json -Compress -Depth 6)"
+    }
+    $listing = $byId['2']
+    $names = @($listing.result.tools | ForEach-Object { $_.name })
+    $expected = @(
+        'get_hardware',
+        'get_toolchain',
+        'get_environment',
+        'refresh_env',
+        'get_cache_status'
+    )
+    if ($listing.error -or (@($expected | Where-Object { $_ -notin $names }).Count -gt 0)) {
+        throw "MCP tools/list is incomplete: $($names -join ', ')"
+    }
+    $hardware = $byId['3']
+    $data = $hardware.result.structuredContent
+    if (-not $data.brand -or -not $data.isa) {
+        throw "MCP hardware probe failed: $($hardware | ConvertTo-Json -Compress -Depth 6)"
+    }
+    $environment = $byId['4'].result.structuredContent
+    if ($environment.network -or -not $environment.os -or -not $environment.paths) {
+        throw 'Local-only environment probe returned an invalid result.'
+    }
+    Write-Ok "handshake: $($initialize.result.serverInfo.name) v$($initialize.result.serverInfo.version)"
+    Write-Ok "tools: $($names -join ', ')"
+    Write-Ok "hardware: $($data.brand), usable vector width $($data.vector_width_bits)"
+    Write-Ok 'environment: local-only probe works without network requests'
+} finally {
+    $process.Dispose()
+    Remove-Item -LiteralPath $wirePath -Force -ErrorAction SilentlyContinue
 }
 
-# --------------------------------------------------------------------------- #
-Write-Step 'Verifying end to end'
-
-# The server writes its startup line to stderr, which PowerShell surfaces as a
-# NativeCommandError and can abort the script before the result is read. Send
-# everything to a file instead, then judge by the sentinel the verifier prints.
-$verify = Join-Path $Root 'verify_config.py'
-$logFile = Join-Path $env:TEMP "machine-env-verify-$PID.log"
-
-$psi = New-Object System.Diagnostics.ProcessStartInfo
-$psi.FileName = $py.Exe
-$psi.Arguments = '"' + $verify + '"'
-$psi.RedirectStandardOutput = $true
-$psi.RedirectStandardError = $true
-$psi.UseShellExecute = $false
-$psi.WorkingDirectory = $Root
-$psi.EnvironmentVariables['PYTHONUTF8'] = '1'
-
-$proc = [System.Diagnostics.Process]::Start($psi)
-$stdout = $proc.StandardOutput.ReadToEnd()
-$stderr = $proc.StandardError.ReadToEnd()
-$proc.WaitForExit()
-$verifyExit = $proc.ExitCode
-
-$combined = @($stdout -split "`r?`n") + @($stderr -split "`r?`n")
-$combined | Set-Content $logFile -Encoding UTF8
-
-$combined | Where-Object { $_ -match '\S' } | ForEach-Object { Write-Host "   $_" }
-
-$passed = @($combined | Where-Object { $_ -match 'RESULT: CONFIG VERIFIED' }).Count -gt 0
-
-Write-Host ''
-if ($passed) {
-    Write-Host 'INSTALL COMPLETE' -ForegroundColor Green
-    Write-Host 'The machine-env tools appear in new chat sessions.'
-    Remove-Item $logFile -Force -ErrorAction SilentlyContinue
-    exit 0
-}
-
-Write-Warn2 "Verification failed (exit $verifyExit). Full log: $logFile"
-$combined | Where-Object { $_ -match '^FAIL|^Traceback|^json\.|Error:' } |
-    Select-Object -First 5 | ForEach-Object { Write-Host "   $_" }
-exit 1
+Write-Host "`nINSTALL COMPLETE — native C++ MCP is configured." -ForegroundColor Green
