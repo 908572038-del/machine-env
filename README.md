@@ -44,7 +44,7 @@ hardware tool over stdio.
 
 The MCP config points directly to the native executable.
 
-Tool calls return concise text by default. `get_toolchain` uses a stable,
+Tool calls return concise text only by default. `get_toolchain` uses a stable,
 memory-friendly format headed by the computer name and machine GUID, followed
 by discovered tool paths in a fixed order; tools found outside PATH are marked.
 Pass `detail: true` to `get_hardware`, `get_toolchain`, `get_environment`,

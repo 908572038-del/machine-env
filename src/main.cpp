@@ -193,10 +193,7 @@ Json tool_result(const std::string& name, Json value, bool detail) {
         result["structuredContent"] = value;
     } else {
         const std::string summary = summarize_payload(name, value);
-        Json compact = Json::object();
-        compact["summary"] = summary;
         result["content"] = text_content(summary);
-        result["structuredContent"] = compact;
     }
     return result;
 }
@@ -503,8 +500,9 @@ int selftest() {
         listing.get("result").get("tools").as_array().size() != 5)
         throw std::runtime_error("MCP tools/list dispatch test failed");
     const Json summary = tool_result("get_hardware", hardware, false);
-    if (!summary.get("structuredContent").get("summary").is_string() ||
-        summary.get("structuredContent").get("summary").as_string().find("CPU：") ==
+    if (summary.contains("structuredContent") ||
+        summary.get("content").as_array().size() != 1 ||
+        summary.get("content").as_array()[0].get("text").as_string().find("CPU：") ==
             std::string::npos ||
         dump_json(summary).size() >= dump_json(hardware).size())
         throw std::runtime_error("concise hardware summary test failed");
