@@ -5,16 +5,19 @@ agents: CPU instruction-set support, installed developer tools, Windows and
 shell details, filesystem paths, and optional network reachability.
 
 The MCP server and probes are implemented in C++17. The PowerShell scripts are
-used as Windows build/setup glue, and the server can discover installed
-development tools and other relevant environment details.
+used as Windows build/setup glue. Tool discovery covers common language
+runtimes, compilers, build systems, JavaScript package managers, container and
+WSL commands, editors, Windows package managers, archive utilities, installer
+builders, and Windows SDK packaging tools.
 
 ## Tools
 
 | Tool | Purpose |
 | --- | --- |
 | `get_hardware` | CPUID/XCR0-backed CPU capabilities and memory |
-| `get_toolchain` | Locate developer tools and report versions |
-| `get_environment` | Windows, shell and paths; `include_network=false` skips HTTPS checks |
+| `get_toolchain` | Locate developer, build, archive, and installer tools |
+| `get_tool_info` | Look up the path, detected version, and official usage docs for one detected tool |
+| `get_environment` | Windows, shell and existing PATH directories; `include_network=false` skips HTTPS checks |
 | `refresh_env` | Force probes for `all`, `hardware`, `toolchain`, or `environment` |
 | `get_cache_status` | Report cache freshness and invalidation per category |
 
@@ -46,10 +49,19 @@ The MCP config points directly to the native executable.
 
 Tool calls return concise text only by default. `get_toolchain` uses a stable,
 memory-friendly format headed by the computer name and machine GUID, followed
-by discovered tool paths in a fixed order; tools found outside PATH are marked.
+by installed tool paths in a fixed order; tools found outside PATH are marked.
+Missing tools are omitted from both concise and detailed toolchain results.
+When usage is unclear, call `get_tool_info` with a name from that inventory to
+retrieve its path, detected version (when available), and curated official
+usage documentation URL. This lookup is read-only and does not install software.
 Pass `detail: true` to `get_hardware`, `get_toolchain`, `get_environment`,
-`refresh_env`, or `get_cache_status` to receive the full JSON data, including
+`get_tool_info`, `refresh_env`, or `get_cache_status` to receive the full JSON data, including
 cache metadata and detailed CPU/environment fields.
+
+The server instructions ask AI clients to inspect project files before deciding
+which tools are needed and not to download, install, or run installers unless
+the user explicitly requests or approves it. Documentation links are for
+learning tool usage, not prompts to install a tool.
 
 `build-installer.ps1` creates `build\installer\machine-env-cpp-setup.exe`
 using NSIS. The installer is per-user, includes the prebuilt server, registers
@@ -66,7 +78,11 @@ and network state are cached for 10 minutes. Cache files live under the current
 user's `%LOCALAPPDATA%\machine-env\cache`; writes are atomic and protected by a
 named Windows mutex. Entries are invalidated when the server executable
 changes or their TTL expires. Cache failures do not prevent probes from
-returning results.
+returning results. Local-only environment snapshots use a separate cache entry
+from snapshots that include network checks, so skipping network still allows
+the local OS, shell, and PATH facts to be cached without misreporting freshness.
+PATH results contain existing directories only; file paths and nonexistent
+entries are omitted and counted.
 
 Network checks use HTTPS HEAD requests to GitHub, Hugging Face, and PyPI. Use
 `{"include_network":false}` for a local-only environment snapshot.
@@ -76,7 +92,8 @@ Network checks use HTTPS HEAD requests to GitHub, Hugging Face, and PyPI. Use
 Environment results contain the current user's profile paths and shell
 identity. Network checks disclose outbound connectivity to the listed service
 hosts. Consider these machine details when sending tool results to remote
-services.
+services. Use this MCP as the source of current machine facts rather than
+keeping or injecting a static tool-path memory file.
 
 The implementation is Windows-specific: it uses Win32, registry, CPUID, and
 WinHTTP APIs. Linux and macOS are not supported.

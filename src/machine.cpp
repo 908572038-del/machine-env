@@ -213,6 +213,12 @@ bool is_python_install_directory(const std::wstring& name) {
     return std::iswdigit(normalized[6]) != 0;
 }
 
+bool is_existing_directory(const std::wstring& path) {
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES &&
+           (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
 std::wstring discover_python_executable() {
     const std::wstring local_app_data = environment_variable(L"LOCALAPPDATA");
     const std::wstring user_profile = environment_variable(L"USERPROFILE");
@@ -319,6 +325,70 @@ std::wstring find_visual_studio_tool(const std::wstring& root,
         const fs::path candidate =
             version / L"bin" / L"Hostx64" / L"x64" / relative;
         if (fs::exists(candidate)) return candidate.wstring();
+    }
+    return {};
+}
+
+std::wstring find_packaging_tool(const std::wstring& name,
+                                 const std::wstring& vs_root) {
+    const std::wstring program_files =
+        environment_variable(L"ProgramFiles");
+    const std::wstring program_files_x86 =
+        environment_variable(L"ProgramFiles(x86)");
+    std::vector<fs::path> candidates;
+
+    if (name == L"7z") {
+        for (const auto& root : {program_files, program_files_x86}) {
+            if (!root.empty())
+                candidates.emplace_back(fs::path(root) / L"7-Zip" / L"7z.exe");
+        }
+    } else if (name == L"makensis") {
+        for (const auto& root : {program_files_x86, program_files}) {
+            if (!root.empty())
+                candidates.emplace_back(fs::path(root) / L"NSIS" / L"makensis.exe");
+        }
+    } else if (name == L"iscc") {
+        for (const auto& root : {program_files_x86, program_files}) {
+            if (root.empty()) continue;
+            candidates.emplace_back(fs::path(root) / L"Inno Setup 7" / L"ISCC.exe");
+            candidates.emplace_back(fs::path(root) / L"Inno Setup 6" / L"ISCC.exe");
+        }
+    } else if (name == L"candle" || name == L"light") {
+        for (const auto& root : {program_files_x86, program_files}) {
+            if (root.empty()) continue;
+            for (const wchar_t* version : {L"v3.14", L"v3.13", L"v3.12",
+                                           L"v3.11"}) {
+                candidates.emplace_back(fs::path(root) / L"WiX Toolset" /
+                                        version / L"bin" /
+                                        (name + L".exe"));
+            }
+        }
+    } else if (name == L"msbuild" && !vs_root.empty()) {
+        candidates.emplace_back(fs::path(vs_root) / L"MSBuild" / L"Current" /
+                                L"Bin" / L"MSBuild.exe");
+        candidates.emplace_back(fs::path(vs_root) / L"MSBuild" / L"Current" /
+                                L"Bin" / L"amd64" / L"MSBuild.exe");
+    } else if ((name == L"makeappx" || name == L"signtool") &&
+               !program_files_x86.empty()) {
+        const fs::path sdk_root =
+            fs::path(program_files_x86) / L"Windows Kits" / L"10" / L"bin";
+        std::error_code ec;
+        std::vector<fs::path> versions;
+        for (fs::directory_iterator it(sdk_root, ec), end; !ec && it != end;
+             it.increment(ec)) {
+            std::error_code entry_error;
+            if (it->is_directory(entry_error))
+                versions.push_back(it->path());
+        }
+        std::sort(versions.rbegin(), versions.rend());
+        for (const auto& version : versions) {
+            candidates.emplace_back(version / L"x64" / (name + L".exe"));
+        }
+    }
+
+    for (const auto& candidate : candidates) {
+        std::error_code ec;
+        if (fs::is_regular_file(candidate, ec)) return candidate.wstring();
     }
     return {};
 }
@@ -746,16 +816,32 @@ Json probe_hardware() {
 }
 
 Json probe_toolchain() {
-    static const std::array<std::pair<const wchar_t*, const wchar_t*>, 12> tools{{
+    static const std::array<std::pair<const wchar_t*, const wchar_t*>, 47> tools{{
         {L"python", L"python.exe"}, {L"pip", L"pip.exe"}, {L"uv", L"uv.exe"},
         {L"git", L"git.exe"}, {L"node", L"node.exe"}, {L"npm", L"npm.exe"},
         {L"cargo", L"cargo.exe"}, {L"go", L"go.exe"}, {L"java", L"java.exe"},
-        {L"cmake", L"cmake.exe"}, {L"ninja", L"ninja.exe"}, {L"cl", L"cl.exe"}
+        {L"cmake", L"cmake.exe"}, {L"ninja", L"ninja.exe"}, {L"cl", L"cl.exe"},
+        {L"docker", L"docker.exe"}, {L"wsl", L"wsl.exe"},
+        {L"pwsh", L"pwsh.exe"}, {L"code", L"code.exe"},
+        {L"code-insiders", L"code-insiders.exe"}, {L"winget", L"winget.exe"},
+        {L"choco", L"choco.exe"}, {L"scoop", L"scoop.exe"},
+        {L"7z", L"7z.exe"}, {L"7zz", L"7zz.exe"}, {L"tar", L"tar.exe"},
+        {L"makensis", L"makensis.exe"}, {L"iscc", L"ISCC.exe"},
+        {L"wix", L"wix.exe"}, {L"candle", L"candle.exe"},
+        {L"light", L"light.exe"}, {L"nuget", L"nuget.exe"},
+        {L"dotnet", L"dotnet.exe"}, {L"msbuild", L"MSBuild.exe"},
+        {L"makeappx", L"MakeAppx.exe"}, {L"signtool", L"signtool.exe"},
+        {L"clang", L"clang.exe"}, {L"clang-cl", L"clang-cl.exe"},
+        {L"gcc", L"gcc.exe"}, {L"rustc", L"rustc.exe"},
+        {L"make", L"make.exe"}, {L"nmake", L"nmake.exe"},
+        {L"meson", L"meson.exe"}, {L"bazel", L"bazel.exe"},
+        {L"xmake", L"xmake.exe"}, {L"pnpm", L"pnpm.exe"},
+        {L"yarn", L"yarn.exe"}, {L"bun", L"bun.exe"},
+        {L"deno", L"deno.exe"}, {L"corepack", L"corepack.exe"}
     }};
     Json result = Json::object();
     Json found = Json::object();
     Json versions = Json::object();
-    Json missing = Json::array();
     Json not_on_path = Json::array();
     const std::wstring vs_root = visual_studio_root();
     result["vs_path"] = utf8(vs_root);
@@ -766,8 +852,24 @@ Json probe_toolchain() {
         std::wstring path = tool.first == std::wstring(L"python")
                                 ? discover_python_executable()
                                 : search_executable(tool.second);
-        if (path.empty() && tool.first == std::wstring(L"npm"))
-            path = search_executable(L"npm.cmd");
+        if (path.empty()) {
+            if (tool.first == std::wstring(L"npm"))
+                path = search_executable(L"npm.cmd");
+            else if (tool.first == std::wstring(L"code"))
+                path = search_executable(L"code.cmd");
+            else if (tool.first == std::wstring(L"code-insiders"))
+                path = search_executable(L"code-insiders.cmd");
+            else if (tool.first == std::wstring(L"pnpm"))
+                path = search_executable(L"pnpm.cmd");
+            else if (tool.first == std::wstring(L"yarn"))
+                path = search_executable(L"yarn.cmd");
+            else if (tool.first == std::wstring(L"corepack"))
+                path = search_executable(L"corepack.cmd");
+            else if (tool.first == std::wstring(L"scoop")) {
+                path = search_executable(L"scoop.cmd");
+                if (path.empty()) path = search_executable(L"scoop.ps1");
+            }
+        }
         bool off_path = false;
         if (path.empty() && tool.first == std::wstring(L"cl")) {
             path = find_visual_studio_tool(
@@ -782,10 +884,19 @@ Json probe_toolchain() {
                 off_path = true;
             }
         }
-        if (path.empty()) {
-            missing.as_array().emplace_back(utf8(tool.first));
-            continue;
+        if (path.empty() &&
+            (tool.first == std::wstring(L"7z") ||
+             tool.first == std::wstring(L"makensis") ||
+             tool.first == std::wstring(L"iscc") ||
+             tool.first == std::wstring(L"candle") ||
+             tool.first == std::wstring(L"light") ||
+             tool.first == std::wstring(L"msbuild") ||
+             tool.first == std::wstring(L"makeappx") ||
+             tool.first == std::wstring(L"signtool"))) {
+            path = find_packaging_tool(tool.first, vs_root);
+            off_path = !path.empty();
         }
+        if (path.empty()) continue;
         found[utf8(tool.first)] = utf8(path);
         ++tool_count;
         if (off_path) not_on_path.as_array().emplace_back(utf8(tool.first));
@@ -793,21 +904,43 @@ Json probe_toolchain() {
         // Do not launch Python or pip; tool discovery does not execute user tools.
         if (tool.first == std::wstring(L"python") ||
             tool.first == std::wstring(L"pip") ||
-            tool.first == std::wstring(L"cl"))
+            tool.first == std::wstring(L"cl") ||
+            tool.first == std::wstring(L"msbuild") ||
+            tool.first == std::wstring(L"makeappx") ||
+            tool.first == std::wstring(L"signtool") ||
+            tool.first == std::wstring(L"nmake") ||
+            path.size() < 4 ||
+            _wcsicmp(path.c_str() + path.size() - 4, L".exe") != 0)
             continue;
         std::wstring args = L"--version";
         if (tool.first == std::wstring(L"go")) args = L"version";
+        if (tool.first == std::wstring(L"pwsh"))
+            args = L"-NoLogo -NoProfile -Command \"$PSVersionTable.PSVersion.ToString()\"";
+        if (tool.first == std::wstring(L"dotnet")) args = L"--version";
+        if (tool.first == std::wstring(L"makensis")) args = L"/VERSION";
+        if (tool.first == std::wstring(L"wix") ||
+            tool.first == std::wstring(L"7zz"))
+            args = L"--version";
+        if (tool.first == std::wstring(L"clang") ||
+            tool.first == std::wstring(L"clang-cl") ||
+            tool.first == std::wstring(L"gcc") ||
+            tool.first == std::wstring(L"rustc") ||
+            tool.first == std::wstring(L"make") ||
+            tool.first == std::wstring(L"meson") ||
+            tool.first == std::wstring(L"bazel") ||
+            tool.first == std::wstring(L"xmake") ||
+            tool.first == std::wstring(L"bun") ||
+            tool.first == std::wstring(L"deno"))
+            args = L"--version";
         const auto version = run_process(path, args);
         if (version.ok && !version.output.empty())
             versions[utf8(tool.first)] = version.output;
     }
 
     result["tool_count"] = tool_count;
-    result["tool_total"] = static_cast<int>(tools.size());
     result["tools"] = found;
     result["versions"] = versions;
     result["not_on_path"] = not_on_path;
-    result["missing"] = missing;
     if (found.contains("python")) {
         result["python_root"] =
             utf8(fs::path(wide(found.get("python").as_string())).parent_path().wstring());
@@ -917,18 +1050,27 @@ Json probe_environment(bool include_network) {
         paths[variable.second] = utf8(environment_variable(variable.first));
     }
     Json path_entries = Json::array();
+    int ignored_path_entries = 0;
     std::wstring path = environment_variable(L"PATH");
     std::size_t start = 0;
     while (start <= path.size()) {
         const auto end = path.find(L';', start);
-        const auto entry = path.substr(start, end == std::wstring::npos
-                                                 ? std::wstring::npos
-                                                 : end - start);
-        if (!entry.empty()) path_entries.as_array().emplace_back(utf8(entry));
+        std::wstring entry = path.substr(start, end == std::wstring::npos
+                                                    ? std::wstring::npos
+                                                    : end - start);
+        if (entry.size() >= 2 && entry.front() == L'"' &&
+            entry.back() == L'"')
+            entry = entry.substr(1, entry.size() - 2);
+        if (!entry.empty() && is_existing_directory(entry)) {
+            path_entries.as_array().emplace_back(utf8(entry));
+        } else if (!entry.empty()) {
+            ++ignored_path_entries;
+        }
         if (end == std::wstring::npos) break;
         start = end + 1;
     }
     paths["path_entries"] = path_entries;
+    paths["ignored_path_entry_count"] = ignored_path_entries;
     result["os"] = os;
     result["shell"] = shell;
     result["paths"] = paths;
@@ -952,6 +1094,8 @@ Json probe_cache_status() {
     categories["hardware"] = read_cached_status("hardware", kDefaultTtl);
     categories["toolchain"] = read_cached_status("toolchain", kDefaultTtl);
     categories["environment"] = read_cached_status("environment", kNetworkTtl);
+    categories["environment_local"] =
+        read_cached_status("environment-local", kNetworkTtl);
     result["categories"] = categories;
     return result;
 }
@@ -959,14 +1103,14 @@ Json probe_cache_status() {
 Json cached_probe(const std::string& kind, bool refresh,
                   bool include_network) {
     const int ttl = kind == "environment" ? kNetworkTtl : kDefaultTtl;
+    const std::string cache_kind =
+        kind == "environment" && !include_network ? "environment-local" : kind;
     if (!refresh) {
-        const Json entry = read_cache_entry(kind, ttl);
+        const Json entry = read_cache_entry(cache_kind, ttl);
         if (entry.is_object()) {
             Json payload = entry.get("payload");
             const auto timestamp = entry.get("cached_at").as_integer();
             annotate_cache(payload, cache_metadata("fresh", true, timestamp));
-            if (kind == "environment" && !include_network)
-                payload.as_object().erase("network");
             if (kind == "environment" && !include_network)
                 payload["_cache"]["network_probe_skipped"] = true;
             return payload;
@@ -985,15 +1129,10 @@ Json cached_probe(const std::string& kind, bool refresh,
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - started)
             .count());
-    if (kind == "environment" && !include_network) {
-        Json local_metadata = metadata;
-        local_metadata["network_probe_skipped"] = true;
-        local_metadata["cached"] = false;
-        local_metadata["not_cached_because"] = "network probe was skipped";
-        annotate_cache(payload, local_metadata);
-        return payload;
-    }
-    return cacheable_probe(kind, std::move(payload), metadata);
+    Json result = cacheable_probe(cache_kind, std::move(payload), metadata);
+    if (kind == "environment" && !include_network)
+        result["_cache"]["network_probe_skipped"] = true;
+    return result;
 }
 
 Json refresh_environment(const std::string& scope) {
