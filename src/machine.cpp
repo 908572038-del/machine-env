@@ -747,6 +747,24 @@ std::string machine_guid() {
     return "unknown-machine";
 }
 
+std::string machine_uuid() {
+    std::string input = machine_guid();
+    if (input.empty() || input == "unknown-machine") {
+        std::array<wchar_t, MAX_COMPUTERNAME_LENGTH + 1> computer{};
+        DWORD size = static_cast<DWORD>(computer.size());
+        if (GetComputerNameW(computer.data(), &size))
+            input = "computer:" + utf8(computer.data());
+    }
+    std::uint64_t hash = 14695981039346656037ull;
+    for (unsigned char ch : input) {
+        hash ^= ch;
+        hash *= 1099511628211ull;
+    }
+    std::ostringstream output;
+    output << "m-" << std::hex << hash;
+    return output.str();
+}
+
 std::string source_fingerprint() {
     static const std::string fingerprint = [] {
         std::array<wchar_t, 32768> executable{};
@@ -945,6 +963,7 @@ Json probe_toolchain() {
         result["python_root"] =
             utf8(fs::path(wide(found.get("python").as_string())).parent_path().wstring());
     }
+    result["machine_id"] = machine_uuid();
     result["machine_guid"] = machine_guid();
     std::array<wchar_t, MAX_COMPUTERNAME_LENGTH + 1> computer{};
     DWORD computer_size = static_cast<DWORD>(computer.size());

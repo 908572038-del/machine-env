@@ -7,6 +7,7 @@
 namespace machine_env {
 
 std::string machine_guid();
+std::string machine_uuid();
 std::string source_fingerprint();
 Json probe_hardware();
 Json probe_toolchain();

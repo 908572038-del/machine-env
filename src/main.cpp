@@ -169,7 +169,7 @@ std::string memory_gb(const Json& value, const std::string& key) {
 std::string summarize_toolchain(const Json& value) {
     std::ostringstream output;
     output << "## 机器: " << string_field(value, "computer_name") << " ["
-           << string_field(value, "machine_guid") << "]";
+           << string_field(value, "machine_id") << "]";
     const Json& tools = value.get("tools");
     const Json& not_on_path = value.get("not_on_path");
     static const std::array<std::pair<const char*, const char*>, 47> order{{
@@ -698,6 +698,13 @@ int selftest() {
         detected_tools.contains("missing") ||
         detected_tools.contains("tool_total"))
         throw std::runtime_error("toolchain installed-only result test failed");
+    if (!detected_tools.get("machine_id").is_string() ||
+        detected_tools.get("machine_id").as_string().empty() ||
+        detected_tools.get("machine_id").as_string() ==
+            detected_tools.get("machine_guid").as_string())
+        throw std::runtime_error("toolchain machine identity test failed");
+    if (machine_uuid() != machine_uuid())
+        throw std::runtime_error("machine identity is not stable");
     const Json summary = tool_result("get_hardware", hardware, false);
     if (summary.contains("structuredContent") ||
         summary.get("content").as_array().size() != 1 ||
@@ -710,6 +717,7 @@ int selftest() {
         throw std::runtime_error("detailed tool result test failed");
     Json sample_toolchain = Json::object();
     sample_toolchain["computer_name"] = "TEST-PC";
+    sample_toolchain["machine_id"] = "test-machine-id";
     sample_toolchain["machine_guid"] = "test-guid";
     sample_toolchain["tools"]["cl"] = "C:\\VS\\cl.exe";
     sample_toolchain["tools"]["git"] = "C:\\Git\\git.exe";
@@ -732,7 +740,7 @@ int selftest() {
     const std::string toolchain_summary =
         summarize_payload("get_toolchain", sample_toolchain);
     const std::string expected_toolchain_summary =
-        "## 机器: TEST-PC [test-guid]\n"
+        "## 机器: TEST-PC [test-machine-id]\n"
         "- PYTHON = C:\\Python\\python.exe\n"
         "- GIT = C:\\Git\\git.exe\n"
         "- CL = C:\\VS\\cl.exe (不在PATH)\n"

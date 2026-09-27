@@ -48,8 +48,8 @@ hardware tool over stdio.
 The MCP config points directly to the native executable.
 
 Tool calls return concise text only by default. `get_toolchain` uses a stable,
-memory-friendly format headed by the computer name and machine GUID, followed
-by installed tool paths in a fixed order; tools found outside PATH are marked.
+memory-friendly format headed by the computer name and a derived machine ID,
+followed by installed tool paths in a fixed order; tools found outside PATH are marked.
 Missing tools are omitted from both concise and detailed toolchain results.
 When usage is unclear, call `get_tool_info` with a name from that inventory to
 retrieve its path, detected version (when available), and curated official
@@ -94,6 +94,10 @@ identity. Network checks disclose outbound connectivity to the listed service
 hosts. Consider these machine details when sending tool results to remote
 services. Use this MCP as the source of current machine facts rather than
 keeping or injecting a static tool-path memory file.
+
+Toolchain results identify the machine with a stable, derived `machine_id`
+(plus the computer name) so shared accounts can tell machines apart; the raw
+Windows `MachineGuid` is not exposed in summaries.
 
 The implementation is Windows-specific: it uses Win32, registry, CPUID, and
 WinHTTP APIs. Linux and macOS are not supported.
