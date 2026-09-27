@@ -62,101 +62,6 @@ bool is_windows_app_alias(const std::string& path) {
     return normalized.find("\\microsoft\\windowsapps\\") != std::string::npos;
 }
 
-struct ToolDocumentation {
-    const char* name;
-    const char* url;
-};
-
-const ToolDocumentation* tool_documentation(const std::string& name) {
-    static const std::array<ToolDocumentation, 47> docs{{
-        {"python", "https://docs.python.org/3/"},
-        {"pip", "https://pip.pypa.io/en/stable/"},
-        {"uv", "https://docs.astral.sh/uv/"},
-        {"git", "https://git-scm.com/docs"},
-        {"node", "https://nodejs.org/docs/latest/api/"},
-        {"npm", "https://docs.npmjs.com/"},
-        {"cargo", "https://doc.rust-lang.org/cargo/"},
-        {"go", "https://go.dev/doc/"},
-        {"java", "https://docs.oracle.com/en/java/"},
-        {"cmake", "https://cmake.org/cmake/help/latest/"},
-        {"ninja", "https://ninja-build.org/manual.html"},
-        {"cl", "https://learn.microsoft.com/cpp/build/reference/compiler-options"},
-        {"docker", "https://docs.docker.com/"},
-        {"wsl", "https://learn.microsoft.com/windows/wsl/"},
-        {"pwsh", "https://learn.microsoft.com/powershell/"},
-        {"code", "https://code.visualstudio.com/docs"},
-        {"code-insiders", "https://code.visualstudio.com/docs"},
-        {"winget", "https://learn.microsoft.com/windows/package-manager/winget/"},
-        {"choco", "https://docs.chocolatey.org/en-us/"},
-        {"scoop", "https://scoop.sh/"},
-        {"7z", "https://7-zip.org/"},
-        {"7zz", "https://7-zip.org/"},
-        {"tar", "https://learn.microsoft.com/windows-server/administration/windows-commands/tar"},
-        {"makensis", "https://nsis.sourceforge.io/Docs/"},
-        {"iscc", "https://jrsoftware.org/ishelp/"},
-        {"wix", "https://docs.firegiant.com/wix/"},
-        {"candle", "https://wixtoolset.org/docs/"},
-        {"light", "https://wixtoolset.org/docs/"},
-        {"nuget", "https://learn.microsoft.com/nuget/"},
-        {"dotnet", "https://learn.microsoft.com/dotnet/"},
-        {"msbuild", "https://learn.microsoft.com/visualstudio/msbuild/msbuild"},
-        {"makeappx", "https://learn.microsoft.com/windows/msix/package/create-app-package-with-makeappx-tool"},
-        {"signtool", "https://learn.microsoft.com/windows/win32/seccrypto/signtool"},
-        {"clang", "https://clang.llvm.org/docs/"},
-        {"clang-cl", "https://clang.llvm.org/docs/UsersManual.html#clang-cl"},
-        {"gcc", "https://gcc.gnu.org/onlinedocs/"},
-        {"rustc", "https://doc.rust-lang.org/rustc/"},
-        {"make", "https://www.gnu.org/software/make/manual/"},
-        {"nmake", "https://learn.microsoft.com/cpp/build/reference/nmake-reference"},
-        {"meson", "https://mesonbuild.com/"},
-        {"bazel", "https://bazel.build/docs"},
-        {"xmake", "https://xmake.io/"},
-        {"pnpm", "https://pnpm.io/"},
-        {"yarn", "https://yarnpkg.com/getting-started"},
-        {"bun", "https://bun.sh/docs"},
-        {"deno", "https://docs.deno.com/"},
-        {"corepack", "https://nodejs.org/api/corepack.html"}}};
-    const auto found = std::find_if(
-        docs.begin(), docs.end(), [&name](const ToolDocumentation& doc) {
-            return name == doc.name;
-        });
-    return found == docs.end() ? nullptr : &*found;
-}
-
-std::string normalized_tool_name(std::string name) {
-    std::transform(name.begin(), name.end(), name.begin(),
-                   [](unsigned char ch) {
-                       return static_cast<char>(std::tolower(ch));
-                   });
-    return name;
-}
-
-Json tool_info_payload(const Json& toolchain, const std::string& requested_name) {
-    const std::string name = normalized_tool_name(requested_name);
-    const ToolDocumentation* doc = tool_documentation(name);
-    if (!doc) {
-        Json error = Json::object();
-        error["error"] = "No curated usage documentation for tool: " + name;
-        return error;
-    }
-    const Json& tools = toolchain.get("tools");
-    const std::string path = string_field(tools, name);
-    if (path.empty()) {
-        Json error = Json::object();
-        error["error"] = "Tool is not present in the detected installed-tool inventory: " +
-                         name;
-        return error;
-    }
-
-    Json result = Json::object();
-    result["name"] = name;
-    result["path"] = path;
-    const std::string version = string_field(toolchain.get("versions"), name);
-    if (!version.empty()) result["version"] = version;
-    result["documentation_url"] = doc->url;
-    return result;
-}
-
 std::string memory_gb(const Json& value, const std::string& key) {
     const Json& field = value.get(key);
     if (!field.is_number()) return {};
@@ -168,8 +73,6 @@ std::string memory_gb(const Json& value, const std::string& key) {
 
 std::string summarize_toolchain(const Json& value) {
     std::ostringstream output;
-    output << "## 机器: " << string_field(value, "computer_name") << " ["
-           << string_field(value, "machine_id") << "]";
     const Json& tools = value.get("tools");
     const Json& not_on_path = value.get("not_on_path");
     static const std::array<std::pair<const char*, const char*>, 47> order{{
@@ -198,6 +101,7 @@ std::string summarize_toolchain(const Json& value) {
     };
 
     if (tools.is_object()) {
+        bool first = true;
         for (const auto& tool : order) {
             const std::string name = tool.first;
             const std::string path = string_field(tools, name);
@@ -205,8 +109,11 @@ std::string summarize_toolchain(const Json& value) {
             if (path.empty() ||
                 (is_windows_app_alias(path) && version.empty()))
                 continue;
-            output << "\n- " << tool.second << " = " << path;
-            if (is_off_path(name)) output << " (不在PATH)";
+            if (!first) output << "\n";
+            first = false;
+            output << "- " << tool.second << " = " << path;
+            if (!version.empty()) output << " (" << first_line(version) << ")";
+            if (is_off_path(name)) output << " 不在PATH";
         }
     }
     return output.str();
@@ -236,16 +143,6 @@ std::string summarize_payload(const std::string& name, const Json& value) {
     }
     if (name == "get_toolchain" || name == "toolchain")
         return summarize_toolchain(value);
-    if (name == "get_tool_info") {
-        std::ostringstream output;
-        output << "Tool: " << string_field(value, "name")
-               << "\nPath: " << string_field(value, "path");
-        const std::string version = string_field(value, "version");
-        if (!version.empty()) output << "\nVersion: " << first_line(version);
-        output << "\nOfficial usage docs: "
-               << string_field(value, "documentation_url");
-        return output.str();
-    }
     if (name == "get_environment" || name == "environment") {
         std::ostringstream output;
         output << "系统配置";
@@ -388,20 +285,6 @@ Json tools() {
         "Locate installed runtimes, build tools, editors, container tools, shells, and package managers. Reports detected tools only.",
         toolchain));
 
-    Json tool_info = object_schema();
-    tool_info["properties"]["name"] =
-        string_schema("Exact tool name from get_toolchain, such as cmake or python.");
-    tool_info["required"] = Json::array();
-    tool_info["required"].as_array().emplace_back("name");
-    tool_info["properties"]["refresh"] =
-        boolean_schema("Bypass the cached toolchain inventory and re-probe.");
-    tool_info["properties"]["detail"] =
-        boolean_schema("Return the full JSON result instead of a concise summary.");
-    list.as_array().push_back(tool_definition(
-        "get_tool_info",
-        "For a detected installed tool, return its path, detected version, and curated official usage documentation URL. Read-only; does not download or install software.",
-        tool_info));
-
     Json environment = object_schema();
     environment["properties"]["refresh"] =
         boolean_schema("Bypass the cache and re-probe.");
@@ -499,13 +382,12 @@ Json dispatch(const Json& request, bool& has_response) {
         result["serverInfo"]["name"] = "machine-env-cpp";
         result["serverInfo"]["version"] = "0.2.0";
         result["instructions"] =
-            "Observed Windows machine facts: CPU ISA, toolchain, OS, shell, paths, "
-            "and optional network state. Use this MCP as the sole source for current "
-            "machine tool and environment facts; do not rely on static memory files "
-            "or guesses. Inspect project files to determine requirements. Report "
-            "detected tools only. Do not download, install, or run installers unless "
-            "the user explicitly requests or approves it. Use get_tool_info only "
-            "when usage of a detected tool is uncertain; its URL is for usage docs.";
+            "观察到的 Windows 机器事实：CPU 指令集、工具链、操作系统、shell、路径，"
+            "以及可选的网络状态。本 MCP 是纯探测工具：只报告存在的内容（工具名、"
+            "版本、路径、是否在 PATH），不提供用法指导。请把它当作当前机器工具与"
+            "环境事实的唯一来源，不要依赖静态记忆文件或猜测。检查项目文件以确定"
+            "需求。只报告已检测到的工具。除非用户明确要求或批准，否则不得下载、"
+            "安装或运行安装程序。";
         Json response = Json::object();
         response["jsonrpc"] = "2.0";
         response["id"] = id;
@@ -563,21 +445,6 @@ Json dispatch(const Json& request, bool& has_response) {
                                                                 : "toolchain",
                                        refresh, true);
             }
-        } else if (name == "get_tool_info") {
-            if (!optional_boolean(arguments, "detail", false, detail,
-                                  validation_error))
-                return rpc_error(id, -32602, validation_error);
-            if (!optional_boolean(arguments, "refresh", false, refresh,
-                                  validation_error))
-                return rpc_error(id, -32602, validation_error);
-            const Json& requested_name = arguments.get("name");
-            if (!requested_name.is_string() || requested_name.as_string().empty())
-                return rpc_error(id, -32602,
-                                 "argument 'name' must be a non-empty string");
-            const Json toolchain = cached_probe("toolchain", refresh, true);
-            payload = toolchain.contains("error")
-                          ? toolchain
-                          : tool_info_payload(toolchain, requested_name.as_string());
         } else if (name == "refresh_env") {
             if (!optional_boolean(arguments, "detail", false, detail,
                                   validation_error))
@@ -649,6 +516,40 @@ int selftest() {
             throw std::runtime_error("environment returned an invalid PATH directory");
     }
 
+    const auto is_file = [](const std::wstring& path) {
+        const DWORD attributes = GetFileAttributesW(path.c_str());
+        return attributes != INVALID_FILE_ATTRIBUTES &&
+               (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+    };
+    const Json& shell = local_environment.get("shell");
+    const std::string shell_kind = string_field(shell, "shell_kind");
+    const std::string shell_version =
+        first_line(string_field(shell, "ps_version"));
+    if (!shell_kind.empty()) {
+        if (shell_kind != "pwsh" && shell_kind != "windows-powershell")
+            throw std::runtime_error("shell kind test failed");
+        if (!is_file(wide_from_utf8(string_field(shell, "shell_path"))))
+            throw std::runtime_error("shell path test failed");
+        if (!shell_version.empty()) {
+            int shell_major = 0;
+            try {
+                shell_major = std::stoi(shell_version);
+            } catch (const std::exception&) {
+                shell_major = 0;
+            }
+            if (!shell.get("supports_ampersand_ampersand").is_bool() ||
+                !shell.get("has_heredoc").is_bool() ||
+                shell.get("supports_ampersand_ampersand").as_bool() !=
+                    (shell_major >= 7) ||
+                shell.get("has_heredoc").as_bool() != (shell_major >= 7))
+                throw std::runtime_error("shell capability flags test failed");
+            if (shell_kind == "pwsh" && shell_major < 7)
+                throw std::runtime_error("pwsh was not probed as the primary shell");
+            if (shell_kind == "windows-powershell" && shell_major >= 7)
+                throw std::runtime_error("pwsh was not preferred as the primary shell");
+        }
+    }
+
     const Json refreshed_hardware = cached_probe("hardware", true, true);
     if (refreshed_hardware.contains("error"))
         throw std::runtime_error("hardware cache write test failed");
@@ -691,7 +592,7 @@ int selftest() {
         parse_json(R"({"jsonrpc":"2.0","id":2,"method":"tools/list"})"),
         has_response);
     if (!has_response ||
-        listing.get("result").get("tools").as_array().size() != 6)
+        listing.get("result").get("tools").as_array().size() != 5)
         throw std::runtime_error("MCP tools/list dispatch test failed");
     const Json detected_tools = probe_toolchain();
     if (!detected_tools.get("tools").is_object() ||
@@ -740,10 +641,9 @@ int selftest() {
     const std::string toolchain_summary =
         summarize_payload("get_toolchain", sample_toolchain);
     const std::string expected_toolchain_summary =
-        "## 机器: TEST-PC [test-machine-id]\n"
-        "- PYTHON = C:\\Python\\python.exe\n"
+        "- PYTHON = C:\\Python\\python.exe (3.14.0)\n"
         "- GIT = C:\\Git\\git.exe\n"
-        "- CL = C:\\VS\\cl.exe (不在PATH)\n"
+        "- CL = C:\\VS\\cl.exe 不在PATH\n"
         "- DOCKER = C:\\Docker\\docker.exe\n"
         "- CODE = C:\\VSCode\\bin\\code.cmd\n"
         "- WINGET = C:\\Windows\\winget.exe\n"
@@ -754,22 +654,11 @@ int selftest() {
         "- PNPM = C:\\Node\\pnpm.cmd";
     if (toolchain_summary != expected_toolchain_summary)
         throw std::runtime_error("toolchain memory format/order test failed");
-    const Json python_info = tool_info_payload(sample_toolchain, "Python");
-    if (python_info.get("path").as_string() != "C:\\Python\\python.exe" ||
-        python_info.get("documentation_url").as_string() !=
-            "https://docs.python.org/3/" ||
-        python_info.get("version").as_string() != "3.14.0")
-        throw std::runtime_error("installed tool documentation lookup test failed");
-    if (!tool_info_payload(sample_toolchain, "dotnet").contains("error"))
-        throw std::runtime_error("undetected tool documentation guard test failed");
-    for (const auto& tool : detected_tools.get("tools").as_object()) {
-        if (!tool_documentation(tool.first))
-            throw std::runtime_error("tool documentation catalog coverage test failed");
-    }
 
     std::cout << "JSON parser: OK\n";
     std::cout << "CPUID probe: " << hardware.get("brand").as_string() << "\n";
     std::cout << "Local Windows probe: OK\n";
+    std::cout << "Shell probe: " << shell_kind << " " << shell_version << "\n";
     std::cout << "Cache write/read: OK\n";
     std::cout << "PATH directory filtering and local environment cache: OK\n";
     std::cout << "MCP initialize: OK\n";

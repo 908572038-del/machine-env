@@ -164,7 +164,6 @@ try {
     $expected = @(
         'get_hardware',
         'get_toolchain',
-        'get_tool_info',
         'get_environment',
         'refresh_env',
         'get_cache_status'

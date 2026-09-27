@@ -409,6 +409,34 @@ std::string current_time_iso() {
     return stream.str();
 }
 
+// Collapse a tool's raw "--version" output into a short version token so the
+// toolchain result stays a pure, low-noise probe. Multi-line output keeps only
+// its first line; well-known redundant prefixes and trailing trivia are
+// stripped. Tools whose raw text is already a plain version are left intact.
+std::string normalize_version(const std::string& raw) {
+    std::string value =
+        raw.substr(0, raw.find_first_of("\r\n"));
+    while (!value.empty() &&
+           (value.back() == ' ' || value.back() == '\t' ||
+            value.back() == '\r'))
+        value.pop_back();
+    const std::size_t start = value.find_first_not_of(" \t");
+    if (start != std::string::npos) value.erase(0, start);
+
+    const std::array<std::string, 9> prefixes{{
+        "git version ", "cmake version ", "bsdtar ", "GNU bash, version ",
+        "Python ", "tar (", "wget ", "curl ", "v"}};
+    for (const auto& prefix : prefixes) {
+        if (value.rfind(prefix, 0) == 0) {
+            value.erase(0, prefix.size());
+            break;
+        }
+    }
+    if (!value.empty() && value.back() == ' ') value.pop_back();
+    if (!value.empty()) return value;
+    return raw;
+}
+
 Json cache_metadata(const std::string& reason, bool hit,
                     std::int64_t cached_at = 0) {
     Json result = Json::object();
@@ -919,7 +947,9 @@ Json probe_toolchain() {
         ++tool_count;
         if (off_path) not_on_path.as_array().emplace_back(utf8(tool.first));
 
-        // Do not launch Python or pip; tool discovery does not execute user tools.
+        // Skip version probing for tools that are expensive, shell wrappers, or
+        // whose "--version" text is long/verbose. Discovery never executes
+        // user tooling that isn't a plain .exe.
         if (tool.first == std::wstring(L"python") ||
             tool.first == std::wstring(L"pip") ||
             tool.first == std::wstring(L"cl") ||
@@ -927,6 +957,7 @@ Json probe_toolchain() {
             tool.first == std::wstring(L"makeappx") ||
             tool.first == std::wstring(L"signtool") ||
             tool.first == std::wstring(L"nmake") ||
+            tool.first == std::wstring(L"tar") ||
             path.size() < 4 ||
             _wcsicmp(path.c_str() + path.size() - 4, L".exe") != 0)
             continue;
@@ -952,7 +983,7 @@ Json probe_toolchain() {
             args = L"--version";
         const auto version = run_process(path, args);
         if (version.ok && !version.output.empty())
-            versions[utf8(tool.first)] = version.output;
+            versions[utf8(tool.first)] = normalize_version(version.output);
     }
 
     result["tool_count"] = tool_count;
@@ -1030,13 +1061,22 @@ Json probe_environment(bool include_network) {
     }
     shell["is_admin"] = is_admin();
     shell["execution_policy"] = "not probed";
+    // A terminal defaults to pwsh when it is installed, so probing only
+    // powershell.exe would under-report capabilities such as "&&".
+    const std::wstring pwsh = search_executable(L"pwsh.exe");
     const std::wstring powershell = search_executable(L"powershell.exe");
-    if (!powershell.empty()) {
-        const auto ps = run_process(
-            powershell,
+    const std::wstring& primary_shell = pwsh.empty() ? powershell : pwsh;
+    const auto probe_shell = [](const std::wstring& executable) {
+        return run_process(
+            executable,
             L"-NoProfile -NonInteractive -Command "
             L"\"$PSVersionTable.PSVersion.ToString();$PSVersionTable.PSEdition;"
             L"$Host.Name;Get-ExecutionPolicy\"");
+    };
+    if (!primary_shell.empty()) {
+        shell["shell_path"] = utf8(primary_shell);
+        shell["shell_kind"] = pwsh.empty() ? "windows-powershell" : "pwsh";
+        const auto ps = probe_shell(primary_shell);
         if (ps.ok) {
             std::istringstream values(ps.output);
             std::string ps_version, ps_edition, ps_host, execution_policy;
@@ -1056,6 +1096,20 @@ Json probe_environment(bool include_network) {
             }
             shell["supports_ampersand_ampersand"] = major >= 7;
             shell["has_heredoc"] = major >= 7;
+        }
+    }
+    if (!pwsh.empty() && !powershell.empty()) {
+        // Only the version is needed here; asking for more would depend on
+        // module autoloading and can fail intermittently.
+        const auto legacy = run_process(
+            powershell,
+            L"-NoProfile -NonInteractive -Command "
+            L"\"$PSVersionTable.PSVersion.ToString()\"");
+        if (legacy.ok && !legacy.output.empty()) {
+            const std::string legacy_version =
+                legacy.output.substr(0, legacy.output.find_first_of("\r\n"));
+            if (!legacy_version.empty())
+                shell["windows_powershell_version"] = legacy_version;
         }
     }
 

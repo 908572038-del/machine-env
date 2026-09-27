@@ -16,10 +16,13 @@ builders, and Windows SDK packaging tools.
 | --- | --- |
 | `get_hardware` | CPUID/XCR0-backed CPU capabilities and memory |
 | `get_toolchain` | Locate developer, build, archive, and installer tools |
-| `get_tool_info` | Look up the path, detected version, and official usage docs for one detected tool |
 | `get_environment` | Windows, shell and existing PATH directories; `include_network=false` skips HTTPS checks |
 | `refresh_env` | Force probes for `all`, `hardware`, `toolchain`, or `environment` |
 | `get_cache_status` | Report cache freshness and invalidation per category |
+
+This MCP is a pure probe: it reports what is present (tool names, versions,
+paths, and PATH status) with no usage guidance or documentation URLs, so its
+output stays compact and low-noise for agents.
 
 The server uses a native CPUID probe and Windows APIs. AVX-family flags are
 reported only when the operating system enables the corresponding XCR0 state.
@@ -47,21 +50,27 @@ hardware tool over stdio.
 
 The MCP config points directly to the native executable.
 
-Tool calls return concise text only by default. `get_toolchain` uses a stable,
-memory-friendly format headed by the computer name and a derived machine ID,
-followed by installed tool paths in a fixed order; tools found outside PATH are marked.
-Missing tools are omitted from both concise and detailed toolchain results.
-When usage is unclear, call `get_tool_info` with a name from that inventory to
-retrieve its path, detected version (when available), and curated official
-usage documentation URL. This lookup is read-only and does not install software.
+Tool calls return concise text only by default. `get_toolchain` reports each
+detected tool on its own line in a fixed order, as `NAME = PATH`, with the
+version appended when known and a `不在PATH` marker when it was found outside
+PATH. Missing tools are omitted from both concise and detailed toolchain
+results.
 Pass `detail: true` to `get_hardware`, `get_toolchain`, `get_environment`,
-`get_tool_info`, `refresh_env`, or `get_cache_status` to receive the full JSON data, including
+`refresh_env`, or `get_cache_status` to receive the full JSON data, including
 cache metadata and detailed CPU/environment fields.
 
 The server instructions ask AI clients to inspect project files before deciding
 which tools are needed and not to download, install, or run installers unless
 the user explicitly requests or approves it. Documentation links are for
 learning tool usage, not prompts to install a tool.
+
+`get_environment` reports the shell a terminal actually runs. When `pwsh` is
+installed it is probed as the primary shell, so `ps_version`,
+`supports_ampersand_ampersand`, and `has_heredoc` describe PowerShell 7+ rather
+than the legacy `powershell.exe`; `shell_path` and `shell_kind` identify which
+one was used, and `windows_powershell_version` records the legacy version
+whenever the legacy shell can be found and queried. Without `pwsh`,
+`powershell.exe` is used as before.
 
 `build-installer.ps1` creates `build\installer\machine-env-cpp-setup.exe`
 using NSIS. The installer is per-user, includes the prebuilt server, registers
