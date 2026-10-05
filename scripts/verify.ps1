@@ -125,6 +125,35 @@ try {
     Assert-That ($apps.count -is [int] -or $apps.count -is [long]) 'get_apps reports an application count'
     Assert-That ($apps.apps -is [array]) 'get_apps returns an application array'
 
+    Write-Step 'Protocol edges'
+    $handshake = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}'
+    # A notification carries no id and must not be answered: a reply would hand
+    # the client a response to a request it never made.
+    $notified = Invoke-Stdio @(
+        $handshake,
+        '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"get_system","arguments":{}}}'
+    )
+    Assert-That (@($notified).Count -eq 1) 'a notification is not answered'
+    # A line that is not JSON must be refused rather than dropped in silence.
+    $broken = Invoke-Stdio @($handshake, '{not json}')
+    Assert-That (@($broken)[1].error.code -eq -32700) 'a malformed line is refused with -32700'
+    $unknownMethod = Invoke-Stdio @($handshake, '{"jsonrpc":"2.0","id":9,"method":"bogus/method"}')
+    Assert-That (@($unknownMethod)[1].error.code -eq -32601) 'an unknown method is refused with -32601'
+    # The client proposes a version and the server answers with one it supports,
+    # so a client that asks for something else is not told it got it.
+    $negotiated = Invoke-Stdio @('{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1.0"}}')
+    Assert-That (@($negotiated)[0].result.protocolVersion -ne '1.0') 'an unsupported protocol version is not echoed back'
+
+    Write-Step 'Detailed app filter'
+    # A detailed result hands the payload back, so a filter that only shaped the
+    # summary used to be accepted and then ignored: the caller asked for a subset
+    # and received the whole inventory in hand instead.
+    $allApps = (Invoke-Stdio @('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_apps","arguments":{"detail":true}}}'))[0].result.structuredContent
+    Assert-That (@($allApps.apps).Count -eq $allApps.count) 'an unfiltered detailed result lists the whole inventory'
+    $noMatch = (Invoke-Stdio @('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_apps","arguments":{"detail":true,"filter":"zzz-no-such-app-xyz"}}}'))[0].result.structuredContent
+    Assert-That (@($noMatch.apps).Count -eq 0) 'a detailed result honours a filter that matches nothing'
+    Assert-That ($noMatch.count -eq $allApps.count) 'the inventory total survives a filter'
+
     Write-Step 'Tool lookup outside the probed catalog'
     # A requested name the catalog does not probe must be answered rather than
     # omitted: an empty answer is read as "not present".

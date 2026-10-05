@@ -624,6 +624,26 @@ void resolve_requested_tools(Json& payload,
     }
 }
 
+// The app filter shapes the summary while it is rendered, which a detailed
+// result never does: that one hands the payload back as it stands. Narrowing it
+// here is what stops the filter from being accepted and then ignored, leaving a
+// caller who asked for a subset holding every installed application instead.
+// count keeps meaning the size of the inventory, which is the total the summary
+// reports and the whole that the subset was drawn from.
+void narrow_apps(Json& payload, const std::vector<std::string>& filter) {
+    const Json& apps = payload.get("apps");
+    if (filter.empty() || !apps.is_array()) return;
+    Json kept = Json::array();
+    for (const auto& app : apps.as_array()) {
+        const std::string name = string_field(app, "name");
+        const std::string version = first_line(string_field(app, "version"));
+        const std::string publisher = string_field(app, "publisher");
+        if (matches_filter(filter, name + " " + version + " " + publisher))
+            kept.as_array().push_back(app);
+    }
+    payload["apps"] = kept;
+}
+
 Json dispatch(const Json& request, bool& has_response) {
     has_response = true;
     if (!request.is_object()) return rpc_error(nullptr, -32600, "invalid request");
@@ -754,6 +774,7 @@ Json dispatch(const Json& request, bool& has_response) {
         }
         payload = cached_probe(kind, refresh);
         if (kind == "toolchain") resolve_requested_tools(payload, filter);
+        if (detail && kind == "apps") narrow_apps(payload, filter);
 
         Json result = Json::object();
         if (payload.contains("error")) {
