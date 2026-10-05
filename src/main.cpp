@@ -947,10 +947,12 @@ int selftest() {
         detected_tools.contains("tool_total"))
         throw std::runtime_error("toolchain installed-only result test failed");
     if (!detected_tools.get("machine_id").is_string() ||
-        detected_tools.get("machine_id").as_string().empty() ||
-        detected_tools.get("machine_id").as_string() ==
-            detected_tools.get("machine_guid").as_string())
+        detected_tools.get("machine_id").as_string().empty())
         throw std::runtime_error("toolchain machine identity test failed");
+    // The raw Windows MachineGuid identifies the installation to anything that
+    // reads it, so only the derived id may leave the server.
+    if (detected_tools.contains("machine_guid"))
+        throw std::runtime_error("the raw MachineGuid is exposed");
     if (machine_uuid() != machine_uuid())
         throw std::runtime_error("machine identity is not stable");
     Json sample_system = Json::object();
@@ -1000,7 +1002,6 @@ int selftest() {
     Json sample_toolchain = Json::object();
     sample_toolchain["computer_name"] = "TEST-PC";
     sample_toolchain["machine_id"] = "test-machine-id";
-    sample_toolchain["machine_guid"] = "test-guid";
     sample_toolchain["tools"]["cl"] = "C:\\VS\\cl.exe";
     sample_toolchain["tools"]["git"] = "C:\\Git\\git.exe";
     sample_toolchain["tools"]["python"] =

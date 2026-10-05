@@ -1360,7 +1360,9 @@ Json probe_toolchain() {
             utf8(fs::path(wide(found.get("python").as_string())).parent_path().wstring());
     }
     result["machine_id"] = machine_uuid();
-    result["machine_guid"] = machine_guid();
+    // The raw MachineGuid is deliberately not reported: it identifies this
+    // installation to anything that reads it, and the derived id already answers
+    // whether two results came from the same machine.
     std::array<wchar_t, MAX_COMPUTERNAME_LENGTH + 1> computer{};
     DWORD computer_size = static_cast<DWORD>(computer.size());
     if (GetComputerNameW(computer.data(), &computer_size))

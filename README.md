@@ -192,8 +192,10 @@ services. Use this MCP as the source of current machine facts rather than
 keeping or injecting a static tool-path memory file.
 
 Toolchain results identify the machine with a stable, derived `machine_id`
-(plus the computer name) so shared accounts can tell machines apart; the raw
-Windows `MachineGuid` is not exposed in summaries.
+(plus the computer name) so shared accounts can tell machines apart. The raw
+Windows `MachineGuid` is not reported at all: it identifies the installation to
+anything that reads it, and the derived id already answers whether two results
+came from the same machine.
 
 The implementation is Windows-specific: it uses Win32, registry, CPUID, and
 WinHTTP APIs. Linux and macOS are not supported.
