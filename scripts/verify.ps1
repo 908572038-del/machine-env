@@ -130,6 +130,9 @@ try {
     # omitted: an empty answer is read as "not present".
     $lookup = (Invoke-Stdio @('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_tools","arguments":{"name":"no-such-tool-xyz"}}}'))[0]
     Assert-That ($lookup.result.content[0].text.Contains('NO-SUCH-TOOL-XYZ = ')) 'a name outside the probed catalog is answered rather than omitted'
+    # A filter that matches nothing must also say so instead of returning silence.
+    $phrase = (Invoke-Stdio @('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_tools","arguments":{"name":"no such phrase"}}}'))[0]
+    Assert-That ($phrase.result.content[0].text.Contains('no such phrase')) 'a filter that matches nothing says so'
 
     Write-Step 'Cache integrity'
     # A cache entry is not trusted blindly: an entry changed by something else

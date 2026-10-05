@@ -257,6 +257,20 @@ std::string summarize_toolchain(const Json& value,
             output << "- " << upper_ascii(name) << " = 未在 PATH 中找到";
         }
     }
+    // Saying that nothing matched is the difference between nothing being there
+    // and nothing having been compared, which is the same reason a looked-up
+    // name is answered instead of omitted.
+    if (first && tools.is_object()) {
+        if (filter.empty()) {
+            output << "未检测到任何已知工具";
+        } else {
+            output << "没有匹配的工具：";
+            for (std::size_t index = 0; index < filter.size(); ++index) {
+                if (index) output << ", ";
+                output << filter[index];
+            }
+        }
+    }
     // Visual Studio detection has its own failure mode: the locator can fail to
     // answer, and the tools it would have found then look uninstalled.
     if (value.get("vs_detection").is_string() &&

@@ -133,9 +133,10 @@ rather than paths, so asking for `cmake` does not also return `ninja` merely
 because it lives under a `CMake` directory. A name the probed catalog does not
 contain is looked up on PATH instead, so asking about a tool outside the catalog
 answers with its path rather than with nothing, and a name that is not on PATH
-says so. Missing tools are omitted, but a tool
-whose version probe failed is listed with a `版本未知` marker rather than being
-dropped, so a failed probe is never read as a missing tool.
+says so. A filter that matches nothing says that too, rather than returning an
+empty answer. Missing tools are omitted, but a tool whose version probe failed
+is listed with a `版本未知` marker rather than being dropped, so a failed probe
+is never read as a missing tool.
 `get_apps` returns only a count unless `filter` is given, because the full
 inventory is long and mostly noise. Both filters take comma-separated
 alternatives, and spaces inside one alternative are part of the phrase, so
