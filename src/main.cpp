@@ -198,16 +198,24 @@ std::string summarize_toolchain(const Json& value,
     std::ostringstream output;
     const Json& tools = value.get("tools");
     const Json& not_on_path = value.get("not_on_path");
-    // The set and the order come from the probe catalog, so a tool cannot be
-    // probed and then be missing from the concise answer.
-    const auto& order = tool_catalog_names();
+    // The catalog supplies the set and the order, so a tool cannot be probed and
+    // then be missing from the concise answer. A tool that was looked up by name
+    // because the catalog does not know it is appended to that order.
+    std::vector<std::string> order = tool_catalog_names();
+    if (tools.is_object()) {
+        for (const auto& entry : tools.as_object()) {
+            if (std::find(order.begin(), order.end(), entry.first) ==
+                order.end())
+                order.push_back(entry.first);
+        }
+    }
 
     const auto is_off_path = [&not_on_path](const std::string& name) {
         return array_contains(not_on_path, name);
     };
 
+    bool first = true;
     if (tools.is_object()) {
-        bool first = true;
         for (const auto& name : order) {
             const std::string path = string_field(tools, name);
             const std::string version = string_field(value.get("versions"), name);
@@ -234,6 +242,19 @@ std::string summarize_toolchain(const Json& value,
                 value.get("python_pip_mismatch").is_bool() &&
                 value.get("python_pip_mismatch").as_bool())
                 output << " 与PYTHON不同源";
+        }
+    }
+    // A requested name that is not on PATH is still an answer: saying so is the
+    // difference between "it is not there" and "nothing was looked for".
+    const Json& unresolved = value.get("unresolved_tools");
+    if (unresolved.is_array()) {
+        for (const auto& item : unresolved.as_array()) {
+            if (!item.is_string()) continue;
+            const std::string name = item.as_string();
+            if (!matches_filter(filter, name)) continue;
+            if (!first) output << "\n";
+            first = false;
+            output << "- " << upper_ascii(name) << " = 未在 PATH 中找到";
         }
     }
     // Visual Studio detection has its own failure mode: the locator can fail to
@@ -480,10 +501,10 @@ Json tools() {
     tool_list["properties"]["detail"] =
         boolean_schema("Return the full JSON result instead of a concise summary.");
     tool_list["properties"]["name"] = string_schema(
-        "Only report tools matching this text, for example \"cmake\" or \"cmake, ninja\".");
+        "Only report tools matching this text, for example \"cmake\" or \"cmake, ninja\". A name the probed catalog does not contain is looked up on PATH instead of being omitted.");
     list.as_array().push_back(tool_definition(
         "get_tools",
-        "Locate developer tools and report each executable path, version, and PATH status. Detected tools only.",
+        "Locate developer tools and report each executable path, version, and PATH status. A name outside the probed catalog is looked up on PATH rather than silently omitted.",
         tool_list));
 
     Json apps = object_schema();
@@ -536,6 +557,42 @@ Json rpc_error(const Json& id, int code, const std::string& message) {
     return response;
 }
 
+// The catalog is a fixed list, so a requested tool outside it would produce no
+// output at all, and silence is indistinguishable from "not present". Looking
+// the name up on PATH turns that silence into an answer.
+void resolve_requested_tools(Json& payload,
+                             const std::vector<std::string>& filter) {
+    if (filter.empty() || !payload.get("tools").is_object()) return;
+    const auto& catalog = tool_catalog_names();
+    for (const auto& name : filter) {
+        if (name.empty() ||
+            std::find(catalog.begin(), catalog.end(), name) != catalog.end())
+            continue;
+        // A phrase narrows a filter; it is not the name of a program.
+        if (name.find(' ') != std::string::npos ||
+            name.find('\t') != std::string::npos)
+            continue;
+        const Json located = locate_tool(name);
+        const std::string path = string_field(located, "path");
+        if (path.empty()) {
+            Json& unresolved = payload["unresolved_tools"];
+            if (!unresolved.is_array()) unresolved = Json::array();
+            unresolved.as_array().emplace_back(name);
+            continue;
+        }
+        payload["tools"][name] = path;
+        Json& versions = payload["versions"];
+        if (!versions.is_object()) versions = Json::object();
+        Json& unknown = payload["version_unknown"];
+        if (!unknown.is_array()) unknown = Json::array();
+        const std::string version = string_field(located, "version");
+        if (!version.empty())
+            versions[name] = version;
+        else
+            unknown.as_array().emplace_back(name);
+    }
+}
+
 Json dispatch(const Json& request, bool& has_response) {
     has_response = true;
     if (!request.is_object()) return rpc_error(nullptr, -32600, "invalid request");
@@ -577,7 +634,7 @@ Json dispatch(const Json& request, bool& has_response) {
             supported ? requested_version : "2025-11-25";
         result["capabilities"]["tools"]["listChanged"] = false;
         result["serverInfo"]["name"] = "machine-env-cpp";
-        result["serverInfo"]["version"] = "0.3.0";
+        result["serverInfo"]["version"] = server_version();
         result["instructions"] =
             "本 MCP 提供当前 Windows 机器的只读环境事实，共四个工具：get_system（操作系统、"
             "shell 能力、硬件（含 GPU 型号与显存）、权限与编码策略，不联网）、"
@@ -665,6 +722,7 @@ Json dispatch(const Json& request, bool& has_response) {
             filter = parse_filter(value.as_string());
         }
         payload = cached_probe(kind, refresh);
+        if (kind == "toolchain") resolve_requested_tools(payload, filter);
 
         Json result = Json::object();
         if (payload.contains("error")) {
@@ -965,6 +1023,18 @@ int selftest() {
         std::string::npos)
         throw std::runtime_error("alias with an unknown version was dropped");
 
+    // A requested tool the catalog does not know must be answered rather than
+    // omitted: silence would be read as "not present".
+    if (locate_tool("definitely-not-a-real-tool-xyz").get("path").is_string())
+        throw std::runtime_error("locate_tool produced a path for a fake name");
+    Json unresolved_sample = Json::object();
+    unresolved_sample["tools"] = Json::object();
+    unresolved_sample["unresolved_tools"] = Json::array();
+    unresolved_sample["unresolved_tools"].as_array().emplace_back("gh");
+    if (summarize_payload("get_tools", unresolved_sample, parse_filter("gh"))
+            .find("GH = 未在 PATH 中找到") == std::string::npos)
+        throw std::runtime_error("an unresolved requested tool was omitted");
+
     const std::string filtered_tools = summarize_payload(
         "get_tools", sample_toolchain, parse_filter("cmake, clang"));
     if (filtered_tools.find("CLANG") == std::string::npos ||
@@ -1048,7 +1118,7 @@ int wmain(int argc, wchar_t** argv) {
 
     try {
         if (argc > 1 && std::wstring(argv[1]) == L"--version") {
-            std::cout << "machine-env-cpp 0.3.0\n";
+            std::cout << "machine-env-cpp " << server_version() << "\n";
             return 0;
         }
         if (argc > 1 && std::wstring(argv[1]) == L"--selftest")

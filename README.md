@@ -15,7 +15,7 @@ builders, and Windows SDK packaging tools.
 | Tool | Purpose |
 | --- | --- |
 | `get_system` | Windows, CPUID/XCR0-backed hardware facts, shell, PATH, and machine policies. Local only; it never makes a network request |
-| `get_tools` | Locate developer tools; `name` narrows the answer to the tools asked about |
+| `get_tools` | Locate developer tools; `name` narrows the answer to the tools asked about, and a name the probe does not cover is looked up on PATH |
 | `get_apps` | Installed applications from the uninstall registry, including software with no command-line entry point; `filter` selects entries, otherwise only the count is returned |
 | `get_network` | GitHub, Hugging Face, and PyPI reachability; the only tool that makes outbound requests, and failures report a reason |
 
@@ -130,7 +130,10 @@ appended when known, a `不在PATH` marker when it was found outside PATH, and a
 than the reported `python`. Its `name` argument narrows the answer, so a single
 tool can be checked without paying for the whole list; it matches tool names
 rather than paths, so asking for `cmake` does not also return `ninja` merely
-because it lives under a `CMake` directory. Missing tools are omitted, but a tool
+because it lives under a `CMake` directory. A name the probed catalog does not
+contain is looked up on PATH instead, so asking about a tool outside the catalog
+answers with its path rather than with nothing, and a name that is not on PATH
+says so. Missing tools are omitted, but a tool
 whose version probe failed is listed with a `版本未知` marker rather than being
 dropped, so a failed probe is never read as a missing tool.
 `get_apps` returns only a count unless `filter` is given, because the full

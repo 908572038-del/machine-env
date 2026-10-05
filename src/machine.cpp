@@ -28,7 +28,7 @@ namespace machine_env {
 namespace {
 
 namespace fs = std::filesystem;
-constexpr char kServerVersion[] = "0.3.0";
+constexpr char kServerVersion[] = "0.3.1";
 constexpr int kDefaultTtl = 24 * 60 * 60;
 constexpr int kNetworkTtl = 10 * 60;
 
@@ -869,8 +869,11 @@ const char* network_failure_reason(DWORD error_code) {
 Json probe_one_endpoint(const wchar_t* host) {
     Json result = Json::object();
     const auto started = std::chrono::steady_clock::now();
+    // Built from the version constant so the two cannot drift apart.
+    static const std::wstring user_agent =
+        L"machine-env/" + wide(kServerVersion);
     HINTERNET session = WinHttpOpen(
-        L"machine-env/0.3.0",
+        user_agent.c_str(),
         WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!session) {
@@ -1170,6 +1173,31 @@ const std::vector<std::string>& tool_catalog_names() {
         return result;
     }();
     return names;
+}
+
+const char* server_version() { return kServerVersion; }
+
+Json locate_tool(const std::string& name) {
+    Json result = Json::object();
+    const std::wstring base = wide(name);
+    // SearchPathW only appends an extension when lpExtension is given, so the
+    // suffix has to be part of the name: passing a bare name looks for a file
+    // literally called that and never finds the executable.
+    const wchar_t* const suffixes[] = {L".exe", L".cmd", L".bat"};
+    for (const wchar_t* suffix : suffixes) {
+        const std::wstring found = search_executable((base + suffix).c_str());
+        if (found.empty()) continue;
+        result["path"] = utf8(found);
+        // Reading a version means running the file, so it stays limited to a
+        // plain executable, the same limit discovery already holds itself to.
+        if (_wcsicmp(suffix, L".exe") == 0) {
+            const auto version = run_process(found, L"--version");
+            if (version.ok && !version.output.empty())
+                result["version"] = normalize_version(version.output);
+        }
+        return result;
+    }
+    return result;
 }
 
 Json probe_toolchain() {

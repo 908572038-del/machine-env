@@ -125,6 +125,12 @@ try {
     Assert-That ($apps.count -is [int] -or $apps.count -is [long]) 'get_apps reports an application count'
     Assert-That ($apps.apps -is [array]) 'get_apps returns an application array'
 
+    Write-Step 'Tool lookup outside the probed catalog'
+    # A requested name the catalog does not probe must be answered rather than
+    # omitted: an empty answer is read as "not present".
+    $lookup = (Invoke-Stdio @('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_tools","arguments":{"name":"no-such-tool-xyz"}}}'))[0]
+    Assert-That ($lookup.result.content[0].text.Contains('NO-SUCH-TOOL-XYZ = ')) 'a name outside the probed catalog is answered rather than omitted'
+
     Write-Step 'Cache integrity'
     # A cache entry is not trusted blindly: an entry changed by something else
     # must be discarded and re-probed, never served as fact.
