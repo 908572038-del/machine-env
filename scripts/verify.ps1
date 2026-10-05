@@ -85,6 +85,11 @@ try {
     Assert-That (Test-Path -LiteralPath $script:Server) 'server executable installed'
     Assert-That (Test-Path -LiteralPath $configPath) 'global MCP config written'
     Assert-That (Test-Path -LiteralPath $vscodeRule) 'scoped instruction installed'
+    # applyTo is what makes the file attach on its own instead of waiting to be
+    # discovered by description, so losing it would quietly return the rule to
+    # on-demand without anything else changing.
+    $ruleFront = Get-Content -LiteralPath $vscodeRule -Encoding UTF8 -TotalCount 8
+    Assert-That (@($ruleFront | Where-Object { $_ -match '^applyTo:\s*"\*\*"\s*$' }).Count -eq 1) 'the installed rule declares applyTo so it attaches by itself'
     # A second copy would double the prompt cost for every request.
     Assert-That (-not (Test-Path -LiteralPath $copilotRule)) 'no duplicate instruction in the Copilot folder'
     $configured = (Get-Content -LiteralPath $configPath -Encoding UTF8 -Raw |
