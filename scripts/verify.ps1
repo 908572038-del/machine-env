@@ -134,6 +134,31 @@ try {
     $phrase = (Invoke-Stdio @('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_tools","arguments":{"name":"no such phrase"}}}'))[0]
     Assert-That ($phrase.result.content[0].text.Contains('no such phrase')) 'a filter that matches nothing says so'
 
+    Write-Step 'Visual Studio detection contract'
+    # "Could not look", "looked and found nothing" and "found it" are three
+    # different answers. vswhere also hides pre-release channels, so an empty
+    # answer only means absent when the query covered every instance.
+    $toolchainResponse = (Invoke-Stdio @('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_tools","arguments":{"detail":true,"refresh":true}}}'))[0]
+    $toolchain = $toolchainResponse.result.structuredContent
+    $toolchainText = [string]$toolchainResponse.result.content[0].text
+    $detection = [string]$toolchain.vs_detection
+    Assert-That ($detection -in @('ok', 'absent', 'unknown')) "vs_detection is one of ok/absent/unknown (got '$detection')"
+    Assert-That (($detection -ne 'ok') -or ($toolchain.vs_path.Length -gt 0)) 'a detected Visual Studio comes with the path it was found at'
+    Assert-That (($detection -eq 'ok') -or ($toolchain.vs_path.Length -eq 0)) 'a path is not left behind by a detection that did not succeed'
+    # A locator that exists and runs answers the question either way, so it must
+    # never leave the result indeterminate: that was the label inversion, where a
+    # completed query that matched nothing was reported as an unfinished one.
+    $pf86 = ${env:ProgramFiles(x86)}
+    if (-not $pf86) { $pf86 = 'C:\Program Files (x86)' }
+    $vswhere = Join-Path $pf86 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (Test-Path -LiteralPath $vswhere) {
+        Assert-That ($detection -ne 'unknown') 'a usable locator never reports the answer as indeterminate'
+    }
+    # The warning is only honest when the look itself failed; printing it after a
+    # completed query reports a successful probe as an incomplete one.
+    $vsWarning = -join ([char]0x68C0, [char]0x6D4B, [char]0x672A, [char]0x5B8C, [char]0x6210)
+    Assert-That ($toolchainText.Contains($vsWarning) -eq ($detection -eq 'unknown')) 'the Visual Studio warning appears only when the look itself failed'
+
     Write-Step 'Cache integrity'
     # A cache entry is not trusted blindly: an entry changed by something else
     # must be discarded and re-probed, never served as fact.

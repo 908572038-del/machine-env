@@ -331,23 +331,44 @@ std::wstring discover_python_executable() {
 // Not finding Visual Studio and failing to look for it are different answers,
 // so the caller is told which one happened instead of receiving an empty path
 // that reads as "not installed".
+//
+// An empty answer from a query that succeeded only means "not installed" when
+// the query covers every instance. This one did not: vswhere hides pre-release
+// channels by default, under which a complete IDE carrying its own compiler is
+// invisible (measured: Visual Studio Community Insiders 18.5 alongside Build
+// Tools, where only the latter was reported). Preferring a stable instance and
+// falling back to a pre-release one keeps that IDE's tools discoverable while
+// leaving an empty answer meaning genuinely absent.
 std::wstring visual_studio_root(std::string& detection) {
-    detection = "absent";
+    // Nothing has been observed yet, and "not checked" must not be reported as
+    // "not installed".
+    detection = "unknown";
     std::wstring program_files_x86 = environment_variable(L"ProgramFiles(x86)");
     if (program_files_x86.empty())
         program_files_x86 = L"C:\\Program Files (x86)";
     const fs::path vswhere =
         fs::path(program_files_x86) /
         L"Microsoft Visual Studio" / L"Installer" / L"vswhere.exe";
+    // A missing locator is a look that failed, not an absent product.
     if (!fs::exists(vswhere)) return {};
-    const auto result = run_process(
+    const auto stable = run_process(
         vswhere.wstring(), L"-latest -products * -property installationPath");
-    if (!result.ok || result.output.empty()) {
-        detection = "unknown";
+    if (!stable.ok) return {};
+    if (!stable.output.empty()) {
+        detection = "ok";
+        return wide(stable.output);
+    }
+    const auto prerelease = run_process(
+        vswhere.wstring(),
+        L"-latest -prerelease -products * -property installationPath");
+    if (!prerelease.ok) return {};
+    if (prerelease.output.empty()) {
+        // The query completed and covered every channel, so nothing is there.
+        detection = "absent";
         return {};
     }
     detection = "ok";
-    return wide(result.output);
+    return wide(prerelease.output);
 }
 
 bool registry_dword(HKEY root, const wchar_t* key_path,
