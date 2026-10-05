@@ -66,6 +66,15 @@ std::string upper_ascii(const std::string& value) {
     return result;
 }
 
+std::string join_tokens(const std::vector<std::string>& values) {
+    std::string result;
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        if (index) result += ", ";
+        result += values[index];
+    }
+    return result;
+}
+
 bool array_contains(const Json& array, const std::string& value) {
     if (!array.is_array()) return false;
     for (const auto& item : array.as_array()) {
@@ -215,12 +224,16 @@ std::string summarize_toolchain(const Json& value,
     };
 
     bool first = true;
+    bool selected_known = false;
     if (tools.is_object()) {
         for (const auto& name : order) {
             const std::string path = string_field(tools, name);
             const std::string version = string_field(value.get("versions"), name);
             const bool version_unknown =
                 array_contains(value.get("version_unknown"), name);
+            // Whether the filter selected a tool the probe knows is a different
+            // question from whether that tool was found.
+            if (matches_filter(filter, name)) selected_known = true;
             // An alias is only dropped when a version was measured: dropping it
             // after a failed probe would report an installed tool as missing.
             if (path.empty() ||
@@ -263,12 +276,12 @@ std::string summarize_toolchain(const Json& value,
     if (first && tools.is_object()) {
         if (filter.empty()) {
             output << "未检测到任何已知工具";
+        } else if (selected_known) {
+            // The filter named something the probe covers, so the tool is
+            // absent; that is not the same as the filter matching nothing.
+            output << "未检测到：" << join_tokens(filter);
         } else {
-            output << "没有匹配的工具：";
-            for (std::size_t index = 0; index < filter.size(); ++index) {
-                if (index) output << ", ";
-                output << filter[index];
-            }
+            output << "没有匹配的工具：" << join_tokens(filter);
         }
     }
     // Visual Studio detection has its own failure mode: the locator can fail to
@@ -1048,6 +1061,18 @@ int selftest() {
     if (summarize_payload("get_tools", unresolved_sample, parse_filter("gh"))
             .find("GH = 未在 PATH 中找到") == std::string::npos)
         throw std::runtime_error("an unresolved requested tool was omitted");
+
+    // A filter that selected a known tool which is not present is a different
+    // answer from a filter that matched nothing at all.
+    Json absent_sample = Json::object();
+    absent_sample["tools"] = Json::object();
+    if (summarize_payload("get_tools", absent_sample, parse_filter("cmake"))
+            .find("未检测到：cmake") == std::string::npos)
+        throw std::runtime_error("an absent known tool was called no match");
+    if (summarize_payload("get_tools", absent_sample,
+                          parse_filter("no such phrase"))
+            .find("没有匹配的工具") == std::string::npos)
+        throw std::runtime_error("a filter matching nothing did not say so");
 
     const std::string filtered_tools = summarize_payload(
         "get_tools", sample_toolchain, parse_filter("cmake, clang"));
