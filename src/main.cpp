@@ -693,12 +693,10 @@ Json dispatch(const Json& request, bool& has_response) {
         result["instructions"] =
             "本机环境必须实测，不得凭操作系统惯例、旧记忆或猜测推断。涉及系统、shell、"
             "工具路径或版本、已装软件、硬件（含 GPU）、编码或权限，或要为本机选择构建、"
-            "测试、运行命令时，先查本 MCP 再作答。get_system=系统与硬件；"
-            "get_tools=工具路径与版本（用 name 只查所需）；get_apps=已装软件（须给 filter）；"
-            "get_network=联网（唯一外部请求，非必要不调用）。本 MCP 只读："
-            "未经用户明确要求或批准，不下载、不安装、不运行安装程序，不修改全局环境。"
-            "未检测到即说明缺失或给出替代方案，不要假设已安装；source=unknown 表示未验证，"
-            "不得当作支持。留意返回值中的约束（如不支持 &&、原生输出非 UTF-8）并据此改写命令。";
+            "测试、运行命令时，先查本 MCP 再作答。本 MCP 只读：未经用户明确要求或批准，"
+            "不下载、不安装、不运行安装程序，不修改全局环境。未检测到即说明缺失或给出"
+            "替代方案，不要假设已安装；source=unknown 表示未验证，不得当作支持。"
+            "留意返回值中的约束（如不支持 &&、原生输出非 UTF-8）并据此改写命令。";
         Json response = Json::object();
         response["jsonrpc"] = "2.0";
         response["id"] = id;
