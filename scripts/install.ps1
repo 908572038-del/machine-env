@@ -1,6 +1,10 @@
+param(
+    [switch]$SkipBuild
+)
+
 $ErrorActionPreference = 'Stop'
 
-$Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
 $serverName = 'machine-env-cpp'
 $previousServerName = 'machine-env'
@@ -13,19 +17,46 @@ function Write-Ok([string]$Text) {
     Write-Host "   OK  $Text" -ForegroundColor Green
 }
 
-Write-Step 'Building native C++ MCP server'
-& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Root 'build.ps1')
-if ($LASTEXITCODE -ne 0) {
-    throw "Native build failed with exit code $LASTEXITCODE"
+if (-not $SkipBuild) {
+    Write-Step 'Building native C++ MCP server'
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'build.ps1')
+    if ($LASTEXITCODE -ne 0) {
+        throw "Native build failed with exit code $LASTEXITCODE"
+    }
 }
 
-$server = Join-Path $Root 'build\machine-env-cpp.exe'
-if (-not (Test-Path -LiteralPath $server)) {
-    throw "Native MCP server was not produced: $server"
+$builtServer = Join-Path $Root 'build\machine-env-cpp.exe'
+$configScriptSource = Join-Path $PSScriptRoot 'configure-mcp.ps1'
+$instructionsSource = Join-Path $PSScriptRoot 'machine-env-cpp.instructions.md'
+$uninstallScriptSource = Join-Path $PSScriptRoot 'uninstall-portable.ps1'
+if (-not (Test-Path -LiteralPath $builtServer)) {
+    throw "Native MCP server was not produced: $builtServer"
 }
+if (-not (Test-Path -LiteralPath $instructionsSource -PathType Leaf)) {
+    throw "MCP instructions file was not found: $instructionsSource"
+}
+if (-not (Test-Path -LiteralPath $configScriptSource -PathType Leaf) -or
+    -not (Test-Path -LiteralPath $uninstallScriptSource -PathType Leaf)) {
+    throw 'MCP install or uninstall support scripts were not found.'
+}
+if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+    throw 'LOCALAPPDATA is not set; cannot determine the per-user install directory.'
+}
+$installDirectory = Join-Path $env:LOCALAPPDATA 'Programs\machine-env-cpp'
+$server = Join-Path $installDirectory 'machine-env-cpp.exe'
+New-Item -ItemType Directory -Path $installDirectory -Force | Out-Null
+Copy-Item -LiteralPath $builtServer -Destination $server -Force
+Copy-Item -LiteralPath $configScriptSource -Destination $installDirectory -Force
+Copy-Item -LiteralPath $instructionsSource -Destination $installDirectory -Force
+Copy-Item -LiteralPath $uninstallScriptSource -Destination $installDirectory -Force
 
 Write-Step 'Updating VS Code MCP configuration'
-$configPath = Join-Path $env:USERPROFILE '.copilot\mcp-config.json'
+$copilotHome = if ([string]::IsNullOrWhiteSpace($env:COPILOT_HOME)) {
+    Join-Path $env:USERPROFILE '.copilot'
+} else {
+    $env:COPILOT_HOME
+}
+$configPath = Join-Path $copilotHome 'mcp-config.json'
 $configDir = Split-Path -Parent $configPath
 if (-not (Test-Path -LiteralPath $configDir)) {
     New-Item -ItemType Directory -Force -Path $configDir | Out-Null
@@ -34,7 +65,7 @@ if (-not (Test-Path -LiteralPath $configDir)) {
 $existing = $null
 if (Test-Path -LiteralPath $configPath) {
     try {
-        $existing = Get-Content -LiteralPath $configPath -Raw |
+        $existing = Get-Content -LiteralPath $configPath -Encoding UTF8 -Raw |
             ConvertFrom-Json -ErrorAction Stop
     } catch {
         throw "Refusing to overwrite invalid MCP config '$configPath': $($_.Exception.Message)"
@@ -47,13 +78,31 @@ if (Test-Path -LiteralPath $configPath) {
         $existing.mcpServers -isnot [System.Management.Automation.PSCustomObject]) {
         throw "Refusing to overwrite '$configPath': 'mcpServers' must be a JSON object."
     }
-    Copy-Item -LiteralPath $configPath -Destination "$configPath.bak" -Force
+    if (-not (Test-Path -LiteralPath "$configPath.bak")) {
+        Copy-Item -LiteralPath $configPath -Destination "$configPath.bak" -Force
+    }
 }
 
 $servers = [ordered]@{}
 if ($existing -and $existing.mcpServers) {
     foreach ($property in $existing.mcpServers.PSObject.Properties) {
-        if ($property.Name -eq $previousServerName) { continue }
+        if ($property.Name -eq $previousServerName) {
+            # Drop the legacy entry only when it points into this product's
+            # install directory; a user's own server of that name is kept.
+            $legacy = [string]$property.Value.command
+            $belongs = $false
+            if (-not [string]::IsNullOrWhiteSpace($legacy)) {
+                try {
+                    $resolved = [System.IO.Path]::GetFullPath($legacy)
+                    $belongs = $resolved.StartsWith(
+                        $installDirectory + '\',
+                        [System.StringComparison]::OrdinalIgnoreCase)
+                } catch {
+                    $belongs = $false
+                }
+            }
+            if ($belongs) { continue }
+        }
         $servers[$property.Name] = $property.Value
     }
 }
@@ -74,8 +123,24 @@ if ($existing) {
 $merged['mcpServers'] = $servers
 $json = $merged | ConvertTo-Json -Depth 20
 $encoding = New-Object System.Text.UTF8Encoding $false
-[System.IO.File]::WriteAllText($configPath, $json, $encoding)
+$temporaryConfig = "$configPath.$PID.tmp"
+try {
+    [System.IO.File]::WriteAllText($temporaryConfig, $json, $encoding)
+    Move-Item -LiteralPath $temporaryConfig -Destination $configPath -Force
+} finally {
+    if (Test-Path -LiteralPath $temporaryConfig) {
+        Remove-Item -LiteralPath $temporaryConfig -Force
+    }
+}
 Write-Ok "wrote $configPath"
+
+if ([string]::IsNullOrWhiteSpace($env:APPDATA)) {
+    throw 'APPDATA is not set; cannot install the VS Code instruction file.'
+}
+$vscodeInstructionDirectory = Join-Path $env:APPDATA 'Code\User\prompts'
+New-Item -ItemType Directory -Path $vscodeInstructionDirectory -Force | Out-Null
+Copy-Item -LiteralPath $instructionsSource -Destination (Join-Path $vscodeInstructionDirectory 'machine-env-cpp.instructions.md') -Force
+Write-Ok 'installed the MCP-scoped instruction for VS Code'
 if (Test-Path -LiteralPath "$configPath.bak") {
     Write-Host "        prior config backed up to $configPath.bak"
 }
@@ -100,16 +165,13 @@ $requests = @(
         jsonrpc = '2.0'
         id = 3
         method = 'tools/call'
-        params = @{ name = 'get_hardware'; arguments = @{ detail = $true } }
+        params = @{ name = 'get_system'; arguments = @{ detail = $true } }
     } | ConvertTo-Json -Depth 20 -Compress),
     ([ordered]@{
         jsonrpc = '2.0'
         id = 4
         method = 'tools/call'
-        params = @{
-            name = 'get_environment'
-            arguments = @{ include_network = $false; detail = $true }
-        }
+        params = @{ name = 'get_tools'; arguments = @{ detail = $true } }
     } | ConvertTo-Json -Depth 20 -Compress)
 )
 [System.IO.File]::WriteAllLines(
@@ -162,31 +224,36 @@ try {
     $listing = $byId['2']
     $names = @($listing.result.tools | ForEach-Object { $_.name })
     $expected = @(
-        'get_hardware',
-        'get_toolchain',
-        'get_environment',
-        'refresh_env',
-        'get_cache_status'
+        'get_system',
+        'get_tools',
+        'get_apps',
+        'get_network'
     )
     if ($listing.error -or (@($expected | Where-Object { $_ -notin $names }).Count -gt 0)) {
         throw "MCP tools/list is incomplete: $($names -join ', ')"
     }
-    $hardware = $byId['3']
-    $data = $hardware.result.structuredContent
-    if (-not $data.brand -or -not $data.isa) {
-        throw "MCP hardware probe failed: $($hardware | ConvertTo-Json -Compress -Depth 6)"
+    if ($names.Count -ne $expected.Count) {
+        throw "Expected exactly $($expected.Count) tools; received $($names.Count)."
     }
-    $environment = $byId['4'].result.structuredContent
-    if ($environment.network -or -not $environment.os -or -not $environment.paths) {
-        throw 'Local-only environment probe returned an invalid result.'
+    $systemResult = $byId['3']
+    if ($systemResult.result.isError) {
+        throw "get_system reported an error: $($systemResult | ConvertTo-Json -Compress -Depth 6)"
+    }
+    $data = $systemResult.result.structuredContent
+    if (-not $data.os -or -not $data.hardware -or -not $data.hardware.brand) {
+        throw "MCP system probe failed: $($systemResult | ConvertTo-Json -Compress -Depth 6)"
+    }
+    $toolsResult = $byId['4'].result.structuredContent
+    if (-not $toolsResult.tools) {
+        throw 'MCP toolchain probe returned an invalid result.'
     }
     Write-Ok "handshake: $($initialize.result.serverInfo.name) v$($initialize.result.serverInfo.version)"
     Write-Ok "tools: $($names -join ', ')"
-    Write-Ok "hardware: $($data.brand), usable vector width $($data.vector_width_bits)"
-    Write-Ok 'environment: local-only probe works without network requests'
+    Write-Ok "system: $($data.os.caption), $($data.hardware.brand)"
+    Write-Ok "tools probe: $($toolsResult.tool_count) detected"
 } finally {
     $process.Dispose()
     Remove-Item -LiteralPath $wirePath -Force -ErrorAction SilentlyContinue
 }
 
-Write-Host "`nINSTALL COMPLETE — machine-env-cpp MCP is configured." -ForegroundColor Green
+Write-Host "`nINSTALL COMPLETE - machine-env-cpp MCP is configured." -ForegroundColor Green

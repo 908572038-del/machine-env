@@ -28,7 +28,7 @@ namespace machine_env {
 namespace {
 
 namespace fs = std::filesystem;
-constexpr char kServerVersion[] = "0.2.0";
+constexpr char kServerVersion[] = "0.3.0";
 constexpr int kDefaultTtl = 24 * 60 * 60;
 constexpr int kNetworkTtl = 10 * 60;
 
@@ -118,8 +118,18 @@ ProcessResult run_process(const std::wstring& executable,
     startup.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
     startup.wShowWindow = SW_HIDE;
     startup.hStdOutput = write_pipe;
-    startup.hStdError = write_pipe;
-    startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    // Give the child its own stdin and discard its stderr. Inheriting the
+    // server's stdin would let a probing tool consume the JSON-RPC request
+    // stream, and merging stderr into the captured pipe would let a single
+    // warning line shift every value a caller reads by position.
+    HANDLE null_device = CreateFileW(
+        L"NUL", GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, &security, OPEN_EXISTING, 0,
+        nullptr);
+    startup.hStdInput =
+        null_device ? null_device : GetStdHandle(STD_INPUT_HANDLE);
+    startup.hStdError =
+        null_device ? null_device : GetStdHandle(STD_ERROR_HANDLE);
 
     std::wstring command_line = quote_argument(executable);
     if (!arguments.empty()) {
@@ -135,6 +145,7 @@ ProcessResult run_process(const std::wstring& executable,
         executable.c_str(), mutable_command.data(), nullptr, nullptr, TRUE,
         CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process);
     CloseHandle(write_pipe);
+    if (null_device) CloseHandle(null_device);
     if (!created) {
         CloseHandle(read_pipe);
         result.error = "CreateProcess failed with code " +
@@ -161,8 +172,12 @@ ProcessResult run_process(const std::wstring& executable,
     if (wait == WAIT_TIMEOUT) {
         TerminateProcess(process.hProcess, ERROR_TIMEOUT);
         WaitForSingleObject(process.hProcess, INFINITE);
+        // A grandchild that still holds the pipe write end would keep the reader
+        // blocked forever, so cancel its pending read before joining it.
+        CancelSynchronousIo(reader.native_handle());
         result.error = "process timed out";
     } else if (wait != WAIT_OBJECT_0) {
+        CancelSynchronousIo(reader.native_handle());
         result.error = "process wait failed";
     }
     GetExitCodeProcess(process.hProcess, &result.exit_code);
@@ -187,9 +202,16 @@ ProcessResult run_process(const std::wstring& executable,
     return result;
 }
 
+// Defined below, after the registry helpers it reads the path with.
+std::wstring system_path();
+
 std::wstring search_executable(const wchar_t* name) {
+    // An explicit path replaces the default search order, which would also
+    // consult the current directory and the process environment.
+    const std::wstring path = system_path();
     std::array<wchar_t, 32768> buffer{};
-    const DWORD size = SearchPathW(nullptr, name, nullptr,
+    const DWORD size = SearchPathW(path.empty() ? nullptr : path.c_str(), name,
+                                   nullptr,
                                    static_cast<DWORD>(buffer.size()),
                                    buffer.data(), nullptr);
     return size && size < buffer.size() ? std::wstring(buffer.data(), size)
@@ -217,6 +239,51 @@ bool is_existing_directory(const std::wstring& path) {
     const DWORD attributes = GetFileAttributesW(path.c_str());
     return attributes != INVALID_FILE_ATTRIBUTES &&
            (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+// Version components are compared as numbers, not as text: otherwise "3.9"
+// would outrank "3.14" and an older toolset would be preferred.
+std::vector<long long> numeric_parts(const std::wstring& text) {
+    std::vector<long long> parts;
+    long long current = -1;
+    for (const wchar_t ch : text) {
+        if (ch >= L'0' && ch <= L'9') {
+            if (current < 0) current = 0;
+            if (current < 100000000000000LL)
+                current = current * 10 + (ch - L'0');
+        } else if (current >= 0) {
+            parts.push_back(current);
+            current = -1;
+        }
+    }
+    if (current >= 0) parts.push_back(current);
+    return parts;
+}
+
+void sort_newest_first(std::vector<fs::path>& directories) {
+    std::sort(directories.begin(), directories.end(),
+              [](const fs::path& left, const fs::path& right) {
+                  return numeric_parts(left.filename().wstring()) >
+                         numeric_parts(right.filename().wstring());
+              });
+}
+
+// Order directories by their numeric components so "v3.14" outranks "v3.9"
+// without a hardcoded version list that would go stale.
+std::vector<fs::path> directories_by_newest(const fs::path& parent,
+                                            const std::wstring& prefix) {
+    std::vector<fs::path> found;
+    std::error_code ec;
+    for (fs::directory_iterator it(parent, ec), end; !ec && it != end;
+         it.increment(ec)) {
+        std::error_code entry_error;
+        if (!it->is_directory(entry_error)) continue;
+        const std::wstring name = it->path().filename().wstring();
+        if (!prefix.empty() && name.rfind(prefix, 0) != 0) continue;
+        found.push_back(it->path());
+    }
+    sort_newest_first(found);
+    return found;
 }
 
 std::wstring discover_python_executable() {
@@ -248,7 +315,7 @@ std::wstring discover_python_executable() {
                 is_python_install_directory(it->path().filename().wstring()))
                 candidates.push_back(it->path());
         }
-        std::sort(candidates.rbegin(), candidates.rend());
+        sort_newest_first(candidates);
         for (const auto& candidate : candidates) {
             const fs::path executable = candidate / L"python.exe";
             ec.clear();
@@ -261,7 +328,11 @@ std::wstring discover_python_executable() {
     return is_windows_apps_path(on_path) ? std::wstring{} : on_path;
 }
 
-std::wstring visual_studio_root() {
+// Not finding Visual Studio and failing to look for it are different answers,
+// so the caller is told which one happened instead of receiving an empty path
+// that reads as "not installed".
+std::wstring visual_studio_root(std::string& detection) {
+    detection = "absent";
     std::wstring program_files_x86 = environment_variable(L"ProgramFiles(x86)");
     if (program_files_x86.empty())
         program_files_x86 = L"C:\\Program Files (x86)";
@@ -270,9 +341,40 @@ std::wstring visual_studio_root() {
         L"Microsoft Visual Studio" / L"Installer" / L"vswhere.exe";
     if (!fs::exists(vswhere)) return {};
     const auto result = run_process(
-        vswhere.wstring(), L"-latest -property installationPath");
-    if (!result.ok || result.output.empty()) return {};
+        vswhere.wstring(), L"-latest -products * -property installationPath");
+    if (!result.ok || result.output.empty()) {
+        detection = "unknown";
+        return {};
+    }
+    detection = "ok";
     return wide(result.output);
+}
+
+bool registry_dword(HKEY root, const wchar_t* key_path,
+                    const wchar_t* value_name, DWORD& value) {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(root, key_path, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
+        return false;
+    DWORD type = 0;
+    DWORD size = sizeof(value);
+    const LONG status = RegQueryValueExW(
+        key, value_name, nullptr, &type, reinterpret_cast<BYTE*>(&value), &size);
+    RegCloseKey(key);
+    return status == ERROR_SUCCESS && type == REG_DWORD && size == sizeof(DWORD);
+}
+
+bool registry_qword(HKEY root, const wchar_t* key_path,
+                    const wchar_t* value_name, unsigned long long& value) {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(root, key_path, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
+        return false;
+    DWORD type = 0;
+    DWORD size = sizeof(value);
+    const LONG status = RegQueryValueExW(
+        key, value_name, nullptr, &type, reinterpret_cast<BYTE*>(&value), &size);
+    RegCloseKey(key);
+    return status == ERROR_SUCCESS && type == REG_QWORD &&
+           size == sizeof(unsigned long long);
 }
 
 std::wstring registry_string(HKEY root, const wchar_t* key_path,
@@ -301,9 +403,30 @@ std::wstring registry_string(HKEY root, const wchar_t* key_path,
         const DWORD length = ExpandEnvironmentStringsW(
             value.c_str(), expanded.data(),
             static_cast<DWORD>(expanded.size()));
-        if (length && length < expanded.size()) return expanded.data();
+        // Reporting "%ProgramFiles%\Foo" as an install location would look like
+        // a usable path, so an unexpanded value counts as unknown instead.
+        if (!length || length >= expanded.size()) return {};
+        return expanded.data();
     }
     return value;
+}
+
+// The PATH a newly started shell receives lives in the registry: the
+// machine-wide value first, then the per-user one, which is the order Windows
+// composes them in. The server's own copy was captured when it started, so a
+// tool installed and added to PATH afterwards would be reported as missing by
+// every later probe, including one that asked to refresh. Re-reading the
+// registry on each probe is what keeps a refresh meaningful.
+std::wstring system_path() {
+    const std::wstring machine = registry_string(
+        HKEY_LOCAL_MACHINE,
+        L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment",
+        L"Path");
+    const std::wstring user =
+        registry_string(HKEY_CURRENT_USER, L"Environment", L"Path");
+    if (machine.empty()) return user;
+    if (user.empty()) return machine;
+    return machine + L";" + user;
 }
 
 std::wstring find_visual_studio_tool(const std::wstring& root,
@@ -320,7 +443,7 @@ std::wstring find_visual_studio_tool(const std::wstring& root,
          it.increment(ec)) {
         if (it->is_directory(ec)) candidates.push_back(it->path());
     }
-    std::sort(candidates.rbegin(), candidates.rend());
+    sort_newest_first(candidates);
     for (const auto& version : candidates) {
         const fs::path candidate =
             version / L"bin" / L"Hostx64" / L"x64" / relative;
@@ -350,18 +473,18 @@ std::wstring find_packaging_tool(const std::wstring& name,
     } else if (name == L"iscc") {
         for (const auto& root : {program_files_x86, program_files}) {
             if (root.empty()) continue;
-            candidates.emplace_back(fs::path(root) / L"Inno Setup 7" / L"ISCC.exe");
-            candidates.emplace_back(fs::path(root) / L"Inno Setup 6" / L"ISCC.exe");
+            for (const auto& directory :
+                 directories_by_newest(fs::path(root), L"Inno Setup"))
+                candidates.emplace_back(directory / L"ISCC.exe");
         }
     } else if (name == L"candle" || name == L"light") {
         for (const auto& root : {program_files_x86, program_files}) {
             if (root.empty()) continue;
-            for (const wchar_t* version : {L"v3.14", L"v3.13", L"v3.12",
-                                           L"v3.11"}) {
-                candidates.emplace_back(fs::path(root) / L"WiX Toolset" /
-                                        version / L"bin" /
-                                        (name + L".exe"));
-            }
+            for (const auto& toolset :
+                 directories_by_newest(fs::path(root), L"WiX Toolset"))
+                for (const auto& version : directories_by_newest(toolset, L"v"))
+                    candidates.emplace_back(version / L"bin" /
+                                            (name + L".exe"));
         }
     } else if (name == L"msbuild" && !vs_root.empty()) {
         candidates.emplace_back(fs::path(vs_root) / L"MSBuild" / L"Current" /
@@ -370,19 +493,15 @@ std::wstring find_packaging_tool(const std::wstring& name,
                                 L"Bin" / L"amd64" / L"MSBuild.exe");
     } else if ((name == L"makeappx" || name == L"signtool") &&
                !program_files_x86.empty()) {
-        const fs::path sdk_root =
-            fs::path(program_files_x86) / L"Windows Kits" / L"10" / L"bin";
-        std::error_code ec;
-        std::vector<fs::path> versions;
-        for (fs::directory_iterator it(sdk_root, ec), end; !ec && it != end;
-             it.increment(ec)) {
-            std::error_code entry_error;
-            if (it->is_directory(entry_error))
-                versions.push_back(it->path());
-        }
-        std::sort(versions.rbegin(), versions.rend());
-        for (const auto& version : versions) {
-            candidates.emplace_back(version / L"x64" / (name + L".exe"));
+        // The SDK major version and its sub-versions change over time, so scan
+        // instead of assuming a "10" root or a specific build number.
+        const fs::path kits = fs::path(program_files_x86) / L"Windows Kits";
+        for (const auto& kit : directories_by_newest(kits, L"")) {
+            const fs::path bin = kit / L"bin";
+            for (const auto& version : directories_by_newest(bin, L""))
+                candidates.emplace_back(version / L"x64" / (name + L".exe"));
+            // Older SDK layouts keep the architectures directly under bin.
+            candidates.emplace_back(bin / L"x64" / (name + L".exe"));
         }
     }
 
@@ -393,11 +512,7 @@ std::wstring find_packaging_tool(const std::wstring& name,
     return {};
 }
 
-Json string_array(const std::vector<std::string>& values) {
-    Json result = Json::array();
-    for (const auto& value : values) result.as_array().emplace_back(value);
-    return result;
-}
+
 
 std::string current_time_iso() {
     const auto now = std::chrono::system_clock::now();
@@ -486,6 +601,30 @@ fs::path cache_file(const std::string& kind) {
 
 std::string cache_read_failure;
 
+// A cache entry carries a checksum over everything that decides the answer, so
+// a file that was edited, truncated, or half-written by something else is
+// rejected and re-probed instead of being served as fact. The point is that a
+// wrong answer must not be silent; the checksum detects corruption rather than
+// forgery, since anything able to rewrite the file could also recompute it.
+std::string cache_checksum(const Json& entry) {
+    Json covered = Json::object();
+    for (const char* key :
+         {"cached_at", "fingerprint", "machine_guid", "payload"}) {
+        if (entry.contains(key)) covered[key] = entry.get(key);
+    }
+    // Object keys serialize in sorted order and numbers use a fixed precision,
+    // so the same content always yields the same bytes and the same checksum.
+    const std::string serialized = dump_json(covered);
+    std::uint64_t hash = 14695981039346656037ull;
+    for (const char byte : serialized) {
+        hash ^= static_cast<unsigned char>(byte);
+        hash *= 1099511628211ull;
+    }
+    std::ostringstream output;
+    output << std::hex << hash;
+    return output.str();
+}
+
 Json read_cache_entry(const std::string& kind, int ttl,
                       bool ignore_expiry = false) {
     cache_read_failure = "no cache file";
@@ -509,6 +648,18 @@ Json read_cache_entry(const std::string& kind, int ttl,
             cache_read_failure = "cache has invalid fields";
             return Json();
         }
+        // Verify before trusting anything the entry says: an entry written by
+        // an older build has no checksum, so it is discarded once and then
+        // rewritten in the current form.
+        const Json& checksum_value = entry.get("checksum");
+        if (!checksum_value.is_string()) {
+            cache_read_failure = "cache has no checksum";
+            return Json();
+        }
+        if (checksum_value.as_string() != cache_checksum(entry)) {
+            cache_read_failure = "cache failed its checksum";
+            return Json();
+        }
         const Json& machine_value = entry.get("machine_guid");
         if (!machine_value.is_string() ||
             machine_value.as_string() != machine_guid()) {
@@ -521,7 +672,12 @@ Json read_cache_entry(const std::string& kind, int ttl,
             cache_read_failure = "cache timestamp is in the future";
             return Json();
         }
-        if (fingerprint_value.as_string() != source_fingerprint()) {
+        const std::string current_fingerprint = source_fingerprint();
+        if (current_fingerprint.empty()) {
+            cache_read_failure = "server binary could not be verified";
+            return Json();
+        }
+        if (fingerprint_value.as_string() != current_fingerprint) {
             cache_read_failure = "server binary changed";
             return Json();
         }
@@ -553,6 +709,7 @@ bool write_cache_entry(const std::string& kind, const Json& payload,
     entry["fingerprint"] = source_fingerprint();
     entry["machine_guid"] = machine_guid();
     entry["payload"] = payload;
+    entry["checksum"] = cache_checksum(entry);
     const std::string serialized = dump_json(entry);
 
     const fs::path destination = cache_file(kind);
@@ -679,7 +836,7 @@ std::string cpu_vendor(char* brand_out, std::size_t brand_size,
     isa["avx2"] = avx && ((ebx7 >> 5) & 1);
     isa["fma"] = avx && ((ecx >> 12) & 1);
     isa["f16c"] = avx && ((ecx >> 29) & 1);
-    isa["avx_vnni"] = max_leaf >= 7 && ((eax71 >> 4) & 1);
+    isa["avx_vnni"] = avx && ((eax71 >> 4) & 1);
     isa["avx512f"] = avx512;
     isa["avx512bw"] = avx512 && ((ebx7 >> 30) & 1);
     isa["avx512vnni"] = avx512 && ((ecx7 >> 11) & 1);
@@ -687,11 +844,33 @@ std::string cpu_vendor(char* brand_out, std::size_t brand_size,
     return vendor;
 }
 
+// "Unreachable" alone is not actionable, so classify the failure the caller
+// would otherwise have to re-discover by hand.
+const char* network_failure_reason(DWORD error_code) {
+    switch (error_code) {
+        case ERROR_WINHTTP_NAME_NOT_RESOLVED:
+            return "dns";
+        case ERROR_WINHTTP_CANNOT_CONNECT:
+            return "connect";
+        case ERROR_WINHTTP_TIMEOUT:
+            return "timeout";
+        case ERROR_WINHTTP_SECURE_FAILURE:
+            return "tls";
+        case ERROR_WINHTTP_CLIENT_AUTH_CERT_NEEDED:
+            return "client-certificate-required";
+        case ERROR_WINHTTP_INVALID_SERVER_RESPONSE:
+        case ERROR_WINHTTP_UNRECOGNIZED_SCHEME:
+            return "response";
+        default:
+            return "other";
+    }
+}
+
 Json probe_one_endpoint(const wchar_t* host) {
     Json result = Json::object();
     const auto started = std::chrono::steady_clock::now();
     HINTERNET session = WinHttpOpen(
-        L"machine-env/0.2.0",
+        L"machine-env/0.3.0",
         WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!session) {
@@ -727,28 +906,14 @@ Json probe_one_endpoint(const wchar_t* host) {
                              .count();
     result["ok"] = ok;
     result["ms"] = static_cast<std::int64_t>(elapsed);
-    if (ok) result["status"] = static_cast<int>(status);
-    else result["error"] = "HTTPS request failed (WinHTTP " +
-                           std::to_string(error_code) + ")";
-    return result;
-}
-
-Json read_cached_status(const std::string& kind, int ttl) {
-    const Json entry = read_cache_entry(kind, ttl, true);
-    const auto reason = cache_read_failure;
-    if (entry.is_object()) {
-        const auto cached_at = entry.get("cached_at").as_integer();
-        const auto now = static_cast<std::int64_t>(std::time(nullptr));
-        const bool fresh = now - cached_at <= ttl;
-        Json metadata = cache_metadata(fresh ? "fresh" : "expired (ttl " +
-                                        std::to_string(ttl) + "s)",
-                                        fresh, cached_at);
-        metadata["ttl_seconds"] = ttl;
-        return metadata;
+    if (ok) {
+        result["status"] = static_cast<int>(status);
+    } else {
+        result["reason"] = network_failure_reason(error_code);
+        result["error"] = "HTTPS request failed (WinHTTP " +
+                          std::to_string(error_code) + ")";
     }
-    Json metadata = cache_metadata(reason, false);
-    metadata["ttl_seconds"] = ttl;
-    return metadata;
+    return result;
 }
 
 }  // namespace
@@ -793,13 +958,16 @@ std::string machine_uuid() {
     return output.str();
 }
 
+// An empty result means the running executable could not be read, so its
+// identity is unknown; a cache entry must never be accepted in that state.
 std::string source_fingerprint() {
     static const std::string fingerprint = [] {
         std::array<wchar_t, 32768> executable{};
         const DWORD size = GetModuleFileNameW(nullptr, executable.data(),
                                               static_cast<DWORD>(executable.size()));
-        if (!size || size >= executable.size()) return std::string(kServerVersion);
+        if (!size || size >= executable.size()) return std::string();
         std::ifstream stream(fs::path(executable.data()), std::ios::binary);
+        if (!stream) return std::string();
         std::uint64_t hash = 14695981039346656037ull;
         std::array<char, 8192> bytes{};
         while (stream) {
@@ -809,11 +977,113 @@ std::string source_fingerprint() {
                 hash *= 1099511628211ull;
             }
         }
+        // A partial read must not masquerade as a complete fingerprint.
+        if (stream.bad()) return std::string();
         std::ostringstream output;
         output << kServerVersion << '-' << std::hex << hash;
         return output.str();
     }();
     return fingerprint;
+}
+
+// Display adapters are read from the display class key instead of WMI: the
+// Win32_VideoController.AdapterRAM field is 32-bit, so it saturates and reports
+// 4 GB for a 24 GB card. The class key carries the driver's own 64-bit figure,
+// which agrees with what the vendor tooling reports for the same adapter.
+Json probe_display_adapters(bool& enumeration_incomplete) {
+    const wchar_t* display_class =
+        L"SYSTEM\\CurrentControlSet\\Control\\Class\\"
+        L"{4d36e968-e325-11ce-bfc1-08002be10318}";
+    enumeration_incomplete = false;
+    Json adapters = Json::array();
+    HKEY class_key = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, display_class, 0,
+                      KEY_ENUMERATE_SUB_KEYS, &class_key) != ERROR_SUCCESS) {
+        // An empty list is a legitimate answer for "no display adapter", so a
+        // failed walk has to be distinguishable from a complete one.
+        enumeration_incomplete = true;
+        return adapters;
+    }
+    for (DWORD index = 0;; ++index) {
+        std::array<wchar_t, 64> subkey{};
+        DWORD subkey_size = static_cast<DWORD>(subkey.size());
+        const LONG status = RegEnumKeyExW(class_key, index, subkey.data(),
+                                          &subkey_size, nullptr, nullptr,
+                                          nullptr, nullptr);
+        if (status == ERROR_NO_MORE_ITEMS) break;
+        if (status != ERROR_SUCCESS) {
+            // A partial walk must not look like a machine with fewer adapters
+            // than it actually has.
+            enumeration_incomplete = true;
+            break;
+        }
+        // Adapter instances live in four-digit subkeys. The class key also
+        // holds Properties and Configuration, which describe no adapter.
+        bool instance = subkey_size == 4;
+        for (DWORD i = 0; instance && i < subkey_size; ++i)
+            if (subkey[i] < L'0' || subkey[i] > L'9') instance = false;
+        if (!instance) continue;
+        const std::wstring path = std::wstring(display_class) + L"\\" +
+                                  std::wstring(subkey.data(), subkey_size);
+        const auto description =
+            registry_string(HKEY_LOCAL_MACHINE, path.c_str(), L"DriverDesc");
+        if (description.empty()) {
+            // An instance that cannot be described is still an instance, so the
+            // list is short rather than empty of that adapter.
+            enumeration_incomplete = true;
+            continue;
+        }
+        Json adapter = Json::object();
+        adapter["name"] = utf8(description);
+        const auto provider =
+            registry_string(HKEY_LOCAL_MACHINE, path.c_str(), L"ProviderName");
+        if (!provider.empty()) adapter["provider"] = utf8(provider);
+        const auto driver =
+            registry_string(HKEY_LOCAL_MACHINE, path.c_str(), L"DriverVersion");
+        if (!driver.empty()) adapter["driver_version"] = utf8(driver);
+        const auto matching = registry_string(
+            HKEY_LOCAL_MACHINE, path.c_str(), L"MatchingDeviceId");
+        if (!matching.empty()) adapter["matching_device_id"] = utf8(matching);
+        // A physical adapter is enumerated on a hardware bus. An indirect
+        // display driver has no hardware behind it and a root-enumerated
+        // adapter is not a device, so both are reported but never counted as
+        // something that can be used.
+        std::wstring bus = matching;
+        const auto separator = bus.find(L'\\');
+        if (separator != std::wstring::npos) bus.resize(separator);
+        adapter["virtual"] = _wcsicmp(bus.c_str(), L"pci") != 0 &&
+                             _wcsicmp(bus.c_str(), L"acpi") != 0;
+        unsigned long long memory = 0;
+        if (registry_qword(HKEY_LOCAL_MACHINE, path.c_str(),
+                           L"HardwareInformation.qwMemorySize", memory) &&
+            memory > 0) {
+            adapter["vram_mb"] = static_cast<std::int64_t>(
+                memory / (1024ull * 1024ull));
+        }
+        adapters.as_array().push_back(std::move(adapter));
+    }
+    RegCloseKey(class_key);
+    // Physical adapters come first, largest memory first, so the adapter that
+    // decides what can run locally is the one that reads first.
+    std::stable_sort(adapters.as_array().begin(), adapters.as_array().end(),
+                     [](const Json& left, const Json& right) {
+                         const bool left_virtual = left.get("virtual").is_bool() &&
+                                                   left.get("virtual").as_bool();
+                         const bool right_virtual =
+                             right.get("virtual").is_bool() &&
+                             right.get("virtual").as_bool();
+                         if (left_virtual != right_virtual)
+                             return !left_virtual;
+                         const Json& left_memory = left.get("vram_mb");
+                         const Json& right_memory = right.get("vram_mb");
+                         return (left_memory.is_number()
+                                     ? left_memory.as_integer()
+                                     : 0) >
+                                (right_memory.is_number()
+                                     ? right_memory.as_integer()
+                                     : 0);
+                     });
+    return adapters;
 }
 
 Json probe_hardware() {
@@ -844,6 +1114,10 @@ Json probe_hardware() {
     const bool avx2 = isa.get("avx2").as_bool();
     result["vector_width_bits"] = avx512 ? 512 : (avx2 ? 256 : 128);
 
+    bool adapters_incomplete = false;
+    result["gpu"] = probe_display_adapters(adapters_incomplete);
+    if (adapters_incomplete) result["gpu_enumeration_incomplete"] = true;
+
     MEMORYSTATUSEX memory{};
     memory.dwLength = sizeof(memory);
     if (GlobalMemoryStatusEx(&memory)) {
@@ -861,43 +1135,91 @@ Json probe_hardware() {
     return result;
 }
 
+// Declared once, outside the probe, so the probe and the concise summary cannot
+// disagree about which tools exist or in what order they are reported. A tool
+// added here shows up in both, with no second list to keep in step.
+const std::array<std::pair<const wchar_t*, const wchar_t*>, 47> kProbeTools{{
+    {L"python", L"python.exe"}, {L"pip", L"pip.exe"}, {L"uv", L"uv.exe"},
+    {L"git", L"git.exe"}, {L"node", L"node.exe"}, {L"npm", L"npm.exe"},
+    {L"cargo", L"cargo.exe"}, {L"go", L"go.exe"}, {L"java", L"java.exe"},
+    {L"cmake", L"cmake.exe"}, {L"ninja", L"ninja.exe"}, {L"cl", L"cl.exe"},
+    {L"docker", L"docker.exe"}, {L"wsl", L"wsl.exe"},
+    {L"pwsh", L"pwsh.exe"}, {L"code", L"code.exe"},
+    {L"code-insiders", L"code-insiders.exe"}, {L"winget", L"winget.exe"},
+    {L"choco", L"choco.exe"}, {L"scoop", L"scoop.exe"},
+    {L"7z", L"7z.exe"}, {L"7zz", L"7zz.exe"}, {L"tar", L"tar.exe"},
+    {L"makensis", L"makensis.exe"}, {L"iscc", L"ISCC.exe"},
+    {L"wix", L"wix.exe"}, {L"candle", L"candle.exe"},
+    {L"light", L"light.exe"}, {L"nuget", L"nuget.exe"},
+    {L"dotnet", L"dotnet.exe"}, {L"msbuild", L"MSBuild.exe"},
+    {L"makeappx", L"MakeAppx.exe"}, {L"signtool", L"signtool.exe"},
+    {L"clang", L"clang.exe"}, {L"clang-cl", L"clang-cl.exe"},
+    {L"gcc", L"gcc.exe"}, {L"rustc", L"rustc.exe"},
+    {L"make", L"make.exe"}, {L"nmake", L"nmake.exe"},
+    {L"meson", L"meson.exe"}, {L"bazel", L"bazel.exe"},
+    {L"xmake", L"xmake.exe"}, {L"pnpm", L"pnpm.exe"},
+    {L"yarn", L"yarn.exe"}, {L"bun", L"bun.exe"},
+    {L"deno", L"deno.exe"}, {L"corepack", L"corepack.exe"}
+}};
+
+const std::vector<std::string>& tool_catalog_names() {
+    static const std::vector<std::string> names = [] {
+        std::vector<std::string> result;
+        result.reserve(kProbeTools.size());
+        for (const auto& tool : kProbeTools) result.push_back(utf8(tool.first));
+        return result;
+    }();
+    return names;
+}
+
 Json probe_toolchain() {
-    static const std::array<std::pair<const wchar_t*, const wchar_t*>, 47> tools{{
-        {L"python", L"python.exe"}, {L"pip", L"pip.exe"}, {L"uv", L"uv.exe"},
-        {L"git", L"git.exe"}, {L"node", L"node.exe"}, {L"npm", L"npm.exe"},
-        {L"cargo", L"cargo.exe"}, {L"go", L"go.exe"}, {L"java", L"java.exe"},
-        {L"cmake", L"cmake.exe"}, {L"ninja", L"ninja.exe"}, {L"cl", L"cl.exe"},
-        {L"docker", L"docker.exe"}, {L"wsl", L"wsl.exe"},
-        {L"pwsh", L"pwsh.exe"}, {L"code", L"code.exe"},
-        {L"code-insiders", L"code-insiders.exe"}, {L"winget", L"winget.exe"},
-        {L"choco", L"choco.exe"}, {L"scoop", L"scoop.exe"},
-        {L"7z", L"7z.exe"}, {L"7zz", L"7zz.exe"}, {L"tar", L"tar.exe"},
-        {L"makensis", L"makensis.exe"}, {L"iscc", L"ISCC.exe"},
-        {L"wix", L"wix.exe"}, {L"candle", L"candle.exe"},
-        {L"light", L"light.exe"}, {L"nuget", L"nuget.exe"},
-        {L"dotnet", L"dotnet.exe"}, {L"msbuild", L"MSBuild.exe"},
-        {L"makeappx", L"MakeAppx.exe"}, {L"signtool", L"signtool.exe"},
-        {L"clang", L"clang.exe"}, {L"clang-cl", L"clang-cl.exe"},
-        {L"gcc", L"gcc.exe"}, {L"rustc", L"rustc.exe"},
-        {L"make", L"make.exe"}, {L"nmake", L"nmake.exe"},
-        {L"meson", L"meson.exe"}, {L"bazel", L"bazel.exe"},
-        {L"xmake", L"xmake.exe"}, {L"pnpm", L"pnpm.exe"},
-        {L"yarn", L"yarn.exe"}, {L"bun", L"bun.exe"},
-        {L"deno", L"deno.exe"}, {L"corepack", L"corepack.exe"}
-    }};
     Json result = Json::object();
     Json found = Json::object();
     Json versions = Json::object();
+    Json version_unknown = Json::array();
     Json not_on_path = Json::array();
-    const std::wstring vs_root = visual_studio_root();
+    std::string vs_detection;
+    const std::wstring vs_root = visual_studio_root(vs_detection);
     result["vs_path"] = utf8(vs_root);
+    result["vs_detection"] = vs_detection;
     result["python_root"] = "";
+    std::wstring python_directory;
+    bool pip_mismatch = false;
     int tool_count = 0;
 
-    for (const auto& tool : tools) {
-        std::wstring path = tool.first == std::wstring(L"python")
-                                ? discover_python_executable()
-                                : search_executable(tool.second);
+    for (const auto& tool : kProbeTools) {
+        std::wstring path;
+        bool off_path = false;
+        if (tool.first == std::wstring(L"python")) {
+            path = discover_python_executable();
+            if (!path.empty()) {
+                python_directory = fs::path(path).parent_path().wstring();
+                // python is picked by a search order rather than by PATH, so a
+                // path that differs from what PATH resolves to is not the
+                // interpreter the bare name "python" will run, and has to say
+                // so instead of looking reachable by name.
+                const std::wstring on_path = search_executable(L"python.exe");
+                if (on_path.empty() ||
+                    _wcsicmp(on_path.c_str(), path.c_str()) != 0)
+                    off_path = true;
+            }
+        } else if (tool.first == std::wstring(L"pip") &&
+                   !python_directory.empty()) {
+            // Pair pip with the interpreter that will actually run, so an agent
+            // does not install packages for a different Python installation.
+            std::error_code pip_error;
+            for (const wchar_t* name : {L"pip.exe", L"pip3.exe"}) {
+                const fs::path candidate =
+                    fs::path(python_directory) / L"Scripts" / name;
+                if (fs::is_regular_file(candidate, pip_error)) {
+                    path = candidate.wstring();
+                    break;
+                }
+                pip_error.clear();
+            }
+        }
+        if (path.empty() && tool.first != std::wstring(L"python"))
+            path = search_executable(tool.second);
         if (path.empty()) {
             if (tool.first == std::wstring(L"npm"))
                 path = search_executable(L"npm.cmd");
@@ -916,7 +1238,6 @@ Json probe_toolchain() {
                 if (path.empty()) path = search_executable(L"scoop.ps1");
             }
         }
-        bool off_path = false;
         if (path.empty() && tool.first == std::wstring(L"cl")) {
             path = find_visual_studio_tool(
                 vs_root, L"cl.exe");
@@ -941,6 +1262,16 @@ Json probe_toolchain() {
              tool.first == std::wstring(L"signtool"))) {
             path = find_packaging_tool(tool.first, vs_root);
             off_path = !path.empty();
+        }
+        if (tool.first == std::wstring(L"pip") && !path.empty() &&
+            !python_directory.empty()) {
+            const fs::path pip_root = fs::path(path).parent_path().parent_path();
+            result["pip_root"] = utf8(pip_root.wstring());
+            const std::wstring path_pip = search_executable(L"pip.exe");
+            if (!path_pip.empty() && _wcsicmp(path_pip.c_str(), path.c_str()) != 0)
+                off_path = true;
+            if (_wcsicmp(pip_root.c_str(), python_directory.c_str()) != 0)
+                pip_mismatch = true;
         }
         if (path.empty()) continue;
         found[utf8(tool.first)] = utf8(path);
@@ -984,12 +1315,18 @@ Json probe_toolchain() {
         const auto version = run_process(path, args);
         if (version.ok && !version.output.empty())
             versions[utf8(tool.first)] = normalize_version(version.output);
+        else
+            // A tool whose version could not be read is not a tool without a
+            // version, so the two outcomes must not look the same.
+            version_unknown.as_array().emplace_back(utf8(tool.first));
     }
 
     result["tool_count"] = tool_count;
     result["tools"] = found;
     result["versions"] = versions;
+    result["version_unknown"] = version_unknown;
     result["not_on_path"] = not_on_path;
+    result["python_pip_mismatch"] = pip_mismatch;
     if (found.contains("python")) {
         result["python_root"] =
             utf8(fs::path(wide(found.get("python").as_string())).parent_path().wstring());
@@ -1004,7 +1341,188 @@ Json probe_toolchain() {
     return result;
 }
 
-Json probe_environment(bool include_network) {
+// "Unreachable" alone is not actionable, so a capability carries the evidence
+// behind it: measured was observed, and unknown means it was not verified and
+// must not be read as support.
+Json capability_of_state(const char* state, const char* source) {
+    Json result = Json::object();
+    result["state"] = state;
+    result["source"] = source;
+    return result;
+}
+
+const char* measured_state(bool supported) {
+    return supported ? "supported" : "unsupported";
+}
+
+std::wstring base64_utf16(const std::wstring& text) {
+    static const char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string bytes;
+    bytes.reserve(text.size() * 2);
+    for (const wchar_t value : text) {
+        bytes.push_back(static_cast<char>(value & 0xff));
+        bytes.push_back(static_cast<char>((value >> 8) & 0xff));
+    }
+    std::string encoded;
+    encoded.reserve((bytes.size() + 2) / 3 * 4);
+    for (std::size_t index = 0; index < bytes.size(); index += 3) {
+        const std::size_t remaining = bytes.size() - index;
+        const unsigned first = static_cast<unsigned char>(bytes[index]);
+        const unsigned second =
+            remaining > 1 ? static_cast<unsigned char>(bytes[index + 1]) : 0u;
+        const unsigned third =
+            remaining > 2 ? static_cast<unsigned char>(bytes[index + 2]) : 0u;
+        const unsigned chunk = (first << 16) | (second << 8) | third;
+        encoded.push_back(alphabet[(chunk >> 18) & 0x3f]);
+        encoded.push_back(alphabet[(chunk >> 12) & 0x3f]);
+        encoded.push_back(remaining > 1 ? alphabet[(chunk >> 6) & 0x3f] : '=');
+        encoded.push_back(remaining > 2 ? alphabet[chunk & 0x3f] : '=');
+    }
+    return std::wstring(encoded.begin(), encoded.end());
+}
+
+// Shell syntax support is decided by parsing the construct rather than trusting
+// a version number, so the reported answer is observed behavior.
+Json probe_shell_capabilities(const std::wstring& shell) {
+    Json capabilities = Json::object();
+    capabilities["ampersand_ampersand"] = capability_of_state("unknown", "unknown");
+    capabilities["here_string"] = capability_of_state("unknown", "unknown");
+    capabilities["non_ascii_pipe_utf8"] = capability_of_state("unknown", "unknown");
+    if (shell.empty()) return capabilities;
+
+    const std::wstring script =
+        L"$o=@()\n"
+        L"try{[void][scriptblock]::Create('$null && $null');"
+        L"$o+='amp=ok'}catch{$o+='amp=no'}\n"
+        L"$hs=\"@'\"+[Environment]::NewLine+'x'+[Environment]::NewLine+\"'@\"\n"
+        L"try{[void][scriptblock]::Create($hs);$o+='here=ok'}"
+        L"catch{$o+='here=no'}\n"
+        L"$o -join ';'\n";
+    const auto parsed = run_process(
+        shell,
+        L"-NoProfile -NonInteractive -EncodedCommand " + base64_utf16(script));
+    if (parsed.ok) {
+        const auto has = [&parsed](const char* token, const char* value) {
+            return parsed.output.find(std::string(token) + "=" + value) !=
+                   std::string::npos;
+        };
+        if (parsed.output.find("amp=") != std::string::npos)
+            capabilities["ampersand_ampersand"] =
+                capability_of_state(measured_state(has("amp", "ok")), "measured");
+        if (parsed.output.find("here=") != std::string::npos)
+            capabilities["here_string"] =
+                capability_of_state(measured_state(has("here", "ok")), "measured");
+    }
+
+    // Non-ASCII text is only trustworthy if it survives the shell-to-pipe path
+    // as UTF-8; otherwise reading the output yields mojibake.
+    const auto marker = run_process(
+        shell, L"-NoProfile -NonInteractive -EncodedCommand " +
+                   base64_utf16(L"[Console]::Out.Write('\u6807\u8bb0')"));
+    if (marker.ok && !marker.output.empty())
+        capabilities["non_ascii_pipe_utf8"] = capability_of_state(
+            measured_state(marker.output == utf8(L"\u6807\u8bb0")), "measured");
+    return capabilities;
+}
+
+Json probe_machine_policies() {
+    Json policies = Json::object();
+    policies["acp"] = static_cast<int>(GetACP());
+    policies["oem_cp"] = static_cast<int>(GetOEMCP());
+    // Both values are REG_DWORD, so a string reader would silently drop them.
+    DWORD long_paths = 0;
+    if (registry_dword(HKEY_LOCAL_MACHINE,
+                       L"SYSTEM\\CurrentControlSet\\Control\\FileSystem",
+                       L"LongPathsEnabled", long_paths))
+        policies["long_paths_enabled"] = long_paths != 0;
+    DWORD developer_mode = 0;
+    if (registry_dword(
+            HKEY_LOCAL_MACHINE,
+            L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\AppModelUnlock",
+            L"AllowDevelopmentWithoutDevLicense", developer_mode))
+        policies["developer_mode"] = developer_mode != 0;
+    return policies;
+}
+
+// The uninstall keys are what "Apps & features" reads, so they are the
+// authoritative inventory. Entries Windows hides are skipped, and duplicates
+// across the 64-bit, 32-bit, and per-user hives are collapsed.
+Json probe_apps() {
+    Json result = Json::object();
+    std::map<std::string, Json> unique;
+    bool enumeration_incomplete = false;
+    const std::array<std::pair<HKEY, const wchar_t*>, 3> hives{{
+        {HKEY_LOCAL_MACHINE,
+         L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall"},
+        {HKEY_LOCAL_MACHINE,
+         L"SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall"},
+        {HKEY_CURRENT_USER,
+         L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall"},
+    }};
+    for (const auto& hive : hives) {
+        HKEY key = nullptr;
+        if (RegOpenKeyExW(hive.first, hive.second, 0, KEY_READ, &key) !=
+            ERROR_SUCCESS) {
+            // A hive that cannot be opened hides every application it holds, so
+            // the inventory has to say it is short rather than look complete.
+            enumeration_incomplete = true;
+            continue;
+        }
+        for (DWORD index = 0;; ++index) {
+            std::array<wchar_t, 512> subkey_name{};
+            DWORD subkey_size = static_cast<DWORD>(subkey_name.size());
+            const LONG enum_status =
+                RegEnumKeyExW(key, index, subkey_name.data(), &subkey_size,
+                              nullptr, nullptr, nullptr, nullptr);
+            if (enum_status == ERROR_NO_MORE_ITEMS) break;
+            if (enum_status != ERROR_SUCCESS) {
+                // A partial inventory must say so rather than look complete.
+                enumeration_incomplete = true;
+                break;
+            }
+            const std::wstring subkey =
+                std::wstring(hive.second) + L"\\" + subkey_name.data();
+            const wchar_t* path = subkey.c_str();
+            DWORD system_component = 0;
+            if (registry_dword(hive.first, path, L"SystemComponent",
+                               system_component) &&
+                system_component != 0)
+                continue;
+            const auto display = registry_string(hive.first, path, L"DisplayName");
+            if (display.empty()) continue;
+            Json app = Json::object();
+            app["name"] = utf8(display);
+            const auto version = registry_string(hive.first, path, L"DisplayVersion");
+            if (!version.empty()) app["version"] = utf8(version);
+            const auto publisher = registry_string(hive.first, path, L"Publisher");
+            if (!publisher.empty()) app["publisher"] = utf8(publisher);
+            std::wstring location =
+                registry_string(hive.first, path, L"InstallLocation");
+            // Some installers store the path wrapped in quotes; strip them so the
+            // reported location can be used as a path directly.
+            if (location.size() >= 2 && location.front() == L'"' &&
+                location.back() == L'"')
+                location = location.substr(1, location.size() - 2);
+            if (!location.empty()) app["install_location"] = utf8(location);
+            const std::string app_name = app.get("name").as_string();
+            const Json& app_version = app.get("version");
+            unique[app_name + '\n' +
+                   (app_version.is_string() ? app_version.as_string()
+                                            : std::string())] = app;
+        }
+        RegCloseKey(key);
+    }
+    Json apps = Json::array();
+    for (const auto& entry : unique) apps.as_array().push_back(entry.second);
+    result["count"] = static_cast<std::int64_t>(apps.as_array().size());
+    result["apps"] = apps;
+    result["enumeration_incomplete"] = enumeration_incomplete;
+    result["probed_at"] = current_time_iso();
+    return result;
+}
+
+Json probe_system() {
     Json result = Json::object();
     Json os = Json::object();
     Json shell = Json::object();
@@ -1016,16 +1534,24 @@ Json probe_environment(bool include_network) {
         GetProcAddress(ntdll, "RtlGetVersion"));
     RTL_OSVERSIONINFOW version{};
     version.dwOSVersionInfoSize = sizeof(version);
+    std::uint32_t build_number = 0;
     if (rtl_get_version && rtl_get_version(&version) == 0) {
         os["version"] = std::to_string(version.dwMajorVersion) + "." +
                         std::to_string(version.dwMinorVersion);
-        os["build"] = static_cast<int>(version.dwBuildNumber);
+        build_number = version.dwBuildNumber;
+        os["build"] = static_cast<int>(build_number);
     }
     const auto product_name = registry_string(
         HKEY_LOCAL_MACHINE,
         L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", L"ProductName");
-    os["caption"] = product_name.empty() ? "Microsoft Windows"
-                                          : utf8(product_name);
+    std::string caption = product_name.empty() ? "Microsoft Windows"
+                                               : utf8(product_name);
+    // The registry ProductName still reports "Windows 10" on Windows 11, so the
+    // build number (22000 and above) is authoritative for the marketing name.
+    const std::string legacy_caption = "Windows 10";
+    if (build_number >= 22000 && caption.rfind(legacy_caption, 0) == 0)
+        caption.replace(0, legacy_caption.size(), "Windows 11");
+    os["caption"] = caption;
     SYSTEM_INFO info{};
     GetNativeSystemInfo(&info);
     os["arch"] = info.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64
@@ -1041,6 +1567,13 @@ Json probe_environment(bool include_network) {
             (memory.ullTotalPhys + 512 * 1024) / (1024 * 1024));
         os["free_mem_mb"] = static_cast<std::int64_t>(
             (memory.ullAvailPhys + 512 * 1024) / (1024 * 1024));
+        // Free physical memory alone does not answer whether a large
+        // allocation will fit: a reservation is charged against the commit
+        // limit, which can be far smaller when the page file is limited.
+        os["commit_limit_mb"] = static_cast<std::int64_t>(
+            (memory.ullTotalPageFile + 512 * 1024) / (1024 * 1024));
+        os["commit_available_mb"] = static_cast<std::int64_t>(
+            (memory.ullAvailPageFile + 512 * 1024) / (1024 * 1024));
     }
     int cpu[4]{};
     __cpuid(cpu, 0x80000000);
@@ -1078,25 +1611,26 @@ Json probe_environment(bool include_network) {
         shell["shell_kind"] = pwsh.empty() ? "windows-powershell" : "pwsh";
         const auto ps = probe_shell(primary_shell);
         if (ps.ok) {
+            // Read the values in the order the command emits them, and record
+            // only what was actually produced: a field the shell did not
+            // answer stays absent instead of becoming an empty string, and the
+            // trailing carriage return is not carried into the value.
             std::istringstream values(ps.output);
-            std::string ps_version, ps_edition, ps_host, execution_policy;
-            std::getline(values, ps_version);
-            std::getline(values, ps_edition);
-            std::getline(values, ps_host);
-            std::getline(values, execution_policy);
-            shell["ps_version"] = ps_version;
-            shell["ps_edition"] = ps_edition;
-            shell["ps_host"] = ps_host;
-            shell["execution_policy"] = execution_policy;
-            int major = 0;
-            try {
-                major = std::stoi(ps_version);
-            } catch (const std::exception&) {
-                major = 0;
+            const std::array<const char*, 4> fields{
+                {"ps_version", "ps_edition", "ps_host",
+                 "execution_policy"}};
+            for (const char* field : fields) {
+                std::string value;
+                if (!std::getline(values, value)) break;
+                while (!value.empty() &&
+                       (value.back() == '\r' || value.back() == '\n' ||
+                        value.back() == ' ' || value.back() == '\t'))
+                    value.pop_back();
+                if (!value.empty()) shell[field] = value;
             }
-            shell["supports_ampersand_ampersand"] = major >= 7;
-            shell["has_heredoc"] = major >= 7;
         }
+        // Measured, so it stays right even if the version rule would not be.
+        shell["capabilities"] = probe_shell_capabilities(primary_shell);
     }
     if (!pwsh.empty() && !powershell.empty()) {
         // Only the version is needed here; asking for more would depend on
@@ -1124,7 +1658,15 @@ Json probe_environment(bool include_network) {
     }
     Json path_entries = Json::array();
     int ignored_path_entries = 0;
-    std::wstring path = environment_variable(L"PATH");
+    // The registry is authoritative because it is what a new shell inherits;
+    // the process copy is only a fallback for the rare case it cannot be read.
+    const std::wstring registry_path = system_path();
+    const std::wstring process_path = environment_variable(L"PATH");
+    std::wstring path = registry_path.empty() ? process_path : registry_path;
+    paths["path_source"] = registry_path.empty() ? "process" : "registry";
+    paths["process_path_differs"] =
+        !path.empty() && !process_path.empty() &&
+        _wcsicmp(path.c_str(), process_path.c_str()) != 0;
     std::size_t start = 0;
     while (start <= path.size()) {
         const auto end = path.find(L';', start);
@@ -1147,96 +1689,58 @@ Json probe_environment(bool include_network) {
     result["os"] = os;
     result["shell"] = shell;
     result["paths"] = paths;
+    result["policies"] = probe_machine_policies();
+    result["hardware"] = probe_hardware();
     result["probed_at"] = current_time_iso();
-
-    if (include_network) {
-        Json network = Json::object();
-        network["github_api"] = probe_one_endpoint(L"api.github.com");
-        network["github_raw"] = probe_one_endpoint(L"raw.githubusercontent.com");
-        network["huggingface"] = probe_one_endpoint(L"huggingface.co");
-        network["pypi"] = probe_one_endpoint(L"pypi.org");
-        result["network"] = network;
-    }
     return result;
 }
 
-Json probe_cache_status() {
+// Network reachability is its own probe so that local system facts never cause
+// an outbound request unless the caller asked for exactly that.
+Json probe_network() {
     Json result = Json::object();
-    result["fingerprint"] = source_fingerprint();
-    Json categories = Json::object();
-    categories["hardware"] = read_cached_status("hardware", kDefaultTtl);
-    categories["toolchain"] = read_cached_status("toolchain", kDefaultTtl);
-    categories["environment"] = read_cached_status("environment", kNetworkTtl);
-    categories["environment_local"] =
-        read_cached_status("environment-local", kNetworkTtl);
-    result["categories"] = categories;
+    Json endpoints = Json::object();
+    endpoints["github_api"] = probe_one_endpoint(L"api.github.com");
+    endpoints["github_raw"] = probe_one_endpoint(L"raw.githubusercontent.com");
+    endpoints["huggingface"] = probe_one_endpoint(L"huggingface.co");
+    endpoints["pypi"] = probe_one_endpoint(L"pypi.org");
+    result["endpoints"] = endpoints;
+    result["probed_at"] = current_time_iso();
     return result;
 }
 
-Json cached_probe(const std::string& kind, bool refresh,
-                  bool include_network) {
-    const int ttl = kind == "environment" ? kNetworkTtl : kDefaultTtl;
-    const std::string cache_kind =
-        kind == "environment" && !include_network ? "environment-local" : kind;
+// Elevation belongs to this process, not to the machine: the same machine
+// answers differently depending on how the client was started, so it is
+// recomputed on every call instead of being served from the cache.
+Json with_live_session_facts(const std::string& kind, Json payload) {
+    if (kind == "system" && payload.get("shell").is_object())
+        payload["shell"]["is_admin"] = is_admin();
+    return payload;
+}
+
+// One cache entry per probe category. System and network facts change often, so
+// they expire quickly; the tool and application inventories are stable.
+Json cached_probe(const std::string& kind, bool refresh) {
+    const int ttl =
+        (kind == "toolchain" || kind == "apps") ? kDefaultTtl : kNetworkTtl;
     if (!refresh) {
-        const Json entry = read_cache_entry(cache_kind, ttl);
+        const Json entry = read_cache_entry(kind, ttl);
         if (entry.is_object()) {
             Json payload = entry.get("payload");
             const auto timestamp = entry.get("cached_at").as_integer();
             annotate_cache(payload, cache_metadata("fresh", true, timestamp));
-            if (kind == "environment" && !include_network)
-                payload["_cache"]["network_probe_skipped"] = true;
-            return payload;
+            return with_live_session_facts(kind, std::move(payload));
         }
     }
 
     const Json metadata = cache_metadata(
         refresh ? "refresh requested" : cache_read_failure, false);
-    const auto started = std::chrono::steady_clock::now();
-    Json payload = kind == "hardware"
-                       ? probe_hardware()
-                       : kind == "toolchain"
-                             ? probe_toolchain()
-                             : probe_environment(include_network);
-    payload["_probe_ms"] = static_cast<std::int64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - started)
-            .count());
-    Json result = cacheable_probe(cache_kind, std::move(payload), metadata);
-    if (kind == "environment" && !include_network)
-        result["_cache"]["network_probe_skipped"] = true;
-    return result;
-}
-
-Json refresh_environment(const std::string& scope) {
-    const std::vector<std::string> valid{"all", "hardware", "toolchain",
-                                         "environment"};
-    if (std::find(valid.begin(), valid.end(), scope) == valid.end()) {
-        Json error = Json::object();
-        error["error"] = "invalid scope '" + scope + "'";
-        error["valid"] = string_array(valid);
-        return error;
-    }
-    Json result = Json::object();
-    Json refreshed = Json::array();
-    result["scope"] = scope;
-    if (scope == "all" || scope == "hardware") {
-        Json payload = cached_probe("hardware", true, true);
-        if (!payload.contains("error")) refreshed.as_array().emplace_back("hardware");
-        result["hardware"] = payload;
-    }
-    if (scope == "all" || scope == "toolchain") {
-        Json payload = cached_probe("toolchain", true, true);
-        if (!payload.contains("error")) refreshed.as_array().emplace_back("toolchain");
-        result["toolchain"] = payload;
-    }
-    if (scope == "all" || scope == "environment") {
-        Json payload = cached_probe("environment", true, true);
-        if (!payload.contains("error")) refreshed.as_array().emplace_back("environment");
-        result["environment"] = payload;
-    }
-    result["refreshed"] = refreshed;
-    return result;
+    Json payload = kind == "system"      ? probe_system()
+                   : kind == "toolchain" ? probe_toolchain()
+                   : kind == "apps"      ? probe_apps()
+                                         : probe_network();
+    return with_live_session_facts(
+        kind, cacheable_probe(kind, std::move(payload), metadata));
 }
 
 }  // namespace machine_env

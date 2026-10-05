@@ -39,6 +39,41 @@ std::string first_line(const std::string& value) {
     return value.substr(0, end);
 }
 
+// A message is read one byte at a time so the size limit applies while it is
+// being read: reading the whole line first and checking its length afterwards
+// would let a single huge message be allocated in full before being rejected.
+bool read_message(std::istream& input, std::string& line, bool& oversized) {
+    constexpr std::size_t kMaxMessageBytes = 8 * 1024 * 1024;
+    line.clear();
+    oversized = false;
+    char byte = 0;
+    while (input.get(byte)) {
+        if (byte == '\n') return true;
+        if (line.size() < kMaxMessageBytes)
+            line.push_back(byte);
+        else
+            oversized = true;
+    }
+    return !line.empty() || oversized;
+}
+
+std::string upper_ascii(const std::string& value) {
+    std::string result = value;
+    std::transform(result.begin(), result.end(), result.begin(),
+                   [](unsigned char ch) {
+                       return static_cast<char>(std::toupper(ch));
+                   });
+    return result;
+}
+
+bool array_contains(const Json& array, const std::string& value) {
+    if (!array.is_array()) return false;
+    for (const auto& item : array.as_array()) {
+        if (item.is_string() && item.as_string() == value) return true;
+    }
+    return false;
+}
+
 std::wstring wide_from_utf8(const std::string& value) {
     if (value.empty()) return {};
     const int size = MultiByteToWideChar(
@@ -71,79 +106,235 @@ std::string memory_gb(const Json& value, const std::string& key) {
     return output.str();
 }
 
-std::string summarize_toolchain(const Json& value) {
+std::string cache_note(const Json& value) {
+    const Json& cache = value.get("_cache");
+    if (!cache.is_object()) return {};
     std::ostringstream output;
-    const Json& tools = value.get("tools");
-    const Json& not_on_path = value.get("not_on_path");
-    static const std::array<std::pair<const char*, const char*>, 47> order{{
-        {"python", "PYTHON"}, {"pip", "PIP"}, {"uv", "UV"}, {"git", "GIT"},
-        {"node", "NODE"}, {"npm", "NPM"}, {"cargo", "CARGO"}, {"go", "GO"},
-        {"java", "JAVA"}, {"cmake", "CMAKE"}, {"ninja", "NINJA"},
-        {"cl", "CL"}, {"docker", "DOCKER"}, {"wsl", "WSL"},
-        {"pwsh", "PWSH"}, {"code", "CODE"}, {"code-insiders", "CODE-INSIDERS"},
-        {"winget", "WINGET"}, {"choco", "CHOCO"}, {"scoop", "SCOOP"},
-        {"7z", "7Z"}, {"7zz", "7ZZ"}, {"tar", "TAR"},
-        {"makensis", "MAKENSIS"}, {"iscc", "ISCC"}, {"wix", "WIX"},
-        {"candle", "CANDLE"}, {"light", "LIGHT"}, {"nuget", "NUGET"},
-        {"dotnet", "DOTNET"}, {"msbuild", "MSBUILD"}, {"makeappx", "MAKEAPPX"},
-        {"signtool", "SIGNTOOL"}, {"clang", "CLANG"}, {"clang-cl", "CLANG-CL"},
-        {"gcc", "GCC"}, {"rustc", "RUSTC"}, {"make", "MAKE"},
-        {"nmake", "NMAKE"}, {"meson", "MESON"}, {"bazel", "BAZEL"},
-        {"xmake", "XMAKE"}, {"pnpm", "PNPM"}, {"yarn", "YARN"},
-        {"bun", "BUN"}, {"deno", "DENO"}, {"corepack", "COREPACK"}}};
-
-    const auto is_off_path = [&not_on_path](const std::string& name) {
-        if (!not_on_path.is_array()) return false;
-        for (const auto& item : not_on_path.as_array()) {
-            if (item.is_string() && item.as_string() == name) return true;
-        }
-        return false;
-    };
-
-    if (tools.is_object()) {
-        bool first = true;
-        for (const auto& tool : order) {
-            const std::string name = tool.first;
-            const std::string path = string_field(tools, name);
-            const std::string version = string_field(value.get("versions"), name);
-            if (path.empty() ||
-                (is_windows_app_alias(path) && version.empty()))
-                continue;
-            if (!first) output << "\n";
-            first = false;
-            output << "- " << tool.second << " = " << path;
-            if (!version.empty()) output << " (" << first_line(version) << ")";
-            if (is_off_path(name)) output << " 不在PATH";
-        }
+    if (cache.get("hit").is_bool() && cache.get("hit").as_bool()) {
+        output << "\n（缓存命中";
+        const Json& age = cache.get("age_seconds");
+        if (age.is_number()) output << "，" << age.as_integer() << " 秒前";
+        output << "）";
     }
     return output.str();
 }
 
-std::string summarize_payload(const std::string& name, const Json& value) {
+// Turn a measured capability into the constraint a caller has to respect, so
+// the answer does not have to be discovered by failing once.
+std::string shell_syntax_note(const Json& shell) {
+    const Json& ampersand =
+        shell.get("capabilities").get("ampersand_ampersand");
+    if (!ampersand.get("state").is_string()) return {};
+    const std::string state = ampersand.get("state").as_string();
+    if (state == "unsupported") return "（不支持 &&，改用 ; 或分行）";
+    if (state == "unknown") return "（&& 支持情况未验证）";
+    return {};
+}
+
+// Name the exact shell executable that will run the command, so the answer is
+// not merely the version of whichever shell happens to be primary.
+std::string shell_executable_label(const Json& shell) {
+    const std::string path = string_field(shell, "shell_path");
+    const auto separator = path.find_last_of("\\/");
+    const std::string name =
+        separator == std::string::npos ? path : path.substr(separator + 1);
+    return name.empty() ? std::string() : "（" + name + "）";
+}
+
+std::string output_encoding_note(const Json& shell) {
+    const Json& utf8 =
+        shell.get("capabilities").get("non_ascii_pipe_utf8");
+    if (!utf8.get("state").is_string()) return {};
+    const std::string state = utf8.get("state").as_string();
+    if (state == "unsupported") return "（原生输出非 UTF-8，读取可能乱码）";
+    if (state == "unknown") return "（输出编码未验证）";
+    return {};
+}
+
+// Commas separate alternatives; spaces inside one alternative stay part of the
+// phrase. Otherwise "visual studio" would also match "Supernova Games Studios".
+std::vector<std::string> parse_filter(const std::string& text) {
+    std::vector<std::string> tokens;
+    std::string current;
+    const auto commit = [&tokens, &current]() {
+        std::size_t begin = 0;
+        while (begin < current.size() &&
+               (current[begin] == ' ' || current[begin] == '\t'))
+            ++begin;
+        std::size_t end = current.size();
+        while (end > begin &&
+               (current[end - 1] == ' ' || current[end - 1] == '\t'))
+            --end;
+        if (end > begin) tokens.push_back(current.substr(begin, end - begin));
+        current.clear();
+    };
+    for (const char ch : text) {
+        if (ch == ',' || ch == ';') {
+            commit();
+            continue;
+        }
+        current.push_back(
+            static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+    }
+    commit();
+    return tokens;
+}
+
+bool matches_filter(const std::vector<std::string>& tokens,
+                    const std::string& text) {
+    if (tokens.empty()) return true;
+    std::string lowered = text;
+    std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                   [](unsigned char ch) {
+                       return static_cast<char>(std::tolower(ch));
+                   });
+    for (const auto& token : tokens)
+        if (lowered.find(token) != std::string::npos) return true;
+    return false;
+}
+
+std::string summarize_toolchain(const Json& value,
+                                const std::vector<std::string>& filter) {
+    std::ostringstream output;
+    const Json& tools = value.get("tools");
+    const Json& not_on_path = value.get("not_on_path");
+    // The set and the order come from the probe catalog, so a tool cannot be
+    // probed and then be missing from the concise answer.
+    const auto& order = tool_catalog_names();
+
+    const auto is_off_path = [&not_on_path](const std::string& name) {
+        return array_contains(not_on_path, name);
+    };
+
+    if (tools.is_object()) {
+        bool first = true;
+        for (const auto& name : order) {
+            const std::string path = string_field(tools, name);
+            const std::string version = string_field(value.get("versions"), name);
+            const bool version_unknown =
+                array_contains(value.get("version_unknown"), name);
+            // An alias is only dropped when a version was measured: dropping it
+            // after a failed probe would report an installed tool as missing.
+            if (path.empty() ||
+                (is_windows_app_alias(path) && version.empty() &&
+                 !version_unknown))
+                continue;
+            // Match the tool name only: a path can contain another tool's name
+            // ("...\CMake\Ninja\ninja.exe") and would return unrelated tools.
+            if (!matches_filter(filter, name)) continue;
+            if (!first) output << "\n";
+            first = false;
+            output << "- " << upper_ascii(name) << " = " << path;
+            if (!version.empty())
+                output << " (" << first_line(version) << ")";
+            else if (version_unknown)
+                output << " (版本未知)";
+            if (is_off_path(name)) output << " 不在PATH";
+            if (name == "pip" &&
+                value.get("python_pip_mismatch").is_bool() &&
+                value.get("python_pip_mismatch").as_bool())
+                output << " 与PYTHON不同源";
+        }
+    }
+    // Visual Studio detection has its own failure mode: the locator can fail to
+    // answer, and the tools it would have found then look uninstalled.
+    if (value.get("vs_detection").is_string() &&
+        value.get("vs_detection").as_string() == "unknown")
+        output << "\n（Visual Studio 检测未完成，cl/msbuild/ninja 可能被漏报）";
+    return output.str();
+}
+
+std::string summarize_apps(const Json& value,
+                           const std::vector<std::string>& filter) {
+    const Json& apps = value.get("apps");
+    if (!apps.is_array()) return dump_json(value);
+    const std::size_t total = apps.as_array().size();
+    // A partial inventory must not be presented as a complete one.
+    const bool incomplete =
+        value.get("enumeration_incomplete").is_bool() &&
+        value.get("enumeration_incomplete").as_bool();
+    const std::string caveat =
+        incomplete ? "（注册表枚举未完成，清单可能不完整）" : std::string();
+    if (filter.empty())
+        return "已安装应用：" + std::to_string(total) +
+               " 项（未列出；可用 filter 按名称、发布者或版本查询）" + caveat;
+    std::ostringstream output;
+    std::size_t shown = 0;
+    bool truncated = false;
+    for (const auto& app : apps.as_array()) {
+        const std::string name = string_field(app, "name");
+        const std::string version = first_line(string_field(app, "version"));
+        const std::string publisher = string_field(app, "publisher");
+        if (!matches_filter(filter, name + " " + version + " " + publisher))
+            continue;
+        if (shown == 50) {
+            truncated = true;
+            break;
+        }
+        if (shown > 0) output << "\n";
+        output << "- " << name;
+        if (!version.empty()) output << " " << version;
+        const std::string location = string_field(app, "install_location");
+        if (!location.empty()) output << "\n  位置：" << location;
+        ++shown;
+    }
+    if (shown == 0)
+        return "没有匹配的已安装应用（共 " + std::to_string(total) + " 项）" +
+               caveat;
+    if (truncated)
+        output << "\n（仅显示前 50 条，共 " << total << " 项）";
+    return output.str() + caveat;
+}
+
+std::string summarize_network(const Json& value) {
+    const Json& endpoints = value.get("endpoints");
+    if (!endpoints.is_object()) return dump_json(value);
+    static const std::array<std::pair<const char*, const char*>, 4> order{{
+        {"github_api", "GitHub API"},
+        {"github_raw", "GitHub Raw"},
+        {"huggingface", "Hugging Face"},
+        {"pypi", "PyPI"}}};
+    std::ostringstream output;
+    output << "网络连通性";
+    int reachable = 0;
+    int checked = 0;
+    for (const auto& entry : order) {
+        const Json& endpoint = endpoints.get(entry.first);
+        if (!endpoint.is_object()) continue;
+        ++checked;
+        const bool ok =
+            endpoint.get("ok").is_bool() && endpoint.get("ok").as_bool();
+        if (ok) ++reachable;
+        output << "\n- " << entry.second << "：";
+        if (ok) {
+            output << "可达";
+            const Json& status = endpoint.get("status");
+            if (status.is_number())
+                output << "（HTTP " << status.as_integer() << "）";
+        } else {
+            output << "不可达";
+            const std::string reason = string_field(endpoint, "reason");
+            if (!reason.empty()) output << "（原因：" << reason << "）";
+        }
+        const Json& ms = endpoint.get("ms");
+        if (ms.is_number()) output << " " << ms.as_integer() << "ms";
+    }
+    output << "\n可达 " << reachable << "/" << checked << " 个目标";
+    return output.str();
+}
+
+std::string summarize_payload(const std::string& name, const Json& value,
+                              const std::vector<std::string>& filter) {
     if (!value.is_object()) return dump_json(value);
     if (value.contains("error")) return dump_json(value);
 
-    if (name == "get_hardware" || name == "hardware") {
-        std::ostringstream output;
-        output << "系统配置";
-        const std::string brand = string_field(value, "brand");
-        if (!brand.empty()) output << "\nCPU：" << brand;
-        const Json& memory = value.get("memory");
-        if (memory.is_object()) {
-            const auto total = memory_gb(memory, "total_mem_mb");
-            if (!total.empty()) output << "\n内存：" << total;
-            const Json& cpus = memory.get("logical_cpu");
-            if (cpus.is_number())
-                output << "\n逻辑处理器：" << cpus.as_integer();
-        }
-        const Json& width = value.get("vector_width_bits");
-        if (width.is_number())
-            output << "\n可用向量宽度：" << width.as_integer() << " 位";
-        return output.str();
-    }
-    if (name == "get_toolchain" || name == "toolchain")
-        return summarize_toolchain(value);
-    if (name == "get_environment" || name == "environment") {
+    if (name == "get_tools" || name == "toolchain")
+        return summarize_toolchain(value, filter) + cache_note(value);
+    if (name == "get_apps" || name == "apps")
+        return summarize_apps(value, filter) + cache_note(value);
+    if (name == "get_network" || name == "network")
+        return summarize_network(value) + cache_note(value);
+    if (name == "get_system" || name == "system") {
         std::ostringstream output;
         output << "系统配置";
         const Json& os = value.get("os");
@@ -168,64 +359,72 @@ std::string summarize_payload(const std::string& name, const Json& value) {
             const std::string version = string_field(shell, "ps_version");
             const std::string clean_version = first_line(version);
             if (!clean_version.empty())
-                output << "\nPowerShell：" << clean_version;
+                output << "\nPowerShell：" << clean_version
+                       << shell_executable_label(shell)
+                       << shell_syntax_note(shell)
+                       << output_encoding_note(shell);
+            // Elevation decides whether a command will fail before it is run.
+            const Json& admin = shell.get("is_admin");
+            if (admin.is_bool())
+                output << "\n权限：" << (admin.as_bool() ? "管理员" : "标准用户");
         }
-        const Json& network = value.get("network");
-        if (network.is_object()) {
-            int reachable = 0;
-            for (const auto& endpoint : network.as_object()) {
-                if (endpoint.second.get("ok").is_bool() &&
-                    endpoint.second.get("ok").as_bool())
-                    ++reachable;
+        const Json& paths = value.get("paths");
+        if (paths.is_object() &&
+            string_field(paths, "path_source") == "process")
+            output << "\nPATH：取自进程环境，可能过期";
+        const Json& policies = value.get("policies");
+        if (policies.is_object()) {
+            const Json& acp = policies.get("acp");
+            if (acp.is_number())
+                output << "\nANSI 代码页：" << acp.as_integer();
+        }
+        const Json& hardware = value.get("hardware");
+        if (hardware.is_object()) {
+            const Json& width = hardware.get("vector_width_bits");
+            if (width.is_number())
+                output << "\n可用向量宽度：" << width.as_integer() << " 位";
+            const Json& adapters = hardware.get("gpu");
+            if (adapters.is_array()) {
+                std::size_t indirect_count = 0;
+                for (const auto& adapter : adapters.as_array()) {
+                    const Json& indirect = adapter.get("virtual");
+                    if (indirect.is_bool() && indirect.as_bool()) {
+                        ++indirect_count;
+                        continue;
+                    }
+                    output << "\nGPU：" << string_field(adapter, "name");
+                    // Kept in MB so it can be compared directly with what the
+                    // vendor tooling reports for the same adapter.
+                    const Json& memory = adapter.get("vram_mb");
+                    if (memory.is_number())
+                        output << "（显存 " << memory.as_integer() << " MB）";
+                    else
+                        output << "（显存未报告）";
+                }
+                if (indirect_count)
+                    output << "\n虚拟显示适配器：" << indirect_count << " 个";
+                // Kept outside the loop so it survives the empty case, which is
+                // exactly when a cut-short walk would otherwise look like a
+                // machine with no display adapters at all.
+                if (hardware.get("gpu_enumeration_incomplete").is_bool())
+                    output << "\nGPU 枚举未完成，列表可能不全";
+                else if (adapters.as_array().empty())
+                    output << "\nGPU：未检测到（枚举已完成）";
             }
-            output << "\n网络连通性：" << reachable << "/"
-                   << network.as_object().size() << " 个目标可达";
         }
-        return output.str();
-    }
-    if (name == "get_cache_status") {
-        std::ostringstream output;
-        output << "缓存状态";
-        const Json& categories = value.get("categories");
-        if (categories.is_object()) {
-            static const std::map<std::string, std::string> labels{
-                {"environment", "环境（含网络）"},
-                {"environment_local", "本地环境（无网络）"},
-                {"hardware", "硬件"},
-                {"toolchain", "开发工具"}};
-            for (const auto& category : categories.as_object()) {
-                const auto label = labels.find(category.first);
-                output << "\n"
-                       << (label == labels.end() ? category.first : label->second)
-                       << "：" << string_field(category.second, "reason");
-            }
-        }
-        return output.str();
-    }
-    if (name == "refresh_env") {
-        std::ostringstream output;
-        output << "环境刷新结果";
-        for (const auto& category : {
-                 std::pair<const char*, const char*>{"hardware", "硬件"},
-                 {"toolchain", "开发工具"},
-                 {"environment", "系统环境"}}) {
-            const Json& item = value.get(category.first);
-            if (item.is_object())
-                output << "\n\n" << category.second << "\n"
-                       << summarize_payload(category.first, item);
-        }
-        return output.str();
+        return output.str() + cache_note(value);
     }
     return dump_json(value);
 }
 
-Json tool_result(const std::string& name, Json value, bool detail) {
+Json tool_result(const std::string& name, Json value, bool detail,
+                 const std::vector<std::string>& filter) {
     Json result = Json::object();
     if (detail) {
         result["content"] = text_content(dump_json(value));
         result["structuredContent"] = value;
     } else {
-        const std::string summary = summarize_payload(name, value);
+        const std::string summary = summarize_payload(name, value, filter);
         result["content"] = text_content(summary);
     }
     return result;
@@ -265,55 +464,49 @@ Json string_schema(const char* description) {
 Json tools() {
     Json list = Json::array();
 
-    Json hardware = object_schema();
-    hardware["properties"]["refresh"] =
+    Json system = object_schema();
+    system["properties"]["refresh"] =
         boolean_schema("Bypass the cache and re-probe.");
-    hardware["properties"]["detail"] =
+    system["properties"]["detail"] =
         boolean_schema("Return the full JSON result instead of a concise summary.");
     list.as_array().push_back(tool_definition(
-        "get_hardware",
-        "CPU identity and OS-usable ISA capabilities from CPUID/XCR0, plus memory.",
-        hardware));
+        "get_system",
+        "Windows, shell, and hardware facts including display adapters and their memory, plus measured shell capabilities and machine policies. Local only: it never makes a network request.",
+        system));
 
-    Json toolchain = object_schema();
-    toolchain["properties"]["refresh"] =
+    Json tool_list = object_schema();
+    tool_list["properties"]["refresh"] =
         boolean_schema("Bypass the cache and re-probe.");
-    toolchain["properties"]["detail"] =
+    tool_list["properties"]["detail"] =
+        boolean_schema("Return the full JSON result instead of a concise summary.");
+    tool_list["properties"]["name"] = string_schema(
+        "Only report tools matching this text, for example \"cmake\" or \"cmake, ninja\".");
+    list.as_array().push_back(tool_definition(
+        "get_tools",
+        "Locate developer tools and report each executable path, version, and PATH status. Detected tools only.",
+        tool_list));
+
+    Json apps = object_schema();
+    apps["properties"]["refresh"] =
+        boolean_schema("Bypass the cache and re-probe.");
+    apps["properties"]["detail"] =
+        boolean_schema("Return the full JSON result instead of a concise summary.");
+    apps["properties"]["filter"] = string_schema(
+        "Match installed applications by name, publisher, or version. Without it only the total count is returned.");
+    list.as_array().push_back(tool_definition(
+        "get_apps",
+        "Installed applications from the Windows uninstall registry, including software with no command-line entry point. Shows name, version, publisher, and install location.",
+        apps));
+
+    Json network = object_schema();
+    network["properties"]["refresh"] =
+        boolean_schema("Bypass the cache and re-probe.");
+    network["properties"]["detail"] =
         boolean_schema("Return the full JSON result instead of a concise summary.");
     list.as_array().push_back(tool_definition(
-        "get_toolchain",
-        "Locate installed runtimes, build tools, editors, container tools, shells, and package managers. Reports detected tools only.",
-        toolchain));
-
-    Json environment = object_schema();
-    environment["properties"]["refresh"] =
-        boolean_schema("Bypass the cache and re-probe.");
-    environment["properties"]["detail"] =
-        boolean_schema("Return the full JSON result instead of a concise summary.");
-    environment["properties"]["include_network"] = boolean_schema(
-        "Check GitHub, Hugging Face, and PyPI reachability. False skips network.");
-    list.as_array().push_back(tool_definition(
-        "get_environment",
-        "Report Windows and shell facts plus existing PATH directories (invalid or file entries are counted and omitted); optionally check network reachability.",
-        environment));
-
-    Json refresh = object_schema();
-    Json scope = string_schema("Categories to re-probe.");
-    Json scope_enum = Json::array();
-    for (const char* name : {"all", "hardware", "toolchain", "environment"})
-        scope_enum.as_array().emplace_back(name);
-    scope["enum"] = scope_enum;
-    refresh["properties"]["scope"] = scope;
-    refresh["properties"]["detail"] =
-        boolean_schema("Return full JSON results instead of concise summaries.");
-    list.as_array().push_back(tool_definition(
-        "refresh_env", "Force a fresh probe for one or all categories.", refresh));
-
-    Json status = object_schema();
-    status["properties"]["detail"] =
-        boolean_schema("Return the full cache metadata.");
-    list.as_array().push_back(tool_definition(
-        "get_cache_status", "Report per-category cache freshness.", status));
+        "get_network",
+        "Check HTTPS reachability of GitHub, Hugging Face, and PyPI. This is the only tool that makes outbound requests; failures report the reason.",
+        network));
     return list;
 }
 
@@ -346,6 +539,10 @@ Json rpc_error(const Json& id, int code, const std::string& message) {
 Json dispatch(const Json& request, bool& has_response) {
     has_response = true;
     if (!request.is_object()) return rpc_error(nullptr, -32600, "invalid request");
+    const Json& version_value = request.get("jsonrpc");
+    if (version_value.is_string() && version_value.as_string() != "2.0")
+        return rpc_error(request.get("id"), -32600,
+                         "unsupported JSON-RPC version");
     const Json& method_value = request.get("method");
     const Json& id = request.get("id");
     const bool notification = !request.contains("id");
@@ -380,14 +577,16 @@ Json dispatch(const Json& request, bool& has_response) {
             supported ? requested_version : "2025-11-25";
         result["capabilities"]["tools"]["listChanged"] = false;
         result["serverInfo"]["name"] = "machine-env-cpp";
-        result["serverInfo"]["version"] = "0.2.0";
+        result["serverInfo"]["version"] = "0.3.0";
         result["instructions"] =
-            "观察到的 Windows 机器事实：CPU 指令集、工具链、操作系统、shell、路径，"
-            "以及可选的网络状态。本 MCP 是纯探测工具：只报告存在的内容（工具名、"
-            "版本、路径、是否在 PATH），不提供用法指导。请把它当作当前机器工具与"
-            "环境事实的唯一来源，不要依赖静态记忆文件或猜测。检查项目文件以确定"
-            "需求。只报告已检测到的工具。除非用户明确要求或批准，否则不得下载、"
-            "安装或运行安装程序。";
+            "本 MCP 提供当前 Windows 机器的只读环境事实，共四个工具：get_system（操作系统、"
+            "shell 能力、硬件（含 GPU 型号与显存）、权限与编码策略，不联网）、"
+            "get_tools（开发工具路径与版本，可用 name 定向查询）、"
+            "get_apps（已安装应用清单，默认只返回总数，用 filter 查询）、"
+            "get_network（唯一会发起外部请求的工具）。任务依赖本机环境时先查询再动手，"
+            "不要根据旧记忆或惯例猜测。能力字段带 source：measured 为实测、"
+            "unknown 表示未验证，不得把 unknown 当作支持。只使用实际检测到的工具和路径；"
+            "工具缺失时说明缺失，不得擅自下载、安装或运行安装程序，除非用户明确要求或批准。";
         Json response = Json::object();
         response["jsonrpc"] = "2.0";
         response["id"] = id;
@@ -422,63 +621,68 @@ Json dispatch(const Json& request, bool& has_response) {
         if (!arguments.is_object())
             return rpc_error(id, -32602, "tool arguments must be an object");
 
+        struct ToolSpec {
+            const char* kind;
+            const char* filter_name;
+            std::vector<const char*> arguments;
+        };
+        static const std::map<std::string, ToolSpec> specs{
+            {"get_system", {"system", nullptr, {"refresh", "detail"}}},
+            {"get_tools",
+             {"toolchain", "name", {"refresh", "detail", "name"}}},
+            {"get_apps", {"apps", "filter", {"refresh", "detail", "filter"}}},
+            {"get_network", {"network", nullptr, {"refresh", "detail"}}}};
+        const auto spec = specs.find(name);
+        if (spec == specs.end())
+            return rpc_error(id, -32602, "unknown tool: " + name);
+        // The declared schema forbids extra properties, so ignore none silently.
+        for (const auto& argument : arguments.as_object()) {
+            const auto& allowed = spec->second.arguments;
+            if (std::find(allowed.begin(), allowed.end(), argument.first) ==
+                allowed.end())
+                return rpc_error(id, -32602,
+                                 "unknown argument: " + argument.first);
+        }
+        const std::string kind = spec->second.kind;
         Json payload;
         std::string validation_error;
         bool detail = false;
         bool refresh = false;
-        if (name == "get_hardware" || name == "get_toolchain" ||
-            name == "get_environment") {
-            if (!optional_boolean(arguments, "detail", false, detail,
-                                  validation_error))
-                return rpc_error(id, -32602, validation_error);
-            if (!optional_boolean(arguments, "refresh", false, refresh,
-                                  validation_error))
-                return rpc_error(id, -32602, validation_error);
-            if (name == "get_environment") {
-                bool include_network = true;
-                if (!optional_boolean(arguments, "include_network", true,
-                                      include_network, validation_error))
-                    return rpc_error(id, -32602, validation_error);
-                payload = cached_probe("environment", refresh, include_network);
-            } else {
-                payload = cached_probe(name == "get_hardware" ? "hardware"
-                                                                : "toolchain",
-                                       refresh, true);
-            }
-        } else if (name == "refresh_env") {
-            if (!optional_boolean(arguments, "detail", false, detail,
-                                  validation_error))
-                return rpc_error(id, -32602, validation_error);
-            std::string scope = "all";
-            if (arguments.contains("scope")) {
-                const Json& value = arguments.get("scope");
-                if (!value.is_string())
-                    return rpc_error(id, -32602, "argument 'scope' must be a string");
-                scope = value.as_string();
-            }
-            payload = refresh_environment(scope);
-        } else if (name == "get_cache_status") {
-            if (!optional_boolean(arguments, "detail", false, detail,
-                                  validation_error))
-                return rpc_error(id, -32602, validation_error);
-            payload = probe_cache_status();
-        } else {
-            return rpc_error(id, -32602, "unknown tool: " + name);
+        std::vector<std::string> filter;
+        if (!optional_boolean(arguments, "detail", false, detail,
+                              validation_error))
+            return rpc_error(id, -32602, validation_error);
+        if (!optional_boolean(arguments, "refresh", false, refresh,
+                              validation_error))
+            return rpc_error(id, -32602, validation_error);
+        const char* filter_name = spec->second.filter_name;
+        if (filter_name && arguments.contains(filter_name)) {
+            const Json& value = arguments.get(filter_name);
+            if (!value.is_string())
+                return rpc_error(id, -32602,
+                                 std::string("argument '") + filter_name +
+                                     "' must be a string");
+            filter = parse_filter(value.as_string());
         }
+        payload = cached_probe(kind, refresh);
 
+        Json result = Json::object();
+        if (payload.contains("error")) {
+            // A tool that could not run is a tool error, not a data payload; a
+            // client must not read the failure as a probe result.
+            result["content"] = text_content(dump_json(payload));
+            result["isError"] = true;
+        } else {
+            result = tool_result(name, std::move(payload), detail, filter);
+        }
         Json response = Json::object();
         response["jsonrpc"] = "2.0";
         response["id"] = id;
-        response["result"] = tool_result(name, std::move(payload), detail);
+        response["result"] = result;
         return response;
     }
-    if (method == "resources/list") {
-        Json response = Json::object();
-        response["jsonrpc"] = "2.0";
-        response["id"] = id;
-        response["result"]["resources"] = Json::array();
-        return response;
-    }
+    // No resources capability is declared, so this method stays unknown rather
+    // than serving a capability the client was never told about.
     return rpc_error(id, -32601, "method not found: " + method);
 }
 
@@ -490,17 +694,41 @@ int selftest() {
         parsed.at("number").as_integer() != -250)
         throw std::runtime_error("JSON parser round-trip test failed");
 
+    // Deep nesting must be rejected instead of overflowing the stack.
+    bool depth_rejected = false;
+    try {
+        parse_json(std::string(400, '['));
+    } catch (const std::exception&) {
+        depth_rejected = true;
+    }
+    if (!depth_rejected)
+        throw std::runtime_error("JSON parser accepted deeply nested input");
+
     const Json hardware = probe_hardware();
     if (!hardware.get("brand").is_string() ||
         hardware.get("brand").as_string().empty() ||
         !hardware.get("isa").is_object())
         throw std::runtime_error("hardware probe returned incomplete data");
+    // The adapter list is always present, even when it is empty, so a caller
+    // can tell "no adapter was found" from "adapters were not probed".
+    const Json adapters = hardware.get("gpu");
+    if (!adapters.is_array())
+        throw std::runtime_error("display adapter probe returned no array");
+    for (const auto& adapter : adapters.as_array()) {
+        const Json& memory = adapter.get("vram_mb");
+        if (string_field(adapter, "name").empty() ||
+            !adapter.get("virtual").is_bool() ||
+            (memory.is_number() && memory.as_integer() <= 0))
+            throw std::runtime_error("display adapter entry is incomplete");
+    }
 
-    const Json local_environment = probe_environment(false);
+    const Json local_environment = probe_system();
     if (!local_environment.get("os").is_object() ||
         !local_environment.get("paths").is_object() ||
+        !local_environment.get("hardware").is_object() ||
+        !local_environment.get("policies").is_object() ||
         local_environment.contains("network"))
-        throw std::runtime_error("local environment probe contract failed");
+        throw std::runtime_error("system probe contract failed");
     const auto is_directory = [](const std::wstring& path) {
         const DWORD attributes = GetFileAttributesW(path.c_str());
         return attributes != INVALID_FILE_ATTRIBUTES &&
@@ -525,6 +753,10 @@ int selftest() {
     const std::string shell_kind = string_field(shell, "shell_kind");
     const std::string shell_version =
         first_line(string_field(shell, "ps_version"));
+    // Elevation decides whether elevated commands will work, so it must always
+    // be present and boolean.
+    if (!shell.get("is_admin").is_bool())
+        throw std::runtime_error("elevation state test failed");
     if (!shell_kind.empty()) {
         if (shell_kind != "pwsh" && shell_kind != "windows-powershell")
             throw std::runtime_error("shell kind test failed");
@@ -537,12 +769,21 @@ int selftest() {
             } catch (const std::exception&) {
                 shell_major = 0;
             }
-            if (!shell.get("supports_ampersand_ampersand").is_bool() ||
-                !shell.get("has_heredoc").is_bool() ||
-                shell.get("supports_ampersand_ampersand").as_bool() !=
-                    (shell_major >= 7) ||
-                shell.get("has_heredoc").as_bool() != (shell_major >= 7))
-                throw std::runtime_error("shell capability flags test failed");
+            const Json& capabilities = shell.get("capabilities");
+            const Json& ampersand = capabilities.get("ampersand_ampersand");
+            const Json& here_string = capabilities.get("here_string");
+            if (!capabilities.is_object() ||
+                ampersand.get("source").as_string() != "measured" ||
+                here_string.get("source").as_string() != "measured" ||
+                ampersand.get("state").as_string() == "unknown" ||
+                here_string.get("state").as_string() == "unknown")
+                throw std::runtime_error("measured shell capability test failed");
+            // PowerShell 5.1 has no "&&"; a probe that reports otherwise is
+            // claiming support it never observed.
+            if (shell_major == 5 &&
+                ampersand.get("state").as_string() == "supported")
+                throw std::runtime_error(
+                    "measured shell capability contradicts PowerShell 5.1");
             if (shell_kind == "pwsh" && shell_major < 7)
                 throw std::runtime_error("pwsh was not probed as the primary shell");
             if (shell_kind == "windows-powershell" && shell_major >= 7)
@@ -550,28 +791,18 @@ int selftest() {
         }
     }
 
-    const Json refreshed_hardware = cached_probe("hardware", true, true);
-    if (refreshed_hardware.contains("error"))
-        throw std::runtime_error("hardware cache write test failed");
-    const Json cached_hardware = cached_probe("hardware", false, true);
-    if (!cached_hardware.get("_cache").get("hit").as_bool() ||
-        cached_hardware.get("brand").as_string() !=
-            refreshed_hardware.get("brand").as_string())
-        throw std::runtime_error("hardware cache round-trip test failed");
-    const Json local_cached_environment = cached_probe("environment", true, false);
-    if (local_cached_environment.contains("network") ||
-        !local_cached_environment.get("_cache").get("cached").as_bool() ||
-        !local_cached_environment.get("_cache")
-             .get("network_probe_skipped").as_bool())
-        throw std::runtime_error("local environment cache test failed");
-    const Json cache_status = probe_cache_status();
-    if (!cache_status.get("categories")
-             .get("environment_local").get("hit").as_bool())
-        throw std::runtime_error("local environment cache status test failed");
-
-    const Json invalid_scope = refresh_environment("invalid");
-    if (!invalid_scope.contains("error"))
-        throw std::runtime_error("refresh scope validation test failed");
+    const Json refreshed_system = cached_probe("system", true);
+    if (refreshed_system.contains("error") ||
+        !refreshed_system.get("_cache").get("cached").as_bool())
+        throw std::runtime_error("system cache write test failed");
+    const Json cached_system = cached_probe("system", false);
+    if (!cached_system.get("_cache").get("hit").as_bool() ||
+        cached_system.get("os").get("caption").as_string() !=
+            refreshed_system.get("os").get("caption").as_string())
+        throw std::runtime_error("system cache round-trip test failed");
+    // A local system probe must never carry network data.
+    if (cached_system.contains("network"))
+        throw std::runtime_error("system probe leaked network data");
     bool has_response = false;
     const Json negotiated = dispatch(
         parse_json(R"({"jsonrpc":"2.0","id":3,"method":"initialize","params":{"protocolVersion":"not-supported"}})"),
@@ -592,8 +823,35 @@ int selftest() {
         parse_json(R"({"jsonrpc":"2.0","id":2,"method":"tools/list"})"),
         has_response);
     if (!has_response ||
-        listing.get("result").get("tools").as_array().size() != 5)
+        listing.get("result").get("tools").as_array().size() != 4)
         throw std::runtime_error("MCP tools/list dispatch test failed");
+    static const std::array<const char*, 4> expected_tools{{
+        "get_system", "get_tools", "get_apps", "get_network"}};
+    for (const char* expected : expected_tools) {
+        bool present = false;
+        for (const auto& tool : listing.get("result").get("tools").as_array())
+            if (tool.get("name").is_string() &&
+                tool.get("name").as_string() == expected)
+                present = true;
+        if (!present)
+            throw std::runtime_error(std::string("missing tool: ") + expected);
+    }
+    const Json apps_probe = probe_apps();
+    if (!apps_probe.get("apps").is_array() ||
+        !apps_probe.get("count").is_number() ||
+        apps_probe.get("count").as_integer() !=
+            static_cast<std::int64_t>(apps_probe.get("apps").as_array().size()))
+        throw std::runtime_error("installed application inventory test failed");
+    // Completeness must always be stated, never implied.
+    if (!apps_probe.get("enumeration_incomplete").is_bool())
+        throw std::runtime_error("inventory completeness test failed");
+    // A running binary must be verifiable; an unreadable one must not be cached.
+    if (source_fingerprint().empty())
+        throw std::runtime_error("running binary fingerprint is unavailable");
+    for (const auto& app : apps_probe.get("apps").as_array()) {
+        if (!app.get("name").is_string() || app.get("name").as_string().empty())
+            throw std::runtime_error("installed application entry has no name");
+    }
     const Json detected_tools = probe_toolchain();
     if (!detected_tools.get("tools").is_object() ||
         detected_tools.contains("missing") ||
@@ -606,15 +864,49 @@ int selftest() {
         throw std::runtime_error("toolchain machine identity test failed");
     if (machine_uuid() != machine_uuid())
         throw std::runtime_error("machine identity is not stable");
-    const Json summary = tool_result("get_hardware", hardware, false);
+    Json sample_system = Json::object();
+    sample_system["os"]["caption"] = "Windows 11 Pro";
+    sample_system["os"]["version"] = "10.0";
+    sample_system["os"]["build"] = 26300;
+    sample_system["os"]["arch"] = "64-bit";
+    sample_system["os"]["cpu_name"] = "Test CPU";
+    sample_system["os"]["total_mem_mb"] = 32768;
+    sample_system["shell"]["ps_version"] = "5.1.26100";
+    sample_system["shell"]["shell_path"] =
+        "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+    sample_system["shell"]["is_admin"] = true;
+    sample_system["shell"]["capabilities"]["ampersand_ampersand"]["state"] =
+        "unsupported";
+    sample_system["shell"]["capabilities"]["ampersand_ampersand"]["source"] =
+        "measured";
+    sample_system["policies"]["acp"] = 936;
+    sample_system["hardware"]["vector_width_bits"] = 256;
+    sample_system["hardware"]["gpu"] = Json::array();
+    Json physical = Json::object();
+    physical["name"] = "Test GPU";
+    physical["vram_mb"] = 8188;
+    physical["virtual"] = false;
+    sample_system["hardware"]["gpu"].as_array().push_back(std::move(physical));
+    Json indirect = Json::object();
+    indirect["name"] = "Test Indirect Display";
+    indirect["virtual"] = true;
+    sample_system["hardware"]["gpu"].as_array().push_back(std::move(indirect));
+    const Json summary = tool_result("get_system", sample_system, false, {});
     if (summary.contains("structuredContent") ||
-        summary.get("content").as_array().size() != 1 ||
-        summary.get("content").as_array()[0].get("text").as_string().find("CPU：") ==
-            std::string::npos ||
-        dump_json(summary).size() >= dump_json(hardware).size())
-        throw std::runtime_error("concise hardware summary test failed");
-    const Json detailed = tool_result("get_hardware", hardware, true);
-    if (!detailed.get("structuredContent").get("isa").is_object())
+        summary.get("content").as_array().size() != 1)
+        throw std::runtime_error("concise summary contract test failed");
+    const std::string summary_text =
+        summary.get("content").as_array()[0].get("text").as_string();
+    if (summary_text.find("Windows 11 Pro") == std::string::npos ||
+        summary_text.find("不支持 &&") == std::string::npos ||
+        summary_text.find("ANSI 代码页：936") == std::string::npos ||
+        summary_text.find("（powershell.exe）") == std::string::npos ||
+        summary_text.find("权限：管理员") == std::string::npos ||
+        summary_text.find("GPU：Test GPU（显存 8188 MB）") == std::string::npos ||
+        summary_text.find("虚拟显示适配器：1 个") == std::string::npos)
+        throw std::runtime_error("concise system summary test failed");
+    const Json detailed = tool_result("get_system", sample_system, true, {});
+    if (!detailed.get("structuredContent").get("hardware").is_object())
         throw std::runtime_error("detailed tool result test failed");
     Json sample_toolchain = Json::object();
     sample_toolchain["computer_name"] = "TEST-PC";
@@ -639,7 +931,7 @@ int selftest() {
     sample_toolchain["not_on_path"] = Json::array();
     sample_toolchain["not_on_path"].as_array().emplace_back("cl");
     const std::string toolchain_summary =
-        summarize_payload("get_toolchain", sample_toolchain);
+        summarize_payload("get_tools", sample_toolchain, {});
     const std::string expected_toolchain_summary =
         "- PYTHON = C:\\Python\\python.exe (3.14.0)\n"
         "- GIT = C:\\Git\\git.exe\n"
@@ -655,17 +947,92 @@ int selftest() {
     if (toolchain_summary != expected_toolchain_summary)
         throw std::runtime_error("toolchain memory format/order test failed");
 
+    // A version that could not be read must not look like a tool that has no
+    // version, and it must not make an installed tool disappear either.
+    Json unknown_version = Json::object();
+    unknown_version["tools"]["git"] = "C:\\Git\\git.exe";
+    unknown_version["version_unknown"] = Json::array();
+    unknown_version["version_unknown"].as_array().emplace_back("git");
+    if (summarize_payload("get_tools", unknown_version, {})
+            .find("GIT = C:\\Git\\git.exe (版本未知)") == std::string::npos)
+        throw std::runtime_error("unknown version marker test failed");
+    Json alias_unknown = Json::object();
+    alias_unknown["tools"]["node"] =
+        "C:\\Users\\Test\\AppData\\Local\\Microsoft\\WindowsApps\\node.exe";
+    alias_unknown["version_unknown"] = Json::array();
+    alias_unknown["version_unknown"].as_array().emplace_back("node");
+    if (summarize_payload("get_tools", alias_unknown, {}).find("NODE =") ==
+        std::string::npos)
+        throw std::runtime_error("alias with an unknown version was dropped");
+
+    const std::string filtered_tools = summarize_payload(
+        "get_tools", sample_toolchain, parse_filter("cmake, clang"));
+    if (filtered_tools.find("CLANG") == std::string::npos ||
+        filtered_tools.find("GIT") != std::string::npos)
+        throw std::runtime_error("tool name filter test failed");
+
+    Json path_noise = Json::object();
+    path_noise["tools"]["node"] = "C:\\Program Files\\nodejs\\node.exe";
+    path_noise["tools"]["pnpm"] = "C:\\Node\\pnpm.cmd";
+    path_noise["not_on_path"] = Json::array();
+    const std::string node_only =
+        summarize_payload("get_tools", path_noise, parse_filter("node"));
+    if (node_only.find("NODE") == std::string::npos ||
+        node_only.find("PNPM") != std::string::npos)
+        throw std::runtime_error("tool filter matched a path instead of a name");
+
+    // A phrase must match as a whole, so a shared word cannot pull in noise.
+    if (parse_filter("visual studio").size() != 1 ||
+        !matches_filter(parse_filter("visual studio"), "Visual Studio 2026") ||
+        matches_filter(parse_filter("visual studio"), "Supernova Games Studios") ||
+        parse_filter("cmake, ninja").size() != 2)
+        throw std::runtime_error("filter phrase semantics test failed");
+
+    Json sample_apps = Json::object();
+    sample_apps["apps"] = Json::array();
+    Json first_app = Json::object();
+    first_app["name"] = "Python 3.14.3";
+    first_app["version"] = "3.14.3";
+    first_app["install_location"] = "C:\\Python314";
+    sample_apps["apps"].as_array().push_back(first_app);
+    Json second_app = Json::object();
+    second_app["name"] = "CMake";
+    sample_apps["apps"].as_array().push_back(second_app);
+    const std::string apps_default =
+        summarize_payload("get_apps", sample_apps, {});
+    if (apps_default.find("2 项") == std::string::npos ||
+        apps_default.find("CMake") != std::string::npos)
+        throw std::runtime_error("apps default summary test failed");
+    const std::string apps_filtered = summarize_payload(
+        "get_apps", sample_apps, parse_filter("python"));
+    if (apps_filtered.find("Python 3.14.3") == std::string::npos ||
+        apps_filtered.find("CMake") != std::string::npos)
+        throw std::runtime_error("apps filter test failed");
+
+    Json sample_network = Json::object();
+    sample_network["endpoints"]["github_api"]["ok"] = true;
+    sample_network["endpoints"]["github_api"]["status"] = 200;
+    sample_network["endpoints"]["huggingface"]["ok"] = false;
+    sample_network["endpoints"]["huggingface"]["reason"] = "timeout";
+    const std::string network_summary =
+        summarize_payload("get_network", sample_network, {});
+    if (network_summary.find("timeout") == std::string::npos ||
+        network_summary.find("可达 1/2") == std::string::npos)
+        throw std::runtime_error("network summary test failed");
+
     std::cout << "JSON parser: OK\n";
     std::cout << "CPUID probe: " << hardware.get("brand").as_string() << "\n";
     std::cout << "Local Windows probe: OK\n";
     std::cout << "Shell probe: " << shell_kind << " " << shell_version << "\n";
     std::cout << "Cache write/read: OK\n";
-    std::cout << "PATH directory filtering and local environment cache: OK\n";
+    std::cout << "PATH directory filtering and system cache: OK\n";
     std::cout << "MCP initialize: OK\n";
-    std::cout << "MCP tools/list: OK\n";
+    std::cout << "MCP tools/list (4 tools): OK\n";
     std::cout << "Concise and detailed tool results: OK\n";
-    std::cout << "Toolchain memory format and order: OK\n";
-    std::cout << "Installed-only toolchain results: OK\n";
+    std::cout << "Measured shell capabilities: OK\n";
+    std::cout << "Toolchain format, order, and name filter: OK\n";
+    std::cout << "Installed application inventory and filter: OK\n";
+    std::cout << "Network summary and failure reason: OK\n";
     std::cout << "Protocol negotiation: OK\n";
     std::cout << "SELFTEST: PASS\n";
     return 0;
@@ -681,25 +1048,47 @@ int wmain(int argc, wchar_t** argv) {
 
     try {
         if (argc > 1 && std::wstring(argv[1]) == L"--version") {
-            std::cout << "machine-env-cpp 0.2.0\n";
+            std::cout << "machine-env-cpp 0.3.0\n";
             return 0;
         }
         if (argc > 1 && std::wstring(argv[1]) == L"--selftest")
             return selftest();
 
+        const std::string fingerprint = source_fingerprint();
         std::cerr << "machine-env-cpp MCP server ready (fingerprint "
-                  << source_fingerprint() << ")\n";
+                  << (fingerprint.empty() ? "unverified" : fingerprint)
+                  << ")\n";
         std::string line;
-        while (std::getline(std::cin, line)) {
-            if (line.empty()) continue;
-            if (line.size() > 8 * 1024 * 1024) {
+        bool oversized = false;
+        while (read_message(std::cin, line, oversized)) {
+            if (oversized) {
                 std::cerr << "machine-env-cpp: rejected oversized JSON-RPC message\n";
+                // Answer rather than stay silent, so the client is not left
+                // waiting for a response that never comes.
+                std::cout << dump_json(rpc_error(Json(), -32600,
+                                                 "message exceeds 8 MiB"))
+                          << '\n' << std::flush;
                 continue;
             }
+            // A client that emits a BOM would otherwise fail every handshake.
+            if (line.size() >= 3 &&
+                static_cast<unsigned char>(line[0]) == 0xef &&
+                static_cast<unsigned char>(line[1]) == 0xbb &&
+                static_cast<unsigned char>(line[2]) == 0xbf)
+                line.erase(0, 3);
+            if (line.empty()) continue;
             try {
                 const Json request = parse_json(line);
                 bool send_response = false;
-                const Json response = dispatch(request, send_response);
+                Json response;
+                try {
+                    response = dispatch(request, send_response);
+                } catch (const std::exception& error) {
+                    // A probe that failed is an internal error for this request,
+                    // not a parse error, and must echo the request id.
+                    response = rpc_error(request.get("id"), -32603, error.what());
+                    send_response = true;
+                }
                 if (send_response)
                     std::cout << dump_json(response) << '\n' << std::flush;
             } catch (const std::exception& error) {

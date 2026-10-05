@@ -4,15 +4,19 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$Root = Split-Path -Parent $PSScriptRoot
 $VsWhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
 if (-not (Test-Path -LiteralPath $VsWhere)) {
     throw "vswhere.exe not found. Install Visual Studio with the C++ workload."
 }
 
-$VsRoot = (& $VsWhere -latest -property installationPath | Select-Object -First 1).Trim()
+$VsRoot = & $VsWhere -latest -products '*' -property installationPath |
+    Select-Object -First 1
+if ($VsRoot) {
+    $VsRoot = $VsRoot.Trim()
+}
 if (-not $VsRoot) {
-    throw 'No Visual Studio installation found by vswhere.'
+    throw 'No Visual Studio or Build Tools installation found by vswhere.'
 }
 
 $VcVars = Join-Path $VsRoot 'VC\Auxiliary\Build\vcvars64.bat'
@@ -32,6 +36,28 @@ $BuildDir = if ([string]::IsNullOrWhiteSpace($BuildDirectory)) {
     Join-Path $Root 'build'
 } else {
     [System.IO.Path]::GetFullPath($BuildDirectory)
+}
+$CacheFile = Join-Path $BuildDir 'CMakeCache.txt'
+if (Test-Path -LiteralPath $CacheFile) {
+    $CacheLine = Select-String -LiteralPath $CacheFile `
+        -Pattern '^CMAKE_HOME_DIRECTORY:INTERNAL=' | Select-Object -First 1
+    $CachedSource = if ($CacheLine) { $CacheLine.Line.Split('=', 2)[1] } else { '' }
+        $CachedSourcePath = $CachedSource.Replace('/', '\').TrimEnd('\')
+        $CurrentSource = [System.IO.Path]::GetFullPath($Root).Replace('/', '\').TrimEnd('\')
+    if ($CachedSource -and -not [string]::Equals(
+            $CachedSourcePath, $CurrentSource,
+            [System.StringComparison]::OrdinalIgnoreCase)) {
+        Write-Host "Discarding CMake cache from '$CachedSource'" -ForegroundColor Yellow
+        foreach ($GeneratedFile in @(
+            'CMakeCache.txt', 'build.ninja', 'build.ninja.old',
+            'cmake_install.cmake', '.ninja_deps', '.ninja_log'
+        )) {
+            Remove-Item -LiteralPath (Join-Path $BuildDir $GeneratedFile) `
+                -Force -ErrorAction SilentlyContinue
+        }
+        Remove-Item -LiteralPath (Join-Path $BuildDir 'CMakeFiles') `
+            -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 $Output = Join-Path $BuildDir 'machine-env-cpp.exe'
 

@@ -6,23 +6,49 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$ExePath,
 
-    [string]$ConfigPath = (Join-Path $env:USERPROFILE '.copilot\mcp-config.json')
+    [Parameter(Mandatory = $true)]
+    [string]$InstructionsPath,
+
+    [string]$ConfigPath = $(if ([string]::IsNullOrWhiteSpace($env:COPILOT_HOME)) {
+        Join-Path $env:USERPROFILE '.copilot\mcp-config.json'
+    } else {
+        Join-Path $env:COPILOT_HOME 'mcp-config.json'
+    })
 )
 
 $ErrorActionPreference = 'Stop'
 $serverName = 'machine-env-cpp'
 $configDirectory = Split-Path -Parent $ConfigPath
 $expectedExe = [System.IO.Path]::GetFullPath($ExePath)
+# Join-Path rejects an empty path, so resolve these only when APPDATA is set.
+$vscodePromptsDirectory = if ([string]::IsNullOrWhiteSpace($env:APPDATA)) {
+    $null
+} else {
+    Join-Path $env:APPDATA 'Code\User\prompts'
+}
+$vscodeInstructions = if ($null -eq $vscodePromptsDirectory) {
+    $null
+} else {
+    Join-Path $vscodePromptsDirectory 'machine-env-cpp.instructions.md'
+}
+# Older releases also copied the instruction into the Copilot user folder.
+$legacyInstructions = Join-Path (Split-Path -Parent $ConfigPath) 'instructions\machine-env-cpp.instructions.md'
+$skipConfigWrite = $false
+
+if ($Mode -eq 'Install' -and
+    -not (Test-Path -LiteralPath $InstructionsPath -PathType Leaf)) {
+    throw "MCP instructions file does not exist: $InstructionsPath"
+}
 
 if (-not (Test-Path -LiteralPath $ConfigPath)) {
     if ($Mode -eq 'Uninstall') {
-        Write-Output 'MCP configuration does not exist; nothing to remove.'
-        exit 0
+        $existing = [pscustomobject]@{}
+    } else {
+        $existing = [pscustomobject]@{}
     }
-    $existing = [pscustomobject]@{}
 } else {
     try {
-        $existing = Get-Content -LiteralPath $ConfigPath -Raw |
+        $existing = Get-Content -LiteralPath $ConfigPath -Encoding UTF8 -Raw |
             ConvertFrom-Json -ErrorAction Stop
     } catch {
         throw "Refusing to modify invalid MCP config '$ConfigPath': $($_.Exception.Message)"
@@ -69,7 +95,7 @@ if ($Mode -eq 'Install') {
         $servers.Remove($serverName)
     } else {
         Write-Output 'The configured machine-env-cpp entry points elsewhere; leaving it unchanged.'
-        exit 0
+        $skipConfigWrite = $true
     }
 }
 
@@ -86,20 +112,37 @@ if ($servers.Count -gt 0) {
 if (-not (Test-Path -LiteralPath $configDirectory)) {
     New-Item -ItemType Directory -Path $configDirectory -Force | Out-Null
 }
-if (Test-Path -LiteralPath $ConfigPath) {
-    Copy-Item -LiteralPath $ConfigPath -Destination "$ConfigPath.bak" -Force
+if (-not $skipConfigWrite -and
+    ($Mode -eq 'Install' -or (Test-Path -LiteralPath $ConfigPath))) {
+    if ((Test-Path -LiteralPath $ConfigPath) -and
+        -not (Test-Path -LiteralPath "$ConfigPath.bak")) {
+        Copy-Item -LiteralPath $ConfigPath -Destination "$ConfigPath.bak" -Force
+    }
+
+    $temporaryPath = "$ConfigPath.$PID.tmp"
+    try {
+        $json = $merged | ConvertTo-Json -Depth 40
+        $encoding = New-Object System.Text.UTF8Encoding $false
+        [System.IO.File]::WriteAllText($temporaryPath, $json, $encoding)
+        Move-Item -LiteralPath $temporaryPath -Destination $ConfigPath -Force
+    } finally {
+        if (Test-Path -LiteralPath $temporaryPath) {
+            Remove-Item -LiteralPath $temporaryPath -Force
+        }
+    }
 }
 
-$temporaryPath = "$ConfigPath.$PID.tmp"
-try {
-    $json = $merged | ConvertTo-Json -Depth 40
-    $encoding = New-Object System.Text.UTF8Encoding $false
-    [System.IO.File]::WriteAllText($temporaryPath, $json, $encoding)
-    Move-Item -LiteralPath $temporaryPath -Destination $ConfigPath -Force
-} finally {
-    if (Test-Path -LiteralPath $temporaryPath) {
-        Remove-Item -LiteralPath $temporaryPath -Force
+if ($Mode -eq 'Install') {
+    if ($null -eq $vscodeInstructions) {
+        throw 'APPDATA is not set; cannot install the VS Code instruction file.'
     }
+    New-Item -ItemType Directory -Path $vscodePromptsDirectory -Force | Out-Null
+    Copy-Item -LiteralPath $InstructionsPath -Destination $vscodeInstructions -Force
+} else {
+    if ($null -ne $vscodeInstructions) {
+        Remove-Item -LiteralPath $vscodeInstructions -Force -ErrorAction SilentlyContinue
+    }
+    Remove-Item -LiteralPath $legacyInstructions -Force -ErrorAction SilentlyContinue
 }
 
 Write-Output "MCP configuration updated: $ConfigPath"

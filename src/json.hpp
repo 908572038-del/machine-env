@@ -116,6 +116,23 @@ public:
 private:
     const std::string& source_;
     std::size_t position_ = 0;
+    std::size_t depth_ = 0;
+    static constexpr std::size_t kMaxDepth = 256;
+
+    // Bounds recursion so a deeply nested document cannot overflow the stack and
+    // take the whole server down.
+    class DepthGuard {
+    public:
+        explicit DepthGuard(JsonParser& parser) : parser_(parser) {
+            if (++parser_.depth_ > kMaxDepth) parser_.fail("nesting too deep");
+        }
+        ~DepthGuard() { --parser_.depth_; }
+        DepthGuard(const DepthGuard&) = delete;
+        DepthGuard& operator=(const DepthGuard&) = delete;
+
+    private:
+        JsonParser& parser_;
+    };
 
     [[noreturn]] void fail(const std::string& message) const {
         throw std::runtime_error("JSON parse error at byte " +
@@ -252,6 +269,7 @@ private:
     }
 
     Json parse_array() {
+        DepthGuard guard(*this);
         expect('[');
         skip_space();
         Json::Array result;
@@ -266,6 +284,7 @@ private:
     }
 
     Json parse_object() {
+        DepthGuard guard(*this);
         expect('{');
         skip_space();
         Json::Object result;
