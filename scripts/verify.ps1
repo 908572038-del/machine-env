@@ -124,6 +124,14 @@ try {
     $apps = $byId['6'].result.structuredContent
     Assert-That ($apps.count -is [int] -or $apps.count -is [long]) 'get_apps reports an application count'
     Assert-That ($apps.apps -is [array]) 'get_apps returns an application array'
+    # The rule travels by two routes: the initialize result, which the client
+    # injects on every request, and an installed file that is only loaded on
+    # demand. Comparing them keeps the two from drifting apart, which is how the
+    # injected wording silently stopped matching what was documented.
+    $ruleText = [System.IO.File]::ReadAllText($vscodeRule, [System.Text.Encoding]::UTF8)
+    $ruleBody = ([regex]::Replace($ruleText, '(?s)^---\r?\n.*?\r?\n---\r?\n', '')).Trim()
+    $injected = ([string]$byId['1'].result.instructions).Trim()
+    Assert-That ($ruleBody -eq $injected) 'the installed rule and the injected rule say the same thing'
 
     Write-Step 'Protocol edges'
     $handshake = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}'

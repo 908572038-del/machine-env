@@ -686,15 +686,19 @@ Json dispatch(const Json& request, bool& has_response) {
         result["capabilities"]["tools"]["listChanged"] = false;
         result["serverInfo"]["name"] = "machine-env-cpp";
         result["serverInfo"]["version"] = server_version();
+        // This is the rule that is actually injected on every request, so it
+        // carries only what has to be obeyed instead of restating the tool
+        // schemas the client already sends. verify.ps1 compares it verbatim with
+        // the installed instruction file, so an edit here belongs there too.
         result["instructions"] =
-            "本 MCP 提供当前 Windows 机器的只读环境事实，共四个工具：get_system（操作系统、"
-            "shell 能力、硬件（含 GPU 型号与显存）、权限与编码策略，不联网）、"
-            "get_tools（开发工具路径与版本，可用 name 定向查询）、"
-            "get_apps（已安装应用清单，默认只返回总数，用 filter 查询）、"
-            "get_network（唯一会发起外部请求的工具）。任务依赖本机环境时先查询再动手，"
-            "不要根据旧记忆或惯例猜测。能力字段带 source：measured 为实测、"
-            "unknown 表示未验证，不得把 unknown 当作支持。只使用实际检测到的工具和路径；"
-            "工具缺失时说明缺失，不得擅自下载、安装或运行安装程序，除非用户明确要求或批准。";
+            "本机环境必须实测，不得凭操作系统惯例、旧记忆或猜测推断。涉及系统、shell、"
+            "工具路径或版本、已装软件、硬件（含 GPU）、编码或权限，或要为本机选择构建、"
+            "测试、运行命令时，先查本 MCP 再作答。get_system=系统与硬件；"
+            "get_tools=工具路径与版本（用 name 只查所需）；get_apps=已装软件（须给 filter）；"
+            "get_network=联网（唯一外部请求，非必要不调用）。本 MCP 只读："
+            "未经用户明确要求或批准，不下载、不安装、不运行安装程序，不修改全局环境。"
+            "未检测到即说明缺失或给出替代方案，不要假设已安装；source=unknown 表示未验证，"
+            "不得当作支持。留意返回值中的约束（如不支持 &&、原生输出非 UTF-8）并据此改写命令。";
         Json response = Json::object();
         response["jsonrpc"] = "2.0";
         response["id"] = id;
