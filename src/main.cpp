@@ -307,21 +307,24 @@ std::string summarize_apps(const Json& value,
         return "已安装应用：" + std::to_string(total) +
                " 项（未列出；可用 filter 按名称、发布者或版本查询）" + caveat;
     std::ostringstream output;
+    constexpr std::size_t kMaxShown = 50;
+    std::size_t matched = 0;
     std::size_t shown = 0;
-    bool truncated = false;
     for (const auto& app : apps.as_array()) {
         const std::string name = string_field(app, "name");
         const std::string version = first_line(string_field(app, "version"));
         const std::string publisher = string_field(app, "publisher");
         if (!matches_filter(filter, name + " " + version + " " + publisher))
             continue;
-        if (shown == 50) {
-            truncated = true;
-            break;
-        }
+        ++matched;
+        // Counting continues past the display cap so the note can state how
+        // many matched rather than how many are installed.
+        if (shown == kMaxShown) continue;
         if (shown > 0) output << "\n";
+        // The version is parenthesised because appending it after a space
+        // leaves the boundary between name and version to be guessed.
         output << "- " << name;
-        if (!version.empty()) output << " " << version;
+        if (!version.empty()) output << " (" << version << ")";
         const std::string location = string_field(app, "install_location");
         if (!location.empty()) output << "\n  位置：" << location;
         ++shown;
@@ -329,8 +332,9 @@ std::string summarize_apps(const Json& value,
     if (shown == 0)
         return "没有匹配的已安装应用（共 " + std::to_string(total) + " 项）" +
                caveat;
-    if (truncated)
-        output << "\n（仅显示前 50 条，共 " << total << " 项）";
+    if (matched > shown)
+        output << "\n（匹配 " << matched << " 项，仅显示前 " << shown
+               << " 条）";
     return output.str() + caveat;
 }
 
@@ -1073,6 +1077,23 @@ int selftest() {
                           parse_filter("no such phrase"))
             .find("没有匹配的工具") == std::string::npos)
         throw std::runtime_error("a filter matching nothing did not say so");
+
+    // An app list must keep the version distinguishable from the name, and a
+    // truncated list must state how many matched, not how many are installed.
+    Json apps_sample = Json::object();
+    apps_sample["apps"] = Json::array();
+    for (int index = 0; index < 60; ++index) {
+        Json app = Json::object();
+        app["name"] = std::string("Sample App ") + std::to_string(index);
+        app["version"] = std::string("1.0.") + std::to_string(index);
+        apps_sample["apps"].as_array().push_back(std::move(app));
+    }
+    const std::string apps_text =
+        summarize_payload("get_apps", apps_sample, parse_filter("sample"));
+    if (apps_text.find("- Sample App 0 (1.0.0)") == std::string::npos)
+        throw std::runtime_error("an app name and version are not distinguished");
+    if (apps_text.find("匹配 60 项，仅显示前 50 条") == std::string::npos)
+        throw std::runtime_error("a truncated app list did not state how many matched");
 
     const std::string filtered_tools = summarize_payload(
         "get_tools", sample_toolchain, parse_filter("cmake, clang"));
