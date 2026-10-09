@@ -88,7 +88,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\package-portable.ps1
 ```
 
 `scripts\verify.ps1` is the one-command check: it builds, runs the native
-self-test, installs into a throwaway profile, asserts the protocol contract
+self-test, installs into a throwaway profile, asserts that both instruction
+copies were installed and that they say the same thing as the rule the server
+injects, asserts the protocol contract
 (identity, the four tools, rejected unknown arguments, no undeclared
 `resources/list`), then tampers with a cache entry to confirm it is rejected and
 re-probed rather than served, then uninstalls and confirms nothing was left
@@ -117,11 +119,14 @@ written there; otherwise it uses `~\.copilot\mcp-config.json`.
 The MCP config points to the executable in the per-user install directory, not
 to the source checkout or extracted ZIP directory.
 
-Installers add one MCP-specific `machine-env-cpp.instructions.md` to the VS Code
-user prompts directory. Its description loads it on demand for tasks that depend
-on current machine facts; unrelated tasks do not load it. NSIS uninstall and
-`uninstall-portable.ps1` remove only this instruction file and this server's
-matching MCP entry, leaving other servers and instruction files untouched.
+Installers add the MCP-specific `machine-env-cpp.instructions.md` to both user
+instruction folders, because a session reads the folder belonging to its own
+harness: `%APPDATA%\Code\User\prompts` for the VS Code Local agent, and
+`%COPILOT_HOME%\instructions` (`~\.copilot\instructions` by default) for Agent
+Host sessions. Installing only one leaves the rule in effect for one harness and
+absent in the other. NSIS uninstall and `uninstall-portable.ps1` remove both
+copies and this server's matching MCP entry, leaving other servers and
+instruction files untouched.
 
 Tool calls return concise text only by default. `get_tools` reports each detected
 tool on its own line in a fixed order, as `NAME = PATH`, with the version
@@ -148,9 +153,11 @@ Windows 11 is not reported with the legacy `Windows 10` registry product name.
 Pass `detail: true` to any tool to receive the full JSON data, including cache
 metadata and the detailed fields behind the summary.
 
-The server instructions ask AI clients to inspect project files before deciding
-which tools are needed and not to download, install, or run installers unless
-the user explicitly requests or approves it.
+The server returns the same rule from `initialize`, so a client that injects
+server instructions applies it without any file being loaded, and `verify.ps1`
+compares the injected wording with the installed file so the two cannot drift
+apart. Neither route installs anything by itself: the rule only tells the agent
+to ask the user before changing the machine.
 
 `get_system` reports one shell and identifies which one it chose. `pwsh` is
 preferred when it is installed, so `shell_path` and `shell_kind` are what tell a
@@ -217,5 +224,5 @@ scripts/             Build, install, packaging, and uninstall scripts
   uninstall-portable.ps1 Removes the per-user install and its registration
   configure-mcp.ps1    Merges or removes the MCP entry and scoped instruction
   machine-env-cpp.nsi  NSIS installer definition
-  machine-env-cpp.instructions.md Scoped agent instruction installed with the server
+  machine-env-cpp.instructions.md Scoped agent instruction, installed for both harnesses
 ```

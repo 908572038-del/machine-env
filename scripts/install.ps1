@@ -140,7 +140,13 @@ if ([string]::IsNullOrWhiteSpace($env:APPDATA)) {
 $vscodeInstructionDirectory = Join-Path $env:APPDATA 'Code\User\prompts'
 New-Item -ItemType Directory -Path $vscodeInstructionDirectory -Force | Out-Null
 Copy-Item -LiteralPath $instructionsSource -Destination (Join-Path $vscodeInstructionDirectory 'machine-env-cpp.instructions.md') -Force
-Write-Ok 'installed the MCP-scoped instruction for VS Code'
+Write-Ok 'installed the MCP-scoped instruction for the VS Code Local agent'
+# Agent Host sessions read user instructions from the Copilot home folder instead,
+# so the rule is installed there as well or it is lost in those sessions.
+$agentHostInstructionDirectory = Join-Path $copilotHome 'instructions'
+New-Item -ItemType Directory -Path $agentHostInstructionDirectory -Force | Out-Null
+Copy-Item -LiteralPath $instructionsSource -Destination (Join-Path $agentHostInstructionDirectory 'machine-env-cpp.instructions.md') -Force
+Write-Ok 'installed the MCP-scoped instruction for Copilot Agent Host sessions'
 if (Test-Path -LiteralPath "$configPath.bak") {
     Write-Host "        prior config backed up to $configPath.bak"
 }

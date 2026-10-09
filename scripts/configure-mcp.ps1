@@ -31,8 +31,13 @@ $vscodeInstructions = if ($null -eq $vscodePromptsDirectory) {
 } else {
     Join-Path $vscodePromptsDirectory 'machine-env-cpp.instructions.md'
 }
-# Older releases also copied the instruction into the Copilot user folder.
-$legacyInstructions = Join-Path (Split-Path -Parent $ConfigPath) 'instructions\machine-env-cpp.instructions.md'
+# A session reads user instructions from the folder belonging to its own harness:
+# Agent Host sessions use the Copilot home folder, the Local agent uses the VS
+# Code profile. Both copies are installed because either harness can be selected,
+# while a single session still reads only the one it belongs to.
+$agentHostInstructions = Join-Path (Split-Path -Parent $ConfigPath) `
+    'instructions\machine-env-cpp.instructions.md'
+$agentHostInstructionsDirectory = Split-Path -Parent $agentHostInstructions
 $skipConfigWrite = $false
 
 if ($Mode -eq 'Install' -and
@@ -138,11 +143,13 @@ if ($Mode -eq 'Install') {
     }
     New-Item -ItemType Directory -Path $vscodePromptsDirectory -Force | Out-Null
     Copy-Item -LiteralPath $InstructionsPath -Destination $vscodeInstructions -Force
+    New-Item -ItemType Directory -Path $agentHostInstructionsDirectory -Force | Out-Null
+    Copy-Item -LiteralPath $InstructionsPath -Destination $agentHostInstructions -Force
 } else {
     if ($null -ne $vscodeInstructions) {
         Remove-Item -LiteralPath $vscodeInstructions -Force -ErrorAction SilentlyContinue
     }
-    Remove-Item -LiteralPath $legacyInstructions -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $agentHostInstructions -Force -ErrorAction SilentlyContinue
 }
 
 Write-Output "MCP configuration updated: $ConfigPath"
