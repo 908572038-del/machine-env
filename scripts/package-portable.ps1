@@ -30,7 +30,6 @@ try {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'install-portable.ps1') -Destination $StageDirectory
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'uninstall-portable.ps1') -Destination $StageDirectory
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'configure-mcp.ps1') -Destination $StageDirectory
-    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'machine-env-cpp.instructions.md') -Destination $StageDirectory
     Compress-Archive -Path (Join-Path $StageDirectory '*') -DestinationPath $PackagePath -Force
 } finally {
     Remove-Item -LiteralPath $StageDirectory -Recurse -Force -ErrorAction SilentlyContinue

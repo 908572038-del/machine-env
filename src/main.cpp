@@ -688,8 +688,9 @@ Json dispatch(const Json& request, bool& has_response) {
         result["serverInfo"]["version"] = server_version();
         // This is the rule that is actually injected on every request, so it
         // carries only what has to be obeyed instead of restating the tool
-        // schemas the client already sends. verify.ps1 compares it verbatim with
-        // the installed instruction file, so an edit here belongs there too.
+        // schemas the client already sends. It is the only copy of the rule:
+        // verify.ps1 checks that the injected text carries the obligations it
+        // exists for rather than comparing it with a second file.
         result["instructions"] =
             "本机环境必须实测，不得凭操作系统惯例、旧记忆或猜测推断。涉及系统、shell、"
             "工具路径或版本、已装软件、硬件（含 GPU）、编码或权限，或要为本机选择构建、"

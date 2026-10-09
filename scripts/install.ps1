@@ -27,13 +27,9 @@ if (-not $SkipBuild) {
 
 $builtServer = Join-Path $Root 'build\machine-env-cpp.exe'
 $configScriptSource = Join-Path $PSScriptRoot 'configure-mcp.ps1'
-$instructionsSource = Join-Path $PSScriptRoot 'machine-env-cpp.instructions.md'
 $uninstallScriptSource = Join-Path $PSScriptRoot 'uninstall-portable.ps1'
 if (-not (Test-Path -LiteralPath $builtServer)) {
     throw "Native MCP server was not produced: $builtServer"
-}
-if (-not (Test-Path -LiteralPath $instructionsSource -PathType Leaf)) {
-    throw "MCP instructions file was not found: $instructionsSource"
 }
 if (-not (Test-Path -LiteralPath $configScriptSource -PathType Leaf) -or
     -not (Test-Path -LiteralPath $uninstallScriptSource -PathType Leaf)) {
@@ -47,7 +43,6 @@ $server = Join-Path $installDirectory 'machine-env-cpp.exe'
 New-Item -ItemType Directory -Path $installDirectory -Force | Out-Null
 Copy-Item -LiteralPath $builtServer -Destination $server -Force
 Copy-Item -LiteralPath $configScriptSource -Destination $installDirectory -Force
-Copy-Item -LiteralPath $instructionsSource -Destination $installDirectory -Force
 Copy-Item -LiteralPath $uninstallScriptSource -Destination $installDirectory -Force
 
 Write-Step 'Updating VS Code MCP configuration'
@@ -134,19 +129,6 @@ try {
 }
 Write-Ok "wrote $configPath"
 
-if ([string]::IsNullOrWhiteSpace($env:APPDATA)) {
-    throw 'APPDATA is not set; cannot install the VS Code instruction file.'
-}
-$vscodeInstructionDirectory = Join-Path $env:APPDATA 'Code\User\prompts'
-New-Item -ItemType Directory -Path $vscodeInstructionDirectory -Force | Out-Null
-Copy-Item -LiteralPath $instructionsSource -Destination (Join-Path $vscodeInstructionDirectory 'machine-env-cpp.instructions.md') -Force
-Write-Ok 'installed the MCP-scoped instruction for the VS Code Local agent'
-# Agent Host sessions read user instructions from the Copilot home folder instead,
-# so the rule is installed there as well or it is lost in those sessions.
-$agentHostInstructionDirectory = Join-Path $copilotHome 'instructions'
-New-Item -ItemType Directory -Path $agentHostInstructionDirectory -Force | Out-Null
-Copy-Item -LiteralPath $instructionsSource -Destination (Join-Path $agentHostInstructionDirectory 'machine-env-cpp.instructions.md') -Force
-Write-Ok 'installed the MCP-scoped instruction for Copilot Agent Host sessions'
 if (Test-Path -LiteralPath "$configPath.bak") {
     Write-Host "        prior config backed up to $configPath.bak"
 }

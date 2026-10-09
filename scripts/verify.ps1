@@ -72,9 +72,6 @@ New-Item -ItemType Directory -Path $env:LOCALAPPDATA, $env:APPDATA, $env:COPILOT
 $installDirectory = Join-Path $env:LOCALAPPDATA 'Programs\machine-env-cpp'
 $script:Server = Join-Path $installDirectory 'machine-env-cpp.exe'
 $configPath = Join-Path $env:COPILOT_HOME 'mcp-config.json'
-$vscodeRule = Join-Path $env:APPDATA 'Code\User\prompts\machine-env-cpp.instructions.md'
-$copilotRule = Join-Path $env:COPILOT_HOME 'instructions\machine-env-cpp.instructions.md'
-$promptsDirectory = Join-Path $env:APPDATA 'Code\User\prompts'
 
 try {
     Write-Step 'Install into a throwaway profile'
@@ -84,21 +81,14 @@ try {
     Write-Step 'Installed layout'
     Assert-That (Test-Path -LiteralPath $script:Server) 'server executable installed'
     Assert-That (Test-Path -LiteralPath $configPath) 'global MCP config written'
-    Assert-That (Test-Path -LiteralPath $vscodeRule) 'the Local agent copy of the instruction is installed'
-    Assert-That (Test-Path -LiteralPath $copilotRule) 'the Agent Host copy of the instruction is installed'
-    # applyTo is what makes the file attach on its own instead of waiting to be
-    # discovered by description, so losing it would quietly return the rule to
-    # on-demand without anything else changing.
-    $ruleFront = Get-Content -LiteralPath $vscodeRule -Encoding UTF8 -TotalCount 8
-    Assert-That (@($ruleFront | Where-Object { $_ -match '^applyTo:\s*"\*\*"\s*$' }).Count -eq 1) 'the installed rule declares applyTo so it attaches by itself'
-    # A session reads the copy belonging to its harness, so the two files never
-    # both reach one request; losing either one loses the rule for that harness.
-    Assert-That ((Get-FileHash -LiteralPath $vscodeRule).Hash -eq (Get-FileHash -LiteralPath $copilotRule).Hash) 'both installed copies carry the same rule'
     $configured = (Get-Content -LiteralPath $configPath -Encoding UTF8 -Raw |
         ConvertFrom-Json).mcpServers.'machine-env-cpp'.command
     Assert-That ($configured -eq $script:Server) 'config points at the installed executable'
-    $promptRules = @(Get-ChildItem -LiteralPath $promptsDirectory -Filter '*.instructions.md' -ErrorAction SilentlyContinue)
-    Assert-That ($promptRules.Count -eq 1) 'exactly one instruction file in the prompts folder'
+    # The rule travels only through the initialize result now, so the install must
+    # not scatter instruction files into the harness instruction folders.
+    $strayRules = @(Get-ChildItem -LiteralPath $env:APPDATA, $env:COPILOT_HOME `
+            -Recurse -Filter 'machine-env-cpp.instructions.md' -ErrorAction SilentlyContinue)
+    Assert-That ($strayRules.Count -eq 0) 'installation leaves no instruction file behind'
 
     Write-Step 'Protocol contract'
     $responses = Invoke-Stdio @(
@@ -131,14 +121,27 @@ try {
     $apps = $byId['6'].result.structuredContent
     Assert-That ($apps.count -is [int] -or $apps.count -is [long]) 'get_apps reports an application count'
     Assert-That ($apps.apps -is [array]) 'get_apps returns an application array'
-    # The rule travels by two routes: the initialize result, which the client
-    # injects on every request, and an installed file that is only loaded on
-    # demand. Comparing them keeps the two from drifting apart, which is how the
-    # injected wording silently stopped matching what was documented.
-    $ruleText = [System.IO.File]::ReadAllText($vscodeRule, [System.Text.Encoding]::UTF8)
-    $ruleBody = ([regex]::Replace($ruleText, '(?s)^---\r?\n.*?\r?\n---\r?\n', '')).Trim()
+    # The initialize result is the only route the rule takes, so there is nothing
+    # left to compare it against. The check is that it is still substantial and
+    # still carries the obligations it exists for, which is what a truncated or
+    # emptied rule would break. Clauses are built from code points so the script
+    # cannot break on code page changes.
+    function ConvertFrom-CodePoints([int[]]$Codes) {
+        -join ($Codes | ForEach-Object { [char]$_ })
+    }
     $injected = ([string]$byId['1'].result.instructions).Trim()
-    Assert-That ($ruleBody -eq $injected) 'the installed rule and the injected rule say the same thing'
+    Assert-That ($injected.Length -gt 100) 'initialize carries the injectable rule'
+    $obligations = [ordered]@{
+        (ConvertFrom-CodePoints 0x672C, 0x673A, 0x73AF, 0x5883, 0x5FC5, 0x987B, 0x5B9E, 0x6D4B) = 'the rule requires measuring the machine rather than assuming'
+        (ConvertFrom-CodePoints 0x5148, 0x67E5) = 'the rule requires consulting this MCP first'
+        (ConvertFrom-CodePoints 0x53EA, 0x8BFB) = 'the rule states this MCP is read-only'
+        (ConvertFrom-CodePoints 0x4E0D, 0x4E0B, 0x8F7D) = 'the rule withholds downloads'
+        ((ConvertFrom-CodePoints 0x4E0D, 0x652F, 0x6301) + ' &&') = 'the rule carries the shell-constraint guidance'
+        'source=unknown' = 'the rule defines what an unverified source means'
+    }
+    foreach ($obligation in $obligations.Keys) {
+        Assert-That ($injected.Contains([string]$obligation)) $obligations[$obligation]
+    }
 
     Write-Step 'Protocol edges'
     $handshake = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}'
@@ -230,8 +233,6 @@ try {
     $servers = (Get-Content -LiteralPath $configPath -Encoding UTF8 -Raw |
         ConvertFrom-Json).mcpServers
     Assert-That (($null -eq $servers) -or ($null -eq $servers.'machine-env-cpp')) 'config entry removed'
-    Assert-That (-not (Test-Path -LiteralPath $vscodeRule)) 'the Local agent copy of the instruction is removed'
-    Assert-That (-not (Test-Path -LiteralPath $copilotRule)) 'the Agent Host copy of the instruction is removed'
     Assert-That (-not (Test-Path -LiteralPath $installDirectory)) 'install directory removed'
 
     Write-Host "`nVERIFY: PASS" -ForegroundColor Green

@@ -6,9 +6,6 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$ExePath,
 
-    [Parameter(Mandatory = $true)]
-    [string]$InstructionsPath,
-
     [string]$ConfigPath = $(if ([string]::IsNullOrWhiteSpace($env:COPILOT_HOME)) {
         Join-Path $env:USERPROFILE '.copilot\mcp-config.json'
     } else {
@@ -20,30 +17,7 @@ $ErrorActionPreference = 'Stop'
 $serverName = 'machine-env-cpp'
 $configDirectory = Split-Path -Parent $ConfigPath
 $expectedExe = [System.IO.Path]::GetFullPath($ExePath)
-# Join-Path rejects an empty path, so resolve these only when APPDATA is set.
-$vscodePromptsDirectory = if ([string]::IsNullOrWhiteSpace($env:APPDATA)) {
-    $null
-} else {
-    Join-Path $env:APPDATA 'Code\User\prompts'
-}
-$vscodeInstructions = if ($null -eq $vscodePromptsDirectory) {
-    $null
-} else {
-    Join-Path $vscodePromptsDirectory 'machine-env-cpp.instructions.md'
-}
-# A session reads user instructions from the folder belonging to its own harness:
-# Agent Host sessions use the Copilot home folder, the Local agent uses the VS
-# Code profile. Both copies are installed because either harness can be selected,
-# while a single session still reads only the one it belongs to.
-$agentHostInstructions = Join-Path (Split-Path -Parent $ConfigPath) `
-    'instructions\machine-env-cpp.instructions.md'
-$agentHostInstructionsDirectory = Split-Path -Parent $agentHostInstructions
 $skipConfigWrite = $false
-
-if ($Mode -eq 'Install' -and
-    -not (Test-Path -LiteralPath $InstructionsPath -PathType Leaf)) {
-    throw "MCP instructions file does not exist: $InstructionsPath"
-}
 
 if (-not (Test-Path -LiteralPath $ConfigPath)) {
     if ($Mode -eq 'Uninstall') {
@@ -135,21 +109,6 @@ if (-not $skipConfigWrite -and
             Remove-Item -LiteralPath $temporaryPath -Force
         }
     }
-}
-
-if ($Mode -eq 'Install') {
-    if ($null -eq $vscodeInstructions) {
-        throw 'APPDATA is not set; cannot install the VS Code instruction file.'
-    }
-    New-Item -ItemType Directory -Path $vscodePromptsDirectory -Force | Out-Null
-    Copy-Item -LiteralPath $InstructionsPath -Destination $vscodeInstructions -Force
-    New-Item -ItemType Directory -Path $agentHostInstructionsDirectory -Force | Out-Null
-    Copy-Item -LiteralPath $InstructionsPath -Destination $agentHostInstructions -Force
-} else {
-    if ($null -ne $vscodeInstructions) {
-        Remove-Item -LiteralPath $vscodeInstructions -Force -ErrorAction SilentlyContinue
-    }
-    Remove-Item -LiteralPath $agentHostInstructions -Force -ErrorAction SilentlyContinue
 }
 
 Write-Output "MCP configuration updated: $ConfigPath"

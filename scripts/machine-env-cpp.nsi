@@ -8,9 +8,6 @@ Unicode true
 !ifndef ConfigScript
   !define ConfigScript "configure-mcp.ps1"
 !endif
-!ifndef InstructionsFile
-  !define InstructionsFile "machine-env-cpp.instructions.md"
-!endif
 !ifndef OutputFile
   !define OutputFile "..\build\machine-env-cpp-setup.exe"
 !endif
@@ -44,7 +41,6 @@ Section "Install"
   SetOutPath "$INSTDIR"
   File /oname=machine-env-cpp.exe "${SourceExe}"
   File /oname=configure-mcp.ps1 "${ConfigScript}"
-  File /oname=machine-env-cpp.instructions.md "${InstructionsFile}"
 
   ; Register the uninstaller first, so a failed configuration still leaves a
   ; product the user can remove through Apps & features.
@@ -57,7 +53,7 @@ Section "Install"
   WriteRegDWORD HKCU "${UninstallKey}" "NoModify" 1
   WriteRegDWORD HKCU "${UninstallKey}" "NoRepair" 1
 
-  nsExec::ExecToLog '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\configure-mcp.ps1" -Mode Install -ExePath "$INSTDIR\machine-env-cpp.exe" -InstructionsPath "$INSTDIR\machine-env-cpp.instructions.md"'
+  nsExec::ExecToLog '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\configure-mcp.ps1" -Mode Install -ExePath "$INSTDIR\machine-env-cpp.exe"'
   Pop $0
   ${If} $0 != 0
     MessageBox MB_ICONSTOP "MCP configuration failed (error code: $0). The server files are installed but not registered; run the uninstaller, or fix the configuration and retry."
@@ -66,7 +62,7 @@ Section "Install"
 SectionEnd
 
 Section "Uninstall"
-  nsExec::ExecToLog '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\configure-mcp.ps1" -Mode Uninstall -ExePath "$INSTDIR\machine-env-cpp.exe" -InstructionsPath "$INSTDIR\machine-env-cpp.instructions.md"'
+  nsExec::ExecToLog '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\configure-mcp.ps1" -Mode Uninstall -ExePath "$INSTDIR\machine-env-cpp.exe"'
   Pop $0
   ${If} $0 != 0
     MessageBox MB_ICONSTOP "Could not safely update the MCP configuration (error code: $0). Uninstall was cancelled."
@@ -83,7 +79,6 @@ Section "Uninstall"
   DeleteRegKey HKCU "${UninstallKey}"
   Delete "$INSTDIR\machine-env-cpp.exe"
   Delete "$INSTDIR\configure-mcp.ps1"
-  Delete "$INSTDIR\machine-env-cpp.instructions.md"
   Delete "$INSTDIR\Uninstall.exe"
   RMDir "$INSTDIR"
 
