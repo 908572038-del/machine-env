@@ -1,5 +1,11 @@
 param(
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+
+    # Client to register. Defaults to copilot for backward compatibility; use
+    # -Client all to register every client in the registry.
+    [string]$Client = 'copilot',
+
+    [switch]$ListClients
 )
 
 $ErrorActionPreference = 'Stop'
@@ -7,7 +13,6 @@ $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
 $serverName = 'machine-env-cpp'
-$previousServerName = 'machine-env'
 
 function Write-Step([string]$Text) {
     Write-Host "`n== $Text" -ForegroundColor Cyan
@@ -15,6 +20,29 @@ function Write-Step([string]$Text) {
 
 function Write-Ok([string]$Text) {
     Write-Host "   OK  $Text" -ForegroundColor Green
+}
+
+$registrySource = Join-Path $PSScriptRoot 'client-registry.ps1'
+if (-not (Test-Path -LiteralPath $registrySource -PathType Leaf)) {
+    throw "client-registry.ps1 was not found: $registrySource"
+}
+. $registrySource
+
+if ($ListClients) {
+    Write-Host 'Supported MCP clients:'
+    foreach ($name in Get-McpClientNames) {
+        $spec = Get-McpClientSpec -Name $name
+        Write-Host ("  {0,-16} {1}" -f $name, $spec.Display)
+        Write-Host ("  {0,-16} -> {1}" -f '', $spec.ConfigPath)
+    }
+    Write-Host "`nRun with -Client <name>, or -Client all to register every client."
+    return
+}
+
+$clients = if ($Client -eq 'all') { Get-McpClientNames } else { @($Client) }
+foreach ($c in $clients) {
+    # Validate the name now so a typo fails before anything is written.
+    [void](Get-McpClientSpec -Name $c)
 }
 
 if (-not $SkipBuild) {
@@ -44,93 +72,16 @@ New-Item -ItemType Directory -Path $installDirectory -Force | Out-Null
 Copy-Item -LiteralPath $builtServer -Destination $server -Force
 Copy-Item -LiteralPath $configScriptSource -Destination $installDirectory -Force
 Copy-Item -LiteralPath $uninstallScriptSource -Destination $installDirectory -Force
+Copy-Item -LiteralPath $registrySource -Destination $installDirectory -Force
 
-Write-Step 'Updating VS Code MCP configuration'
-$copilotHome = if ([string]::IsNullOrWhiteSpace($env:COPILOT_HOME)) {
-    Join-Path $env:USERPROFILE '.copilot'
-} else {
-    $env:COPILOT_HOME
-}
-$configPath = Join-Path $copilotHome 'mcp-config.json'
-$configDir = Split-Path -Parent $configPath
-if (-not (Test-Path -LiteralPath $configDir)) {
-    New-Item -ItemType Directory -Force -Path $configDir | Out-Null
-}
-
-$existing = $null
-if (Test-Path -LiteralPath $configPath) {
-    try {
-        $existing = Get-Content -LiteralPath $configPath -Encoding UTF8 -Raw |
-            ConvertFrom-Json -ErrorAction Stop
-    } catch {
-        throw "Refusing to overwrite invalid MCP config '$configPath': $($_.Exception.Message)"
+Write-Step "Registering machine-env-cpp for: $($clients -join ', ')"
+foreach ($c in $clients) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $configScriptSource `
+        -Mode Install -ExePath $server -Client $c
+    if ($LASTEXITCODE -ne 0) {
+        throw "MCP registration failed for client '$c' (exit code $LASTEXITCODE)"
     }
-    if ($null -eq $existing -or $existing -is [array]) {
-        throw "Refusing to overwrite '$configPath': expected a JSON object."
-    }
-    if ($existing.PSObject.Properties.Name -contains 'mcpServers' -and
-        $null -ne $existing.mcpServers -and
-        $existing.mcpServers -isnot [System.Management.Automation.PSCustomObject]) {
-        throw "Refusing to overwrite '$configPath': 'mcpServers' must be a JSON object."
-    }
-    if (-not (Test-Path -LiteralPath "$configPath.bak")) {
-        Copy-Item -LiteralPath $configPath -Destination "$configPath.bak" -Force
-    }
-}
-
-$servers = [ordered]@{}
-if ($existing -and $existing.mcpServers) {
-    foreach ($property in $existing.mcpServers.PSObject.Properties) {
-        if ($property.Name -eq $previousServerName) {
-            # Drop the legacy entry only when it points into this product's
-            # install directory; a user's own server of that name is kept.
-            $legacy = [string]$property.Value.command
-            $belongs = $false
-            if (-not [string]::IsNullOrWhiteSpace($legacy)) {
-                try {
-                    $resolved = [System.IO.Path]::GetFullPath($legacy)
-                    $belongs = $resolved.StartsWith(
-                        $installDirectory + '\',
-                        [System.StringComparison]::OrdinalIgnoreCase)
-                } catch {
-                    $belongs = $false
-                }
-            }
-            if ($belongs) { continue }
-        }
-        $servers[$property.Name] = $property.Value
-    }
-}
-$servers[$serverName] = [ordered]@{
-    type = 'stdio'
-    command = $server
-    env = [ordered]@{}
-}
-
-$merged = [ordered]@{}
-if ($existing) {
-    foreach ($property in $existing.PSObject.Properties) {
-        if ($property.Name -ne 'mcpServers') {
-            $merged[$property.Name] = $property.Value
-        }
-    }
-}
-$merged['mcpServers'] = $servers
-$json = $merged | ConvertTo-Json -Depth 20
-$encoding = New-Object System.Text.UTF8Encoding $false
-$temporaryConfig = "$configPath.$PID.tmp"
-try {
-    [System.IO.File]::WriteAllText($temporaryConfig, $json, $encoding)
-    Move-Item -LiteralPath $temporaryConfig -Destination $configPath -Force
-} finally {
-    if (Test-Path -LiteralPath $temporaryConfig) {
-        Remove-Item -LiteralPath $temporaryConfig -Force
-    }
-}
-Write-Ok "wrote $configPath"
-
-if (Test-Path -LiteralPath "$configPath.bak") {
-    Write-Host "        prior config backed up to $configPath.bak"
+    Write-Ok "registered: $c"
 }
 
 Write-Step 'Verifying actual MCP stdio connection'
@@ -244,4 +195,4 @@ try {
     Remove-Item -LiteralPath $wirePath -Force -ErrorAction SilentlyContinue
 }
 
-Write-Host "`nINSTALL COMPLETE - machine-env-cpp MCP is configured." -ForegroundColor Green
+Write-Host "`nINSTALL COMPLETE - machine-env-cpp MCP is configured for: $($clients -join ', ')." -ForegroundColor Green

@@ -62,12 +62,22 @@ $sandbox = Join-Path $env:TEMP ("machine-env-verify-" + [guid]::NewGuid().ToStri
 $savedLocalAppData = $env:LOCALAPPDATA
 $savedAppData = $env:APPDATA
 $savedCopilotHome = $env:COPILOT_HOME
+$savedUserProfile = $env:USERPROFILE
+$savedLocation = (Get-Location).Path
 
 $env:LOCALAPPDATA = Join-Path $sandbox 'local'
 $env:APPDATA = Join-Path $sandbox 'appdata'
 $env:COPILOT_HOME = Join-Path $sandbox 'copilot'
-New-Item -ItemType Directory -Path $env:LOCALAPPDATA, $env:APPDATA, $env:COPILOT_HOME -Force |
+# Every client has to land inside the sandbox, not just the ones that resolve
+# their config from LOCALAPPDATA/APPDATA: Cursor and Windsurf hang off
+# USERPROFILE and the VS Code entry is written into the working directory.
+# Without these two the uninstall loop reaches into the real profile, and a
+# check that is documented as non-destructive would be reading and comparing
+# configurations it has no business touching.
+$env:USERPROFILE = Join-Path $sandbox 'userprofile'
+New-Item -ItemType Directory -Path $env:LOCALAPPDATA, $env:APPDATA, $env:COPILOT_HOME, $env:USERPROFILE -Force |
     Out-Null
+Set-Location -LiteralPath $sandbox
 
 $installDirectory = Join-Path $env:LOCALAPPDATA 'Programs\machine-env-cpp'
 $script:Server = Join-Path $installDirectory 'machine-env-cpp.exe'
@@ -162,6 +172,62 @@ try {
     $negotiated = Invoke-Stdio @('{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1.0"}}')
     Assert-That (@($negotiated)[0].result.protocolVersion -ne '1.0') 'an unsupported protocol version is not echoed back'
 
+    # The size limit has to hold while the message is being read, not after it
+    # has been buffered: the point is to refuse an oversized message without ever
+    # holding it in full. Reading in blocks must not lose that, and the stream
+    # must still be positioned at the next message afterwards.
+    $oversizedLine = '{"jsonrpc":"2.0","id":9,"method":"ping","params":{"pad":"' + ('x' * 9000000) + '"}}'
+    $afterOversized = Invoke-Stdio @($oversizedLine, '{"jsonrpc":"2.0","id":10,"method":"ping"}')
+    Assert-That ($afterOversized[0].error.code -eq -32600) 'an oversized message is refused, not buffered'
+    Assert-That ([string]$afterOversized[0].error.message -match '8 MiB') 'the refusal names the limit'
+    Assert-That ($afterOversized[1].id -eq 10) 'the message after an oversized one is still read'
+
+    Write-Step 'Response contract'
+    # Every call must carry a structured body, not only a detail=true one. A
+    # caller that had to choose between a readable answer and a parseable one
+    # ended up requesting detail for everything and paying for it in transcript.
+    foreach ($tool in @('get_system', 'get_tools', 'get_apps', 'get_network')) {
+        $plain = (Invoke-Stdio @('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"' + $tool + '","arguments":{}}}'))[0].result
+        $body = $plain.structuredContent
+        Assert-That ($null -ne $body -and @($body.PSObject.Properties).Count -gt 0) "$tool returns structured content without detail=true"
+        Assert-That ($plain._meta.tool -eq $tool) "$tool reports itself in _meta"
+        Assert-That ($plain._meta.elapsed_ms -ge 0) "$tool reports its elapsed time"
+        Assert-That ($plain._meta.brief_payload_bytes -gt 0) "$tool reports how large the text it returned is"
+        Assert-That ([string]$plain.content[0].text -notmatch '^\s*\{') "$tool still answers in prose when detail is not set"
+    }
+    # The injected rule is the primary route, but a harness that drops it must
+    # still see the constraint where every client does look.
+    $descriptions = (Invoke-Stdio @($handshake, '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'))[1].result.tools
+    foreach ($tool in $descriptions) {
+        Assert-That ([string]$tool.description -match 'Read-only') "$($tool.name) states the read-only constraint in its own description"
+    }
+
+    Write-Step 'Application paging'
+    # A page is a slice, never the inventory: count keeps meaning the total, and
+    # page records what the slice covers so a page cannot be read as the whole.
+    $allAppsForPaging = (Invoke-Stdio @('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_apps","arguments":{"detail":true}}}'))[0].result.structuredContent
+    $page1 = (Invoke-Stdio @('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_apps","arguments":{"detail":true,"limit":2,"offset":0}}}'))[0].result.structuredContent
+    Assert-That (@($page1.apps).Count -eq 2) 'a limit returns that many applications'
+    Assert-That ($page1.count -eq $allAppsForPaging.count) 'the inventory total survives a page'
+    Assert-That ($page1.page.returned -eq 2) 'the page reports how many it returned'
+    Assert-That ($page1.page.available -eq $allAppsForPaging.count) 'the page reports how many it drew from'
+    $page2 = (Invoke-Stdio @('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_apps","arguments":{"detail":true,"limit":2,"offset":2}}}'))[0].result.structuredContent
+    $first1 = @($page1.apps)[0].name
+    $first2 = @($page2.apps)[0].name
+    Assert-That ($first1 -ne $first2) 'an offset moves the window'
+    # Out-of-range values are clamped rather than refused, and a wrong type is an
+    # error rather than a silent default.
+    $clamped = (Invoke-Stdio @('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_apps","arguments":{"detail":true,"limit":99999}}}'))[0].result.structuredContent
+    Assert-That ($clamped.page.limit -eq 1000) 'an oversized page is clamped'
+    $badLimit = (Invoke-Stdio @('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_apps","arguments":{"limit":"many"}}}'))[0]
+    Assert-That ($badLimit.error.code -eq -32602) 'a non-integer limit is rejected'
+    # A page is cut out of the matches, not out of the inventory: filtering after
+    # paging made filter+limit answer "no match" while the inventory had matches.
+    # A filter that matches nothing must leave nothing available to page through.
+    $noMatchPage = (Invoke-Stdio @('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_apps","arguments":{"filter":"zzz-no-such-app-xyz","limit":2,"offset":1}}}'))[0].result.structuredContent
+    Assert-That ($noMatchPage.page.available -eq 0) 'a page is cut out of the matches rather than the inventory'
+    Assert-That ($noMatchPage.page.returned -eq 0) 'a filter that matches nothing returns no page'
+
     Write-Step 'Detailed app filter'
     # A detailed result hands the payload back, so a filter that only shaped the
     # summary used to be accepted and then ignored: the caller asked for a subset
@@ -177,9 +243,22 @@ try {
     # omitted: an empty answer is read as "not present".
     $lookup = (Invoke-Stdio @('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_tools","arguments":{"name":"no-such-tool-xyz"}}}'))[0]
     Assert-That ($lookup.result.content[0].text.Contains('NO-SUCH-TOOL-XYZ = ')) 'a name outside the probed catalog is answered rather than omitted'
-    # A filter that matches nothing must also say so instead of returning silence.
-    $phrase = (Invoke-Stdio @('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_tools","arguments":{"name":"no such phrase"}}}'))[0]
-    Assert-That ($phrase.result.content[0].text.Contains('no such phrase')) 'a filter that matches nothing says so'
+    # A space separates tool names instead of joining a phrase, because a tool
+    # name is a single token: "cmake ninja" asks for both. Treating it as one
+    # phrase matched nothing and silently fell back to the whole catalog, so a
+    # multi-word request is asserted on names that cannot be installed, which
+    # keeps this check independent of what this machine happens to have.
+    $split = (Invoke-Stdio @('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_tools","arguments":{"name":"zz-split-a zz-split-b"}}}'))[0].result.content[0].text
+    Assert-That ($split.Contains('ZZ-SPLIT-A = ')) 'a space-separated name list answers the first name'
+    Assert-That ($split.Contains('ZZ-SPLIT-B = ')) 'a space-separated name list answers the second name'
+    # A filter that matches nothing must say so instead of returning silence.
+    # Under the split rule each requested name is answered in turn, so "says so"
+    # means every name comes back, not that the input is echoed whole.
+    $phrase = (Invoke-Stdio @('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_tools","arguments":{"name":"zz-none-a zz-none-b zz-none-c"}}}'))[0].result.content[0].text
+    Assert-That (-not [string]::IsNullOrWhiteSpace($phrase)) 'a filter that matches nothing is not silence'
+    foreach ($token in @('ZZ-NONE-A', 'ZZ-NONE-B', 'ZZ-NONE-C')) {
+        Assert-That ($phrase.Contains("$token = ")) "a filter that matches nothing still answers '$token'"
+    }
 
     Write-Step 'Visual Studio detection contract'
     # "Could not look", "looked and found nothing" and "found it" are three
@@ -206,6 +285,87 @@ try {
     $vsWarning = -join ([char]0x68C0, [char]0x6D4B, [char]0x672A, [char]0x5B8C, [char]0x6210)
     Assert-That ($toolchainText.Contains($vsWarning) -eq ($detection -eq 'unknown')) 'the Visual Studio warning appears only when the look itself failed'
 
+    Write-Step 'Detailed tool filter'
+    # A detailed result hands the probed payload back, so a name filter that only
+    # shaped the summary used to be accepted and then ignored: asking for one
+    # tool still returned the whole catalog in hand (E02). The filter now narrows
+    # the payload, and the related maps have to shrink in step so a tool cannot
+    # survive in "tools" while vanishing from "versions".
+    $catalogNames = @($toolchain.tools.PSObject.Properties.Name)
+    if ($catalogNames.Count -gt 1) {
+        $requested = $catalogNames[0]
+        # Versions are opt-in now, so a narrowing test that means anything has to
+        # ask for them: without the flag the version map is empty and the check
+        # would pass by having nothing to check.
+        $single = (Invoke-Stdio @('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_tools","arguments":{"detail":true,"include_versions":true,"name":"' + $requested + '"}}}'))[0].result.structuredContent
+        $singleNames = @($single.tools.PSObject.Properties.Name)
+        Assert-That ($singleNames -contains $requested) 'a detailed result keeps the tool that was requested'
+        Assert-That ($singleNames.Count -lt $catalogNames.Count) 'a detailed result narrows the catalog to the filter'
+        Assert-That ($single.tool_count -eq $toolchain.tool_count) 'the catalog total survives a name filter'
+        # A null property name is not an entry: an empty map yields $null from
+        # .Name, and @($null) is a one-element array, which used to read as an
+        # orphan that was not there.
+        $versionNames = @($single.versions.PSObject.Properties.Name | Where-Object { $_ })
+        $orphans = @($versionNames | Where-Object { $singleNames -notcontains $_ })
+        Assert-That ($orphans.Count -eq 0) 'no version entry outlives the tool it describes'
+    } else {
+        Write-Host '   SKIP  fewer than two probed tools to narrow on' -ForegroundColor DarkYellow
+    }
+    # Even when nothing matches, the total stays the size of the catalog: it is
+    # the whole the subset was drawn from, not the size of the subset.
+    $nothing = (Invoke-Stdio @('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_tools","arguments":{"detail":true,"name":"zz-no-such-tool-xyz"}}}'))[0].result.structuredContent
+    Assert-That (@($nothing.tools.PSObject.Properties).Count -eq 0) 'a detailed result honours a filter that matches nothing'
+    Assert-That ($nothing.tool_count -eq $toolchain.tool_count) 'the catalog total survives a filter that matches nothing'
+
+    Write-Step 'Tool version opt-in'
+    # Reading a version means running the tool: one child process per tool, which
+    # is what made this call cost ~1.3s. It is opt-in, and the two answers are
+    # cached apart so the fast payload can never satisfy a request for versions.
+    # Both halves arrive in one call now, so the summary is checked on the same
+    # response the structured body comes from.
+    $fast = (Invoke-Stdio @('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_tools","arguments":{"refresh":true}}}'))[0].result
+    $fastBody = $fast.structuredContent
+    Assert-That ($fastBody.versions_included -eq $false) 'versions are not read unless asked for'
+    Assert-That (@($fastBody.versions.PSObject.Properties).Count -eq 0) 'an unversioned probe carries no versions'
+    Assert-That ([string]$fast.content[0].text -match 'include_versions') 'the summary says versions were not queried'
+    Assert-That ($fast._meta.elapsed_ms -lt 1200) 'locating tools without running them stays well under a second'
+    $withVersions = (Invoke-Stdio @('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_tools","arguments":{"refresh":true,"include_versions":true,"detail":true}}}'))[0].result.structuredContent
+    Assert-That ($withVersions.versions_included -eq $true) 'versions are read when asked for'
+    Assert-That ($withVersions.tool_count -eq $fastBody.tool_count) 'asking for versions does not change which tools were found'
+    # Served from cache this time, and the cached unversioned entry must not be
+    # what answers it.
+    $fromCache = (Invoke-Stdio @('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_tools","arguments":{"include_versions":true,"detail":true}}}'))[0].result.structuredContent
+    Assert-That ($fromCache.versions_included -eq $true) 'a request for versions is never served the unversioned cache entry'
+
+    Write-Step 'Network timeout contract'
+    # A host blackholed at the DNS layer stalls the resolver past every
+    # per-phase WinHTTP timeout, so the call is bounded by a wall-clock budget
+    # and anything still unanswered is reported as over budget. offline is the
+    # deterministic way to check the plumbing: every endpoint is skipped, so the
+    # probe never touches the network while still reporting the budget in force.
+    $offline = (Invoke-Stdio @('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_network","arguments":{"offline":true,"detail":true}}}'))[0].result.structuredContent
+    Assert-That ($offline.budget_ms -eq 2500) 'a network probe reports its budget'
+    Assert-That ($offline.offline -eq $true) 'offline is recorded on the result'
+    $entries = @($offline.endpoints.PSObject.Properties)
+    $skippedEntries = @($entries | Where-Object { $_.Value.skipped -eq $true })
+    Assert-That ($entries.Count -gt 0 -and $skippedEntries.Count -eq $entries.Count) 'offline skips every endpoint'
+    Assert-That (@($skippedEntries | Where-Object { $_.Value.reason -ne 'offline' }).Count -eq 0) 'a skipped endpoint records why'
+    # Out-of-range budgets are clamped rather than rejected: a rejected call
+    # would cost the caller the whole answer instead of the nearest budget.
+    $floor = (Invoke-Stdio @('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_network","arguments":{"offline":true,"timeout_ms":1,"detail":true}}}'))[0].result.structuredContent
+    Assert-That ($floor.budget_ms -eq 200) 'a budget below the floor is clamped'
+    $ceiling = (Invoke-Stdio @('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_network","arguments":{"offline":true,"timeout_ms":999999,"detail":true}}}'))[0].result.structuredContent
+    Assert-That ($ceiling.budget_ms -eq 10000) 'a budget above the ceiling is clamped'
+    # A wrong type is an error, not a silent fallback to the default budget.
+    $badBudget = (Invoke-Stdio @('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_network","arguments":{"timeout_ms":"fast"}}}'))[0]
+    Assert-That ($badBudget.error.code -eq -32602) 'a non-integer budget is rejected'
+    # The argument only helps if a client can discover it.
+    $networkTool = @((Invoke-Stdio @($handshake, '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'))[1].result.tools |
+            Where-Object { $_.name -eq 'get_network' })[0]
+    $budgetSchema = $networkTool.inputSchema.properties.timeout_ms
+    Assert-That ($null -ne $budgetSchema) 'the schema advertises timeout_ms'
+    Assert-That ($budgetSchema.minimum -eq 200 -and $budgetSchema.maximum -eq 10000) 'the schema carries the budget bounds'
+
     Write-Step 'Cache integrity'
     # A cache entry is not trusted blindly: an entry changed by something else
     # must be discarded and re-probed, never served as fact.
@@ -227,6 +387,28 @@ try {
     $healed = (Invoke-Stdio @($readSystem))[0].result.structuredContent
     Assert-That ($healed._cache.hit -eq $true) 'the cache heals itself on the next call'
 
+    Write-Step 'Concurrent request handling'
+    # Requests are executed concurrently but answered in the order they were
+    # asked. Order is the part a client can be broken by, so it is asserted;
+    # the latency gain is a consequence, not a contract.
+    $burst = Invoke-Stdio @(
+        $handshake,
+        '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_apps","arguments":{}}}',
+        '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_tools","arguments":{}}}',
+        '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"get_system","arguments":{}}}',
+        '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"get_network","arguments":{"offline":true}}}'
+    )
+    Assert-That (@($burst).Count -eq 5) 'a pipelined burst gets one answer per request'
+    $answeredOrder = (@($burst) | ForEach-Object { [string]$_.id }) -join ','
+    Assert-That ($answeredOrder -eq '1,2,3,4,5') "a pipelined burst is answered in request order (got $answeredOrder)"
+    # A refresh inside the minimum interval is answered from the entry a previous
+    # probe just wrote, and says so, instead of repeating the probe.
+    $probed = (Invoke-Stdio @($handshake, '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_apps","arguments":{"refresh":true}}}'))[1].result
+    $coalesced = (Invoke-Stdio @($handshake, '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_apps","arguments":{"refresh":true}}}'))[1].result
+    Assert-That ($coalesced.structuredContent._cache.reason -eq 'refresh coalesced') 'a refresh inside the minimum interval is coalesced'
+    Assert-That ($coalesced._meta.elapsed_ms -le $probed._meta.elapsed_ms) 'a coalesced refresh costs no more than the probe it replaces'
+    Assert-That ($coalesced.structuredContent.count -gt 0) 'a coalesced refresh still returns the fact, not an empty answer'
+
     Write-Step 'Uninstall'
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $installDirectory 'uninstall-portable.ps1')
     if ($LASTEXITCODE -ne 0) { throw "uninstall failed with exit code $LASTEXITCODE" }
@@ -234,6 +416,15 @@ try {
         ConvertFrom-Json).mcpServers
     Assert-That (($null -eq $servers) -or ($null -eq $servers.'machine-env-cpp')) 'config entry removed'
     Assert-That (-not (Test-Path -LiteralPath $installDirectory)) 'install directory removed'
+    # The uninstaller loops over every supported client so a multi-client install
+    # is fully undone. On a client that was never registered there is nothing to
+    # remove, and it must say so instead of inventing a configuration file.
+    $strayConfigs = @(
+        (Join-Path $env:USERPROFILE '.cursor\mcp.json')
+        (Join-Path $env:USERPROFILE '.codeium\windsurf\mcp_config.json')
+        (Join-Path (Get-Location) '.vscode\mcp.json')
+    ) | Where-Object { Test-Path -LiteralPath $_ }
+    Assert-That ($strayConfigs.Count -eq 0) 'uninstalling creates no configuration for a client that was never registered'
 
     Write-Host "`nVERIFY: PASS" -ForegroundColor Green
 } finally {
@@ -244,5 +435,9 @@ try {
     } else {
         $env:COPILOT_HOME = $savedCopilotHome
     }
+    $env:USERPROFILE = $savedUserProfile
+    # The working directory has to leave the sandbox before the sandbox is
+    # removed, or the removal fails because the directory is in use.
+    Set-Location -LiteralPath $savedLocation
     Remove-Item -LiteralPath $sandbox -Recurse -Force -ErrorAction SilentlyContinue
 }

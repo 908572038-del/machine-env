@@ -100,21 +100,35 @@ disturbed.
 `install.ps1` accepts `-SkipBuild` to reuse an existing `build\machine-env-cpp.exe`
 instead of rebuilding, which keeps re-installs and verification quick.
 
+`install.ps1` registers one client by default and takes `-Client` to pick another:
+`copilot` (default), `claude-desktop`, `cursor`, `windsurf`, `vscode`, or `all`.
+`-ListClients` prints the supported names with the exact configuration file each
+one uses, so there is no guessing about which path or top-level key applies.
+Each client stores servers differently, and the difference is a silent failure
+rather than an error: VS Code reads `servers` while the others read
+`mcpServers`, and VS Code also ignores an `env` block it was not asked for.
+`scripts\client-registry.ps1` is the single source for those layouts; the
+installers, the portable scripts, and the NSIS package all read it instead of
+each carrying their own copy.
+
 `CMakeLists.txt` defines the C++17 target and Windows system libraries.
 `build.ps1` locates Visual Studio and Ninja, configures/builds with CMake,
 produces `build\machine-env-cpp.exe`, and runs its native self-test. `install.ps1`
 copies the server to `%LOCALAPPDATA%\Programs\machine-env-cpp` and updates the
-global Copilot MCP configuration, preserving other servers and backing up the
-prior configuration. It refuses to overwrite malformed JSON. It then starts the
-configured executable, performs the MCP handshake, lists tools, and calls the
-hardware tool over stdio.
+global Copilot MCP configuration by default, preserving other servers and
+backing up the prior configuration. It refuses to overwrite malformed JSON. It
+then starts the configured executable, performs the MCP handshake, lists tools,
+and calls the hardware tool over stdio.
 
 `package-portable.ps1` creates `build\release\machine-env-cpp-windows-x64.zip`.
 After downloading and extracting the ZIP, run `install-portable.ps1`; it installs
 the server per-user and registers its actual path globally, so no source path or
-manual JSON editing is needed. The portable install does not require Visual
-Studio, CMake, Ninja, or NSIS. When `COPILOT_HOME` is set, MCP configuration is
-written there; otherwise it uses `~\.copilot\mcp-config.json`.
+manual JSON editing is needed. It takes the same `-Client` and `-ListClients`
+arguments as `install.ps1`, and the ZIP carries `client-registry.ps1` so the
+client list is read from the same place as in a source checkout. The portable
+install does not require Visual Studio, CMake, Ninja, or NSIS. When
+`COPILOT_HOME` is set, the Copilot entry is written there; otherwise it uses
+`~\.copilot\mcp-config.json`.
 
 The MCP config points to the executable in the per-user install directory, not
 to the source checkout or extracted ZIP directory.
@@ -126,11 +140,34 @@ each harness would have to be given separately. NSIS uninstall and
 `uninstall-portable.ps1` remove this server's MCP entry, leaving other servers
 and instruction files untouched.
 
-Tool calls return concise text only by default. `get_tools` reports each detected
+Tool calls return concise text **and** a structured body. The text is what a
+model reads; `structuredContent` is what a caller acts on; both describe the
+same result, so a caller no longer has to request `detail` just to parse an
+answer (or pay for the full payload in the transcript just to read one).
+`detail: true` still switches the text itself to the full JSON. Every result
+also carries `_meta` with `tool`, `elapsed_ms`, `brief_payload_bytes` (the size
+of the text the model ingests), and `cache_hit` when a cache was consulted,
+which is where call-level measurements live so they never mix into the probed
+facts. Each tool description restates the read-only constraint, so a harness
+that does not inject `initialize.instructions` still sees it.
+
+Requests are dispatched concurrently and answered in the order they were asked.
+A client that pipelines calls pays for the slowest probe instead of the sum of
+all of them (measured: a burst of four calls went from 5.6s to 2.6s), while still
+receiving exactly one answer per request, in sequence — out-of-order answers would
+be legal JSON-RPC and would still break a client that assumes otherwise.
+
+`get_tools` reports each detected
 tool on its own line in a fixed order, as `NAME = PATH`, with the version
-appended when known, a `不在PATH` marker when it was found outside PATH, and a
-`与PYTHON不同源` marker when `pip` belongs to a different Python installation
-than the reported `python`. Its `name` argument narrows the answer, so a single
+appended when versions were asked for and could be read, a `不在PATH` marker
+when it was found outside PATH, and a `与PYTHON不同源` marker when `pip` belongs
+to a different Python installation than the reported `python`. Reading a version
+means running the tool, so it is opt-in through `include_versions: true`; without
+it the answer is a filesystem lookup that starts no process, and the summary says
+so rather than leaving a missing version to be read as an unknown one. Versions
+are cached in an entry of their own, so the fast answer is never served to a
+caller who asked for them and is never invalidated by one. Its `name` argument
+narrows the answer, so a single
 tool can be checked without paying for the whole list; it matches tool names
 rather than paths, so asking for `cmake` does not also return `ninja` merely
 because it lives under a `CMake` directory. A name the probed catalog does not
@@ -141,7 +178,10 @@ empty answer. Missing tools are omitted, but a tool whose version probe failed
 is listed with a `版本未知` marker rather than being dropped, so a failed probe
 is never read as a missing tool.
 `get_apps` returns only a count unless `filter` is given, because the full
-inventory is long and mostly noise. Both filters take comma-separated
+inventory is long and mostly noise. `limit` and `offset` page through the
+matches: `count` stays the size of the inventory, and `page` records the window
+this answer covers (`offset`, `returned`, `available`), so a page is never read
+as the whole. Both filters take comma-separated
 alternatives, and spaces inside one alternative are part of the phrase, so
 `"visual studio"` does not also match a publisher named `... Studios`.
 
@@ -163,15 +203,21 @@ preferred when it is installed, so `shell_path` and `shell_kind` are what tell a
 caller which executable the probed values describe; the capability values
 themselves live under `shell.capabilities` (`ampersand_ampersand`, `here_string`,
 `non_ascii_pipe_utf8`), and `windows_powershell_version` records the legacy
-version whenever the legacy shell can be found and queried. The preference is a
+version whenever the legacy shell can be found and queried. All of those facts
+come from a single shell invocation — version, edition, host, execution policy,
+and the capability probes are answered by one script that tags each line — and
+the legacy version is queried in parallel when both shells exist, so the answer
+costs two processes at most instead of four in sequence. The preference is a
 choice of shell to probe, not a detection of the terminal a caller is using.
 
 `build-installer.ps1` creates `build\installer\machine-env-cpp-setup.exe`
-using NSIS. The installer is per-user, includes the prebuilt server, registers
-an uninstaller, and adds the MCP entry to the user's Copilot configuration.
-Uninstalling removes only the MCP entry that points to that installation and
-preserves other servers and configuration fields. Close VS Code before
-upgrading an installation that is currently running, then reload VS Code after
+using NSIS. The installer is per-user, includes the prebuilt server and the
+client registry, registers an uninstaller, and adds the MCP entry to the user's
+Copilot configuration. It registers Copilot because that is the only client it
+can verify unattended; run `install.ps1 -Client all` after installing to add the
+others. Uninstalling removes only the MCP entry that points to that installation
+and preserves other servers and configuration fields. Close the editor before
+upgrading an installation that is currently running, then reload it after
 installing or uninstalling to refresh its server list.
 
 ## Cache and latency
@@ -184,10 +230,66 @@ changes or their TTL expires. Cache failures do not prevent probes from
 returning results. PATH results contain existing directories only; file paths
 and nonexistent entries are omitted and counted.
 
+The cache mutex is held for at most two seconds, and only for a **write**: reads
+take no lock at all, because a write publishes by renaming a temporary file over
+the destination, so a reader sees either the previous complete entry or the new
+one and never a half-written file; the checksum then rejects anything that was
+truncated or mixed by another writer. A write that cannot take the lock is
+skipped and reported as `not_cached_because: "cache busy"` rather than blocking,
+because freezing every instance behind one stuck writer is worse than
+re-probing.
+
+`refresh` is coalesced rather than taken literally. A refresh that arrives within
+five seconds of a completed probe of the same kind is answered from that entry and
+says so (`_cache.reason: "refresh coalesced"`), so a client cannot make the server
+re-probe by asking twice. Across processes, one probe per kind is elected through a
+named lock, so five editors opening at once cost one probe instead of five. Waiting
+for that lock is bounded: a stalled holder costs a duplicate probe, never the
+answer. A partial result (one that ran out of its budget) is never served as a
+refresh and never stored.
+
+Probes that start child processes kill the whole tree on timeout through a job
+object, so a grandchild cannot outlive the timeout and hold the output pipe
+open. `get_system` reports `process_tree_kill` as `job`, or `fallback` when the
+job object was unavailable and only the direct child could be terminated.
+
+Registry work is done once per question rather than once per lookup. A toolchain
+probe reads the PATH value from the registry a single time and answers every
+lookup from that snapshot (registry opens for one probe: 113 before, 3 now),
+while an application inventory opens each application's key once instead of once
+per field (667 before, 336 now — one per entry), which cut `get_apps` cold time by
+about a fifth. The snapshot lasts exactly one probe: nothing is cached across
+requests, so `refresh` still sees a PATH edited a moment ago.
+
+Requests are read in 64 KB blocks instead of one byte at a time, which is what
+makes receiving a large message cheap (rejecting a 9 MB message went from ~330ms
+to ~25ms). The 8 MiB limit still applies while reading: bytes past it are
+consumed and counted but never stored, so an oversized message is refused without
+being held in memory, and the next message on the stream is still read correctly.
+
 `get_network` uses HTTPS HEAD requests to GitHub, Hugging Face, and PyPI, and
 reports a reason such as `dns`, `connect`, `timeout`, or `tls` when a target is
-unreachable. It is the only tool that opens a socket, so a local system probe
-can never cause an unexpected outbound request.
+unreachable. The four hosts are checked concurrently, so the call costs the
+slowest endpoint rather than their sum. It is the only tool that opens a socket,
+so a local system probe can never cause an unexpected outbound request.
+
+A host blackholed at the resolver can stall past every per-phase WinHTTP
+timeout, which no timeout setting can bound. The call is therefore capped by a
+wall-clock budget: `timeout_ms` (200-10000, default 2500) is the deadline for the
+whole check, and an endpoint still unanswered at the deadline is reported as
+`timed_out` with `reason: "budget"` rather than being waited out. That is a third
+answer, distinct from unreachable: the host was asked and did not answer in time.
+`budget_ms` and `budget_exhausted` appear on the result so a partial answer is
+never mistaken for a complete one. A probe that ran out of budget is returned but
+never cached, so a timeout cannot be served as a fact for the next ten minutes.
+Pass a larger `timeout_ms` for a slow link; a cached answer is always a complete
+one, so a budgeted caller is still served from the cache.
+
+`offline: true` skips every endpoint and reports each one as skipped without
+opening a socket; `skip_endpoints` names individual hosts (`github_api`,
+`github_raw`, `huggingface`, `pypi`) to leave unprobed. Both bypass the cache
+because they change what the result means, and both keep "deliberately not
+checked" distinct from "checked and unreachable".
 
 ## Privacy and platform support
 
@@ -222,5 +324,6 @@ scripts/             Build, install, packaging, and uninstall scripts
   install-portable.ps1 One-file install from the extracted ZIP
   uninstall-portable.ps1 Removes the per-user install and its registration
   configure-mcp.ps1    Merges or removes the MCP entry
+  client-registry.ps1  Per-client config path, top-level key, and entry shape
   machine-env-cpp.nsi  NSIS installer definition
 ```

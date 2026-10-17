@@ -1,4 +1,9 @@
+// NOMINMAX has to come before the Windows headers: windows.h defines min and
+// max as macros, and std::min(a, b) written in the ordinary form is then
+// rewritten by the preprocessor into a syntax error. Defining them away means
+// the standard library's versions are the only ones in scope.
 #define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 #include <windows.h>
 #include <fcntl.h>
 #include <io.h>
@@ -8,14 +13,19 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
+#include <cstdint>
 #include <cwctype>
 #include <iostream>
 #include <iomanip>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <utility>
+#include <vector>
 
 namespace machine_env {
 namespace {
@@ -39,22 +49,42 @@ std::string first_line(const std::string& value) {
     return value.substr(0, end);
 }
 
-// A message is read one byte at a time so the size limit applies while it is
-// being read: reading the whole line first and checking its length afterwards
-// would let a single huge message be allocated in full before being rejected.
+// Messages are read in blocks, not one byte at a time. A per-character read
+// costs a virtual call and a stream test for every byte, so receiving a request
+// was dominated by the cost of copying it in rather than by anything the server
+// measured. The size limit still applies while reading: bytes past the cap are
+// consumed and counted but never stored, so an oversized message is rejected
+// without ever being allocated in full.
 bool read_message(std::istream& input, std::string& line, bool& oversized) {
     constexpr std::size_t kMaxMessageBytes = 8 * 1024 * 1024;
+    constexpr std::size_t kBlockBytes = 64 * 1024;
+    // A block read cannot stop at a newline, so the bytes of the next message
+    // that arrive with this one have to survive the call.
+    static thread_local std::string pending;
+    static thread_local std::array<char, kBlockBytes> block;
     line.clear();
     oversized = false;
-    char byte = 0;
-    while (input.get(byte)) {
-        if (byte == '\n') return true;
-        if (line.size() < kMaxMessageBytes)
-            line.push_back(byte);
-        else
-            oversized = true;
+    for (;;) {
+        const std::size_t newline = pending.find('\n');
+        const std::size_t end =
+            newline == std::string::npos ? pending.size() : newline;
+        const std::size_t room =
+            line.size() < kMaxMessageBytes ? kMaxMessageBytes - line.size() : 0;
+        const std::size_t take = std::min(end, room);
+        line.append(pending, 0, take);
+        // Past the cap the bytes are dropped, but the message is still read to
+        // its end so the next one starts at the right place.
+        if (take < end) oversized = true;
+        if (newline != std::string::npos) {
+            pending.erase(0, newline + 1);
+            return true;
+        }
+        pending.clear();
+        input.read(block.data(), static_cast<std::streamsize>(block.size()));
+        const std::streamsize got = input.gcount();
+        if (got <= 0) return !line.empty() || oversized;
+        pending.assign(block.data(), static_cast<std::size_t>(got));
     }
-    return !line.empty() || oversized;
 }
 
 std::string upper_ascii(const std::string& value) {
@@ -189,6 +219,29 @@ std::vector<std::string> parse_filter(const std::string& text) {
     return tokens;
 }
 
+// get_tools names a set of single-token programs ("cmake", "ninja"), so unlike
+// an application filter a space separates alternatives rather than joining a
+// phrase: "cmake ninja" asks for both tools. Reusing parse_filter here would
+// keep it as the phrase "cmake ninja", which matches no tool and is why the
+// request silently fell back to the full catalog (E08).
+std::vector<std::string> parse_tool_names(const std::string& text) {
+    std::vector<std::string> tokens;
+    std::string current;
+    for (const char ch : text) {
+        if (ch == ',' || ch == ';' || ch == ' ' || ch == '\t') {
+            if (!current.empty()) {
+                tokens.push_back(current);
+                current.clear();
+            }
+            continue;
+        }
+        current.push_back(
+            static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+    }
+    if (!current.empty()) tokens.push_back(current);
+    return tokens;
+}
+
 bool matches_filter(const std::vector<std::string>& tokens,
                     const std::string& text) {
     if (tokens.empty()) return true;
@@ -284,6 +337,11 @@ std::string summarize_toolchain(const Json& value,
             output << "没有匹配的工具：" << join_tokens(filter);
         }
     }
+    // A line without a version has two causes: none could be read, or none was
+    // asked for. Saying which keeps "not checked" from being read as "unknown".
+    const Json& versions_included = value.get("versions_included");
+    if (versions_included.is_bool() && !versions_included.as_bool())
+        output << "\n（未查询版本；传 include_versions=true 可获取）";
     // Visual Studio detection has its own failure mode: the locator can fail to
     // answer, and the tools it would have found then look uninstalled.
     if (value.get("vs_detection").is_string() &&
@@ -296,7 +354,12 @@ std::string summarize_apps(const Json& value,
                            const std::vector<std::string>& filter) {
     const Json& apps = value.get("apps");
     if (!apps.is_array()) return dump_json(value);
-    const std::size_t total = apps.as_array().size();
+    // count is the size of the inventory, not of this page: a paged answer must
+    // not report its own length as the number of applications installed.
+    const Json& counted = value.get("count");
+    const std::size_t total =
+        counted.is_number() ? static_cast<std::size_t>(counted.as_integer())
+                            : apps.as_array().size();
     // A partial inventory must not be presented as a complete one.
     const bool incomplete =
         value.get("enumeration_incomplete").is_bool() &&
@@ -332,9 +395,19 @@ std::string summarize_apps(const Json& value,
     if (shown == 0)
         return "没有匹配的已安装应用（共 " + std::to_string(total) + " 项）" +
                caveat;
-    if (matched > shown)
-        output << "\n（匹配 " << matched << " 项，仅显示前 " << shown
-               << " 条）";
+    // A page is stated as a range of what it was cut from, so "how much is left"
+    // is answered by the answer itself instead of by a second call.
+    const Json& page = value.get("page");
+    if (page.is_object() && page.get("available").is_number()) {
+        const auto from = static_cast<std::size_t>(
+            page.get("offset").is_number() ? page.get("offset").as_integer() : 0);
+        const auto available =
+            static_cast<std::size_t>(page.get("available").as_integer());
+        output << "\n（本页第 " << from + 1 << "–" << from + shown
+               << " 项，匹配共 " << available << " 项）";
+    } else if (matched > shown) {
+        output << "\n（匹配 " << matched << " 项，仅显示前 " << shown << " 条）";
+    }
     return output.str() + caveat;
 }
 
@@ -350,10 +423,35 @@ std::string summarize_network(const Json& value) {
     output << "网络连通性";
     int reachable = 0;
     int checked = 0;
+    int skipped_count = 0;
+    int over_budget = 0;
     for (const auto& entry : order) {
         const Json& endpoint = endpoints.get(entry.first);
         if (!endpoint.is_object()) continue;
+        const bool skipped = endpoint.get("skipped").is_bool() &&
+                             endpoint.get("skipped").as_bool();
+        if (skipped) {
+            // Deliberately unprobed is not the same as unreachable, and it must
+            // not count toward the checked total.
+            ++skipped_count;
+            output << "\n- " << entry.second << "：跳过";
+            const std::string reason = string_field(endpoint, "reason");
+            if (!reason.empty()) output << "（" << reason << "）";
+            continue;
+        }
         ++checked;
+        // Over budget is a third answer: the host was asked and did not answer
+        // in time. Reporting it as unreachable would claim a fact the call
+        // never established.
+        const bool timed_out = endpoint.get("timed_out").is_bool() &&
+                               endpoint.get("timed_out").as_bool();
+        if (timed_out) {
+            ++over_budget;
+            output << "\n- " << entry.second << "：超过预算未完成";
+            const Json& ms = endpoint.get("ms");
+            if (ms.is_number()) output << " " << ms.as_integer() << "ms";
+            continue;
+        }
         const bool ok =
             endpoint.get("ok").is_bool() && endpoint.get("ok").as_bool();
         if (ok) ++reachable;
@@ -371,7 +469,19 @@ std::string summarize_network(const Json& value) {
         const Json& ms = endpoint.get("ms");
         if (ms.is_number()) output << " " << ms.as_integer() << "ms";
     }
-    output << "\n可达 " << reachable << "/" << checked << " 个目标";
+    if (checked == 0)
+        output << "\n全部端点已跳过";
+    else
+        output << "\n可达 " << reachable << "/" << checked << " 个目标";
+    if (skipped_count > 0 && checked > 0)
+        output << "，跳过 " << skipped_count << " 个";
+    if (over_budget > 0) {
+        output << "，其中 " << over_budget << " 个超过预算未完成";
+        const Json& budget = value.get("budget_ms");
+        if (budget.is_number())
+            output << "（预算 " << budget.as_integer()
+                   << "ms，可传更大的 timeout_ms）";
+    }
     return output.str();
 }
 
@@ -469,24 +579,56 @@ std::string summarize_payload(const std::string& name, const Json& value,
     return dump_json(value);
 }
 
+// Every call carries a structured body, not only a detail=true one. A caller
+// should not have to choose between a readable answer and a parseable one: the
+// summary is what the model reads, the structured body is what a caller acts
+// on, and both describe the same result. Returning one without the other used
+// to make detail=true the only usable mode, which also made every caller pay
+// for the full payload in the transcript.
+//
+// _meta is the standard place for the call's own measurements (MCP reserves it
+// on a result), so instrumentation never gets mixed into the probed facts a
+// caller parses.
 Json tool_result(const std::string& name, Json value, bool detail,
-                 const std::vector<std::string>& filter) {
+                 const std::vector<std::string>& filter, long long elapsed_ms) {
+    const std::string text =
+        detail ? dump_json(value) : summarize_payload(name, value, filter);
     Json result = Json::object();
-    if (detail) {
-        result["content"] = text_content(dump_json(value));
-        result["structuredContent"] = value;
-    } else {
-        const std::string summary = summarize_payload(name, value, filter);
-        result["content"] = text_content(summary);
+    result["content"] = text_content(text);
+    Json meta = Json::object();
+    meta["tool"] = name;
+    meta["elapsed_ms"] = static_cast<std::int64_t>(elapsed_ms);
+    // The bytes the model actually reads, which is the number that matters for
+    // a context budget; the structured body is measured by whoever consumes it.
+    meta["brief_payload_bytes"] = static_cast<std::int64_t>(text.size());
+    const Json& cache = value.get("_cache");
+    if (cache.is_object()) {
+        const Json& hit = cache.get("hit");
+        if (hit.is_bool()) meta["cache_hit"] = hit.as_bool();
+        const std::string reason = string_field(cache, "not_cached_because");
+        if (!reason.empty()) meta["not_cached_because"] = reason;
     }
+    const Json& budget = value.get("budget_exhausted");
+    if (budget.is_bool()) meta["budget_exhausted"] = budget.as_bool();
+    result["_meta"] = meta;
+    result["structuredContent"] = std::move(value);
     return result;
 }
+
+// The rule that governs these tools is delivered through
+// initialize.instructions, but a harness that does not inject that field leaves
+// the tool looking like something that acts on the machine. Restating the
+// constraint in every tool description puts it where every client does look,
+// so the guarantee survives a client that drops the instruction block.
+constexpr char kToolConstraint[] =
+    " Read-only: it measures and reports, never changes the machine. Ask the "
+    "user before acting on the result.";
 
 Json tool_definition(const char* name, const char* description,
                      const Json& input_schema) {
     Json tool = Json::object();
     tool["name"] = name;
-    tool["description"] = description;
+    tool["description"] = std::string(description) + kToolConstraint;
     tool["inputSchema"] = input_schema;
     return tool;
 }
@@ -533,11 +675,14 @@ Json tools() {
         boolean_schema("Return the full JSON result instead of a concise summary.");
     tool_list["properties"]["name"] = string_schema(
         "Only report tools matching this text, for example \"cmake\" or \"cmake, ninja\". A name the probed catalog does not contain is looked up on PATH instead of being omitted.");
+    tool_list["properties"]["include_versions"] = boolean_schema(
+        "Also report each tool's version (default false). Reading a version runs "
+        "the tool, so it costs one child process per tool; without it the answer "
+        "is a fast path lookup with no process started.");
     list.as_array().push_back(tool_definition(
         "get_tools",
         "Locate developer tools and report each executable path, version, and PATH status. A name outside the probed catalog is looked up on PATH rather than silently omitted.",
         tool_list));
-
     Json apps = object_schema();
     apps["properties"]["refresh"] =
         boolean_schema("Bypass the cache and re-probe.");
@@ -545,6 +690,22 @@ Json tools() {
         boolean_schema("Return the full JSON result instead of a concise summary.");
     apps["properties"]["filter"] = string_schema(
         "Match installed applications by name, publisher, or version. Without it only the total count is returned.");
+    Json app_limit = Json::object();
+    app_limit["type"] = "integer";
+    app_limit["minimum"] = 0;
+    app_limit["maximum"] = 1000;
+    app_limit["description"] =
+        "Return at most this many matching applications (0 or omitted returns "
+        "every match). Pair with offset to page through a long inventory; the "
+        "total count is reported separately and is not the size of a page.";
+    apps["properties"]["limit"] = app_limit;
+    Json app_offset = Json::object();
+    app_offset["type"] = "integer";
+    app_offset["minimum"] = 0;
+    app_offset["description"] =
+        "Skip this many matching applications before returning results. Use the "
+        "reported page.available to know when there is nothing left to read.";
+    apps["properties"]["offset"] = app_offset;
     list.as_array().push_back(tool_definition(
         "get_apps",
         "Installed applications from the Windows uninstall registry, including software with no command-line entry point. Shows name, version, publisher, and install location.",
@@ -555,6 +716,28 @@ Json tools() {
         boolean_schema("Bypass the cache and re-probe.");
     network["properties"]["detail"] =
         boolean_schema("Return the full JSON result instead of a concise summary.");
+    network["properties"]["offline"] = boolean_schema(
+        "Skip every outbound request and report each endpoint as skipped. Use "
+        "this to guarantee zero network access in restricted environments.");
+    Json skip_endpoints = Json::object();
+    skip_endpoints["type"] = "array";
+    Json skip_items = Json::object();
+    skip_items["type"] = "string";
+    skip_endpoints["items"] = skip_items;
+    skip_endpoints["description"] =
+        "Endpoint keys to leave unprobed and report as skipped: github_api, "
+        "github_raw, huggingface, pypi. Lets a caller avoid a host that only "
+        "stalls instead of waiting out its timeout.";
+    network["properties"]["skip_endpoints"] = skip_endpoints;
+    Json timeout_ms = Json::object();
+    timeout_ms["type"] = "integer";
+    timeout_ms["minimum"] = kNetworkBudgetMinMs;
+    timeout_ms["maximum"] = kNetworkBudgetMaxMs;
+    timeout_ms["description"] =
+        "Wall-clock budget for the whole check in milliseconds (200-10000, "
+        "default 2500). An endpoint still unanswered when the budget runs out is "
+        "reported as over budget instead of holding the answer open.";
+    network["properties"]["timeout_ms"] = timeout_ms;
     list.as_array().push_back(tool_definition(
         "get_network",
         "Check HTTPS reachability of GitHub, Hugging Face, and PyPI. This is the only tool that makes outbound requests; failures report the reason.",
@@ -641,6 +824,70 @@ void narrow_apps(Json& payload, const std::vector<std::string>& filter) {
         if (matches_filter(filter, name + " " + version + " " + publisher))
             kept.as_array().push_back(app);
     }
+    payload["apps"] = kept;
+}
+
+// A detailed get_tools result hands the probed payload back untouched, so a
+// caller who asked for "cmake" still received every catalogued tool (E02).
+// Keeping only the names the filter selected makes the filter mean the same
+// thing in the summary and in the full payload: the related maps (versions,
+// version_unknown, not_on_path, unresolved_tools) are narrowed in step so a
+// tool cannot survive in one field and vanish from another.
+void narrow_tools(Json& payload, const std::vector<std::string>& filter) {
+    if (filter.empty()) return;
+    const auto narrow_named = [&payload, &filter](const char* key) {
+        if (!payload.contains(key)) return;
+        Json& collection = payload[key];
+        if (!collection.is_object()) return;
+        Json kept = Json::object();
+        for (const auto& entry : collection.as_object())
+            if (matches_filter(filter, entry.first)) kept[entry.first] = entry.second;
+        collection = kept;
+    };
+    const auto narrow_listed = [&payload, &filter](const char* key) {
+        if (!payload.contains(key)) return;
+        Json& collection = payload[key];
+        if (!collection.is_array()) return;
+        Json kept = Json::array();
+        for (const auto& item : collection.as_array())
+            if (item.is_string() && matches_filter(filter, item.as_string()))
+                kept.as_array().push_back(item);
+        collection = kept;
+    };
+    narrow_named("tools");
+    narrow_named("versions");
+    narrow_listed("version_unknown");
+    narrow_listed("not_on_path");
+    narrow_listed("unresolved_tools");
+}
+
+// An inventory of every installed application is mostly noise when a caller
+// wants a few of them, and a detailed answer used to hand back the whole array
+// no matter what. limit/offset make the payload something a caller can ask for
+// in pieces. count keeps meaning the size of the inventory, and page records
+// what this slice actually covers, so a page can never be read as the whole.
+void paginate_apps(Json& payload, int offset, int limit) {
+    const Json& apps = payload.get("apps");
+    if (!apps.is_array()) return;
+    if (offset <= 0 && limit <= 0) return;
+    const auto& all = apps.as_array();
+    const std::size_t begin = static_cast<std::size_t>(
+        std::min<std::size_t>(static_cast<std::size_t>(offset), all.size()));
+    std::size_t end = all.size();
+    if (limit > 0) {
+        const std::size_t span = static_cast<std::size_t>(limit);
+        end = std::min<std::size_t>(begin + span, all.size());
+    }
+    Json kept = Json::array();
+    for (std::size_t i = begin; i < end; ++i) kept.as_array().push_back(all[i]);
+    Json page = Json::object();
+    page["offset"] = static_cast<std::int64_t>(begin);
+    page["returned"] = static_cast<std::int64_t>(kept.as_array().size());
+    // The number of entries the filter selected, before this page was cut out
+    // of them, so "more to read" is a fact and not a guess.
+    page["available"] = static_cast<std::int64_t>(all.size());
+    if (limit > 0) page["limit"] = static_cast<std::int64_t>(limit);
+    payload["page"] = page;
     payload["apps"] = kept;
 }
 
@@ -740,9 +987,13 @@ Json dispatch(const Json& request, bool& has_response) {
         static const std::map<std::string, ToolSpec> specs{
             {"get_system", {"system", nullptr, {"refresh", "detail"}}},
             {"get_tools",
-             {"toolchain", "name", {"refresh", "detail", "name"}}},
-            {"get_apps", {"apps", "filter", {"refresh", "detail", "filter"}}},
-            {"get_network", {"network", nullptr, {"refresh", "detail"}}}};
+             {"toolchain", "name",
+              {"refresh", "detail", "name", "include_versions"}}},
+            {"get_apps",
+             {"apps", "filter", {"refresh", "detail", "filter", "limit", "offset"}}},
+            {"get_network",
+             {"network", nullptr,
+              {"refresh", "detail", "offline", "skip_endpoints", "timeout_ms"}}}};
         const auto spec = specs.find(name);
         if (spec == specs.end())
             return rpc_error(id, -32602, "unknown tool: " + name);
@@ -759,13 +1010,84 @@ Json dispatch(const Json& request, bool& has_response) {
         std::string validation_error;
         bool detail = false;
         bool refresh = false;
+        bool offline_net = false;
+        bool include_versions = false;
+        std::vector<std::string> skip_endpoints;
         std::vector<std::string> filter;
+        int budget_ms = kNetworkBudgetMs;
+        int limit = 0;
+        int offset = 0;
         if (!optional_boolean(arguments, "detail", false, detail,
                               validation_error))
             return rpc_error(id, -32602, validation_error);
         if (!optional_boolean(arguments, "refresh", false, refresh,
                               validation_error))
             return rpc_error(id, -32602, validation_error);
+        if (kind == "network") {
+            if (!optional_boolean(arguments, "offline", false, offline_net,
+                                  validation_error))
+                return rpc_error(id, -32602, validation_error);
+            if (arguments.contains("skip_endpoints")) {
+                const Json& value = arguments.get("skip_endpoints");
+                if (!value.is_array())
+                    return rpc_error(
+                        id, -32602,
+                        "argument 'skip_endpoints' must be an array of strings");
+                for (const auto& item : value.as_array()) {
+                    if (!item.is_string())
+                        return rpc_error(
+                            id, -32602,
+                            "argument 'skip_endpoints' must be an array of strings");
+                    skip_endpoints.push_back(item.as_string());
+                }
+            }
+            if (arguments.contains("timeout_ms")) {
+                const Json& value = arguments.get("timeout_ms");
+                if (!value.is_number())
+                    return rpc_error(id, -32602,
+                                     "argument 'timeout_ms' must be an integer");
+                // Clamped rather than rejected: a caller asking for a budget
+                // outside the supportable range wants the nearest one it can
+                // have, and a rejected call would cost it the whole answer.
+                const std::int64_t raw = value.as_integer();
+                budget_ms = static_cast<int>(std::min<std::int64_t>(
+                    std::max<std::int64_t>(raw, kNetworkBudgetMinMs),
+                    kNetworkBudgetMaxMs));
+            }
+        }
+        if (kind == "toolchain") {
+            // Reading a version runs the tool, which is what made this call cost
+            // ~1.3s and up to 20 child processes. Locating a tool is a
+            // filesystem question, so versions are opt-in.
+            if (!optional_boolean(arguments, "include_versions", false,
+                                  include_versions, validation_error))
+                return rpc_error(id, -32602, validation_error);
+        }
+        if (kind == "apps") {
+            // Clamped for the same reason as the network budget: a page that
+            // asks for more than the cap is better served than refused. limit
+            // stops at 1000 so a single call cannot ask for an unbounded body.
+            if (arguments.contains("limit")) {
+                const Json& value = arguments.get("limit");
+                if (!value.is_number())
+                    return rpc_error(id, -32602,
+                                     "argument 'limit' must be an integer");
+                limit = static_cast<int>(
+                    std::min<std::int64_t>(std::max<std::int64_t>(
+                                               value.as_integer(), 0),
+                                           1000));
+            }
+            if (arguments.contains("offset")) {
+                const Json& value = arguments.get("offset");
+                if (!value.is_number())
+                    return rpc_error(id, -32602,
+                                     "argument 'offset' must be an integer");
+                offset = static_cast<int>(
+                    std::min<std::int64_t>(std::max<std::int64_t>(
+                                               value.as_integer(), 0),
+                                           100000));
+            }
+        }
         const char* filter_name = spec->second.filter_name;
         if (filter_name && arguments.contains(filter_name)) {
             const Json& value = arguments.get(filter_name);
@@ -773,20 +1095,66 @@ Json dispatch(const Json& request, bool& has_response) {
                 return rpc_error(id, -32602,
                                  std::string("argument '") + filter_name +
                                      "' must be a string");
-            filter = parse_filter(value.as_string());
+            // Tool names are single tokens (a space joins alternatives); app
+            // filters keep a space inside a phrase ("visual studio").
+            filter = kind == "toolchain"
+                         ? parse_tool_names(value.as_string())
+                         : parse_filter(value.as_string());
         }
-        payload = cached_probe(kind, refresh);
-        if (kind == "toolchain") resolve_requested_tools(payload, filter);
-        if (detail && kind == "apps") narrow_apps(payload, filter);
+        // offline and skip_endpoints change what the result means, so a cached
+        // full probe must not stand in for them; probe directly and leave the
+        // cache untouched. timeout_ms does not change the meaning of a result,
+        // only how long a probe may take, so it rides through the normal path:
+        // a cached answer is a complete one (a probe that ran out of budget is
+        // never stored) and can serve a budgeted caller.
+        const auto call_started = std::chrono::steady_clock::now();
+        if (kind == "network" && (offline_net || !skip_endpoints.empty())) {
+            payload = probe_network(offline_net, skip_endpoints, budget_ms);
+        } else if (kind == "network") {
+            payload = cached_probe(kind, refresh, budget_ms);
+        } else {
+            // Versions are cached separately so a payload built without them is
+            // never served to a caller who asked for them, and the fast path is
+            // never invalidated by a request for versions.
+            const std::string cache_kind =
+                (kind == "toolchain" && include_versions) ? "toolchain_versions"
+                                                          : kind;
+            payload = cached_probe(cache_kind, refresh);
+        }
+        if (kind == "toolchain") {
+            resolve_requested_tools(payload, filter);
+            narrow_tools(payload, filter);
+        }
+        // The filter is applied to the payload for both shapes, not only for a
+        // detailed one. Leaving it to the summary on a concise call made paging
+        // wrong: the page would be cut out of the whole inventory and then
+        // filtered inside that slice, so filter+limit could report "no match"
+        // while the inventory plainly had matches. Filtering first also makes
+        // page.available mean "how many matched", which is what a caller reads
+        // it as.
+        if (kind == "apps") {
+            narrow_apps(payload, filter);
+            paginate_apps(payload, offset, limit);
+        }
 
+        const long long elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - call_started)
+                .count();
         Json result = Json::object();
         if (payload.contains("error")) {
             // A tool that could not run is a tool error, not a data payload; a
             // client must not read the failure as a probe result.
             result["content"] = text_content(dump_json(payload));
             result["isError"] = true;
+            // The same meta contract as a successful call, so a caller can time
+            // and log failures with the same code path.
+            Json meta = Json::object();
+            meta["tool"] = name;
+            meta["elapsed_ms"] = static_cast<std::int64_t>(elapsed_ms);
+            result["_meta"] = meta;
         } else {
-            result = tool_result(name, std::move(payload), detail, filter);
+            result = tool_result(name, std::move(payload), detail, filter, elapsed_ms);
         }
         Json response = Json::object();
         response["jsonrpc"] = "2.0";
@@ -1006,10 +1374,15 @@ int selftest() {
     indirect["name"] = "Test Indirect Display";
     indirect["virtual"] = true;
     sample_system["hardware"]["gpu"].as_array().push_back(std::move(indirect));
-    const Json summary = tool_result("get_system", sample_system, false, {});
-    if (summary.contains("structuredContent") ||
+    const Json summary = tool_result("get_system", sample_system, false, {}, 0);
+    // Both halves travel together: a concise call still hands back the
+    // structured body, so the two shapes cannot drift apart by detail flag.
+    if (!summary.contains("structuredContent") ||
+        !summary.get("structuredContent").get("hardware").is_object() ||
         summary.get("content").as_array().size() != 1)
         throw std::runtime_error("concise summary contract test failed");
+    if (summary.get("_meta").get("tool").as_string() != "get_system")
+        throw std::runtime_error("result meta test failed");
     const std::string summary_text =
         summary.get("content").as_array()[0].get("text").as_string();
     if (summary_text.find("Windows 11 Pro") == std::string::npos ||
@@ -1020,7 +1393,7 @@ int selftest() {
         summary_text.find("GPU：Test GPU（显存 8188 MB）") == std::string::npos ||
         summary_text.find("虚拟显示适配器：1 个") == std::string::npos)
         throw std::runtime_error("concise system summary test failed");
-    const Json detailed = tool_result("get_system", sample_system, true, {});
+    const Json detailed = tool_result("get_system", sample_system, true, {}, 0);
     if (!detailed.get("structuredContent").get("hardware").is_object())
         throw std::runtime_error("detailed tool result test failed");
     Json sample_toolchain = Json::object();
@@ -1215,14 +1588,53 @@ int wmain(int argc, wchar_t** argv) {
                   << ")\n";
         std::string line;
         bool oversized = false;
+        // Requests are dispatched on their own thread, and answers are emitted in
+        // request order. Dispatching inline used to stop the loop from even
+        // reading the next request, so N pipelined calls cost the sum of their
+        // probes; running them concurrently makes a burst cost the slowest one.
+        // Order is preserved because a client that pipelines still expects one
+        // answer per request, in the sequence it asked, even though JSON-RPC
+        // correlates them by id: emitting out of order would be legal and still
+        // break a client that assumes otherwise.
+        std::mutex emit_mutex;
+        std::map<std::uint64_t, std::pair<bool, Json>> completed;
+        std::uint64_t next_to_emit = 0;
+        std::uint64_t next_sequence = 0;
+        std::vector<std::thread> workers;
+
+        // Writes every answer whose turn has come. Called with the mutex free so
+        // the flush never happens while another thread is waiting to record its
+        // result; the map is the buffer for answers that finished early.
+        const auto emit_ready = [&]() {
+            std::lock_guard<std::mutex> lock(emit_mutex);
+            for (auto entry = completed.find(next_to_emit);
+                 entry != completed.end();
+                 entry = completed.find(next_to_emit)) {
+                if (entry->second.first)
+                    std::cout << dump_json(entry->second.second) << '\n'
+                              << std::flush;
+                completed.erase(entry);
+                ++next_to_emit;
+            }
+        };
+
+        const auto record = [&](std::uint64_t sequence, bool respond,
+                                Json response) {
+            {
+                std::lock_guard<std::mutex> lock(emit_mutex);
+                completed[sequence] = {respond, std::move(response)};
+            }
+            emit_ready();
+        };
+
         while (read_message(std::cin, line, oversized)) {
+            const std::uint64_t sequence = next_sequence++;
             if (oversized) {
                 std::cerr << "machine-env-cpp: rejected oversized JSON-RPC message\n";
                 // Answer rather than stay silent, so the client is not left
                 // waiting for a response that never comes.
-                std::cout << dump_json(rpc_error(Json(), -32600,
-                                                 "message exceeds 8 MiB"))
-                          << '\n' << std::flush;
+                record(sequence, true,
+                       rpc_error(Json(), -32600, "message exceeds 8 MiB"));
                 continue;
             }
             // A client that emits a BOM would otherwise fail every handshake.
@@ -1232,20 +1644,9 @@ int wmain(int argc, wchar_t** argv) {
                 static_cast<unsigned char>(line[2]) == 0xbf)
                 line.erase(0, 3);
             if (line.empty()) continue;
+            Json request;
             try {
-                const Json request = parse_json(line);
-                bool send_response = false;
-                Json response;
-                try {
-                    response = dispatch(request, send_response);
-                } catch (const std::exception& error) {
-                    // A probe that failed is an internal error for this request,
-                    // not a parse error, and must echo the request id.
-                    response = rpc_error(request.get("id"), -32603, error.what());
-                    send_response = true;
-                }
-                if (send_response)
-                    std::cout << dump_json(response) << '\n' << std::flush;
+                request = parse_json(line);
             } catch (const std::exception& error) {
                 Json response = Json::object();
                 response["jsonrpc"] = "2.0";
@@ -1254,9 +1655,37 @@ int wmain(int argc, wchar_t** argv) {
                 detail["code"] = -32700;
                 detail["message"] = error.what();
                 response["error"] = detail;
-                std::cout << dump_json(response) << '\n' << std::flush;
+                record(sequence, true, std::move(response));
+                continue;
             }
+            workers.emplace_back([&, sequence, request]() {
+                bool send_response = false;
+                Json response;
+                try {
+                    try {
+                        response = dispatch(request, send_response);
+                    } catch (const std::exception& error) {
+                        // A probe that failed is an internal error for this
+                        // request, not a parse error, and must echo the id.
+                        response =
+                            rpc_error(request.get("id"), -32603, error.what());
+                        send_response = true;
+                    }
+                } catch (...) {
+                    response = rpc_error(request.get("id"), -32603,
+                                         "internal error while dispatching");
+                    send_response = true;
+                }
+                record(sequence, send_response, std::move(response));
+            });
         }
+        // Every answer still owed is written before the process leaves: the loop
+        // stops reading at end of input, which means "no more requests", not
+        // "abandon the ones in flight". A probe is bounded by its own budget, so
+        // this wait is bounded too.
+        for (auto& worker : workers)
+            if (worker.joinable()) worker.join();
+        emit_ready();
     } catch (const std::exception& error) {
         std::cerr << "machine-env-cpp fatal: " << error.what() << '\n';
         return 1;

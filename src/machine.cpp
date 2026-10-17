@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <ctime>
@@ -19,6 +20,8 @@
 #include <fstream>
 #include <iomanip>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -98,6 +101,14 @@ struct ProcessResult {
     DWORD exit_code = 0;
 };
 
+// Windows offers no way to enumerate a probe's descendants, so the tree kill
+// is best effort through a job object. The count below is per thread because a
+// probe runs wholly on one thread: it lets probe_system report what its own
+// launches did without a concurrent probe contaminating the answer. It counts
+// launches that could not be bound to a job, i.e. the ones that fell back to
+// terminating the direct child alone.
+thread_local unsigned long long tree_kill_fallbacks = 0;
+
 ProcessResult run_process(const std::wstring& executable,
                          const std::wstring& arguments,
                          DWORD timeout_ms = 5000) {
@@ -140,6 +151,23 @@ ProcessResult run_process(const std::wstring& executable,
                                          command_line.end());
     mutable_command.push_back(L'\0');
 
+    // One job per probe. KILL_ON_JOB_CLOSE is what makes cleanup complete: it
+    // reaps grandchildren along with the child, and it is also what releases
+    // the pipe write end a surviving descendant would otherwise hold open.
+    // Every step here is optional: a probe that cannot get a job still runs,
+    // it just loses the tree-wide kill.
+    HANDLE job = CreateJobObjectW(nullptr, nullptr);
+    if (job) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+        limits.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation,
+                                     &limits, sizeof(limits))) {
+            CloseHandle(job);
+            job = nullptr;
+        }
+    }
+
     PROCESS_INFORMATION process{};
     const BOOL created = CreateProcessW(
         executable.c_str(), mutable_command.data(), nullptr, nullptr, TRUE,
@@ -147,11 +175,21 @@ ProcessResult run_process(const std::wstring& executable,
     CloseHandle(write_pipe);
     if (null_device) CloseHandle(null_device);
     if (!created) {
+        if (job) CloseHandle(job);
         CloseHandle(read_pipe);
         result.error = "CreateProcess failed with code " +
                        std::to_string(GetLastError());
         return result;
     }
+
+    if (job && !AssignProcessToJobObject(job, process.hProcess)) {
+        // Typical cause: the server itself runs inside a job that does not
+        // allow nesting. Losing the tree kill is acceptable; failing the probe
+        // is not, so the direct-child path stays available.
+        CloseHandle(job);
+        job = nullptr;
+    }
+    if (!job) ++tree_kill_fallbacks;
 
     std::string bytes;
     std::thread reader([&] {
@@ -169,18 +207,36 @@ ProcessResult run_process(const std::wstring& executable,
     });
 
     const DWORD wait = WaitForSingleObject(process.hProcess, timeout_ms);
-    if (wait == WAIT_TIMEOUT) {
-        TerminateProcess(process.hProcess, ERROR_TIMEOUT);
+    if (wait != WAIT_OBJECT_0) {
+        // Terminate the whole tree, not only the direct child: a surviving
+        // grandchild keeps the pipe write end open, so the reader thread would
+        // never see end-of-file and the cancel below would be load-bearing
+        // instead of a last resort. When no job could be applied this degrades
+        // to exactly the previous behaviour.
+        if (job) {
+            TerminateJobObject(job, ERROR_TIMEOUT);
+        } else {
+            TerminateProcess(process.hProcess, ERROR_TIMEOUT);
+        }
+        // The direct child reports its exit first, then closing the job reaps
+        // whatever descendants it left behind, which is what finally releases
+        // the pipe the reader is blocked on.
         WaitForSingleObject(process.hProcess, INFINITE);
-        // A grandchild that still holds the pipe write end would keep the reader
-        // blocked forever, so cancel its pending read before joining it.
+        if (job) {
+            CloseHandle(job);
+            job = nullptr;
+        }
+        // A grandchild can still hold the write end if it broke away from the
+        // job, so cancelling the pending read stays as the last resort.
         CancelSynchronousIo(reader.native_handle());
-        result.error = "process timed out";
-    } else if (wait != WAIT_OBJECT_0) {
-        CancelSynchronousIo(reader.native_handle());
-        result.error = "process wait failed";
+        result.error =
+            wait == WAIT_TIMEOUT ? "process timed out" : "process wait failed";
     }
     GetExitCodeProcess(process.hProcess, &result.exit_code);
+    // On the normal path the child exited by itself, but closing the job still
+    // matters: a descendant it left running would hold the pipe open and block
+    // the join below for as long as that descendant lived.
+    if (job) CloseHandle(job);
     reader.join();
     if (bytes.size() >= 1024 * 1024 && result.error.empty())
         result.error = "process output exceeded 1 MiB";
@@ -371,17 +427,51 @@ std::wstring visual_studio_root(std::string& detection) {
     return wide(prerelease.output);
 }
 
+// Reading a value from a key that is already open. The helpers below that take
+// a root and a path open and close one key per value, which is fine for a
+// single value but multiplies when several values live in the same key.
+bool query_registry_dword(HKEY key, const wchar_t* value_name, DWORD& value) {
+    DWORD type = 0;
+    DWORD size = sizeof(value);
+    const LONG status = RegQueryValueExW(
+        key, value_name, nullptr, &type, reinterpret_cast<BYTE*>(&value), &size);
+    return status == ERROR_SUCCESS && type == REG_DWORD && size == sizeof(DWORD);
+}
+
+std::wstring query_registry_string(HKEY key, const wchar_t* value_name) {
+    DWORD type = 0;
+    DWORD size = 0;
+    LONG status = RegQueryValueExW(key, value_name, nullptr, &type, nullptr,
+                                   &size);
+    if (status != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ) ||
+        size < sizeof(wchar_t))
+        return {};
+    std::wstring value(size / sizeof(wchar_t), L'\0');
+    status = RegQueryValueExW(key, value_name, nullptr, &type,
+                              reinterpret_cast<BYTE*>(value.data()), &size);
+    if (status != ERROR_SUCCESS) return {};
+    while (!value.empty() && value.back() == L'\0') value.pop_back();
+    if (type == REG_EXPAND_SZ) {
+        std::array<wchar_t, 32768> expanded{};
+        const DWORD length = ExpandEnvironmentStringsW(
+            value.c_str(), expanded.data(),
+            static_cast<DWORD>(expanded.size()));
+        // Reporting "%ProgramFiles%\Foo" as an install location would look like
+        // a usable path, so an unexpanded value counts as unknown instead.
+        if (!length || length >= expanded.size()) return {};
+        return expanded.data();
+    }
+    return value;
+}
+
 bool registry_dword(HKEY root, const wchar_t* key_path,
                     const wchar_t* value_name, DWORD& value) {
     HKEY key = nullptr;
     if (RegOpenKeyExW(root, key_path, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
         return false;
-    DWORD type = 0;
-    DWORD size = sizeof(value);
-    const LONG status = RegQueryValueExW(
-        key, value_name, nullptr, &type, reinterpret_cast<BYTE*>(&value), &size);
+    const bool found = query_registry_dword(key, value_name, value);
     RegCloseKey(key);
-    return status == ERROR_SUCCESS && type == REG_DWORD && size == sizeof(DWORD);
+    return found;
 }
 
 bool registry_qword(HKEY root, const wchar_t* key_path,
@@ -404,33 +494,32 @@ std::wstring registry_string(HKEY root, const wchar_t* key_path,
     if (RegOpenKeyExW(root, key_path, 0, KEY_QUERY_VALUE, &key) !=
         ERROR_SUCCESS)
         return {};
-    DWORD type = 0;
-    DWORD size = 0;
-    LONG status = RegQueryValueExW(key, value_name, nullptr, &type, nullptr,
-                                   &size);
-    if (status != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ) ||
-        size < sizeof(wchar_t)) {
-        RegCloseKey(key);
-        return {};
-    }
-    std::wstring value(size / sizeof(wchar_t), L'\0');
-    status = RegQueryValueExW(key, value_name, nullptr, &type,
-                              reinterpret_cast<BYTE*>(value.data()), &size);
+    std::wstring value = query_registry_string(key, value_name);
     RegCloseKey(key);
-    if (status != ERROR_SUCCESS) return {};
-    while (!value.empty() && value.back() == L'\0') value.pop_back();
-    if (type == REG_EXPAND_SZ) {
-        std::array<wchar_t, 32768> expanded{};
-        const DWORD length = ExpandEnvironmentStringsW(
-            value.c_str(), expanded.data(),
-            static_cast<DWORD>(expanded.size()));
-        // Reporting "%ProgramFiles%\Foo" as an install location would look like
-        // a usable path, so an unexpanded value counts as unknown instead.
-        if (!length || length >= expanded.size()) return {};
-        return expanded.data();
-    }
     return value;
 }
+
+// One key held for the handful of values read from it, closed on every exit
+// path. The application inventory skips an entry from several places, which is
+// exactly where a manually closed handle gets missed.
+class RegistryKey {
+public:
+    RegistryKey(HKEY root, const wchar_t* key_path) {
+        if (RegOpenKeyExW(root, key_path, 0, KEY_QUERY_VALUE, &key_) !=
+            ERROR_SUCCESS)
+            key_ = nullptr;
+    }
+    ~RegistryKey() {
+        if (key_) RegCloseKey(key_);
+    }
+    HKEY get() const { return key_; }
+    bool valid() const { return key_ != nullptr; }
+    RegistryKey(const RegistryKey&) = delete;
+    RegistryKey& operator=(const RegistryKey&) = delete;
+
+private:
+    HKEY key_ = nullptr;
+};
 
 // The PATH a newly started shell receives lives in the registry: the
 // machine-wide value first, then the per-user one, which is the order Windows
@@ -438,7 +527,7 @@ std::wstring registry_string(HKEY root, const wchar_t* key_path,
 // tool installed and added to PATH afterwards would be reported as missing by
 // every later probe, including one that asked to refresh. Re-reading the
 // registry on each probe is what keeps a refresh meaningful.
-std::wstring system_path() {
+std::wstring read_registry_path() {
     const std::wstring machine = registry_string(
         HKEY_LOCAL_MACHINE,
         L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment",
@@ -449,6 +538,41 @@ std::wstring system_path() {
     if (user.empty()) return machine;
     return machine + L";" + user;
 }
+
+// Finding one executable needs the PATH, so a probe that looks for fifty of
+// them would open the same two keys fifty times to answer one question. These
+// make a probe pay for it once. The cache is scoped, not timed, and never
+// outlives the probe: outside a PathSnapshot system_path still reads the
+// registry, so a refresh after a PATH change still sees the change.
+thread_local int path_snapshot_depth = 0;
+thread_local bool path_snapshot_valid = false;
+thread_local std::wstring path_snapshot_value;
+
+std::wstring system_path() {
+    if (path_snapshot_valid) return path_snapshot_value;
+    return read_registry_path();
+}
+
+// Depth counted so a nested probe shares the outer read, and the value is
+// dropped as soon as the outermost snapshot ends. RAII keeps that true on every
+// exit path, including an exception thrown mid-probe.
+class PathSnapshot {
+public:
+    PathSnapshot() {
+        if (path_snapshot_depth++ == 0) {
+            path_snapshot_value = read_registry_path();
+            path_snapshot_valid = true;
+        }
+    }
+    ~PathSnapshot() {
+        if (--path_snapshot_depth == 0) {
+            path_snapshot_valid = false;
+            path_snapshot_value.clear();
+        }
+    }
+    PathSnapshot(const PathSnapshot&) = delete;
+    PathSnapshot& operator=(const PathSnapshot&) = delete;
+};
 
 std::wstring find_visual_studio_tool(const std::wstring& root,
                                      const wchar_t* relative) {
@@ -598,29 +722,63 @@ fs::path cache_directory() {
     return fs::path(local) / L"machine-env" / L"cache";
 }
 
-class CacheMutex {
+// Every lock below is only ever waited for with a bound: a stuck holder must
+// cost a degraded operation, never a frozen caller.
+constexpr wchar_t kCacheMutexName[] = L"Local\\machine-env-cache-v2";
+// Far longer than writing one entry and renaming it takes, so a timeout means
+// the holder is stuck rather than merely slow.
+constexpr DWORD kCacheMutexWaitMs = 2000;
+// One probe per kind at a time across processes. A waiter that cannot get this
+// within the bound probes anyway instead of waiting forever.
+constexpr DWORD kProbeMutexWaitMs = 3000;
+// A refresh asked for inside this window of the last write is answered from
+// that write: at that age the entry is what a fresh probe would produce, and
+// five clients starting together would otherwise run five full probes.
+constexpr int kRefreshMinIntervalMs = 5000;
+
+class NamedMutex {
 public:
-    CacheMutex() : handle_(CreateMutexW(nullptr, FALSE, L"Local\\machine-env-cache-v2")) {
-        if (handle_) WaitForSingleObject(handle_, INFINITE);
-    }
-    ~CacheMutex() {
+    NamedMutex(const wchar_t* name, DWORD timeout_ms)
+        : handle_(CreateMutexW(nullptr, FALSE, name)) {
         if (handle_) {
-            ReleaseMutex(handle_);
+            // An abandoned mutex is a lock this caller now owns: the previous
+            // holder died, and any file it left half-written is exactly what
+            // the checksum and the atomic rename already reject.
+            const DWORD wait = WaitForSingleObject(handle_, timeout_ms);
+            acquired_ = wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED;
+        }
+    }
+    ~NamedMutex() {
+        if (handle_) {
+            if (acquired_) ReleaseMutex(handle_);
             CloseHandle(handle_);
         }
     }
-    CacheMutex(const CacheMutex&) = delete;
-    CacheMutex& operator=(const CacheMutex&) = delete;
+    // A caller that did not get the lock continues in a degraded mode instead
+    // of failing: losing the race may cost a redundant probe, never the answer.
+    bool acquired() const { return acquired_; }
+    NamedMutex(const NamedMutex&) = delete;
+    NamedMutex& operator=(const NamedMutex&) = delete;
 
 private:
     HANDLE handle_ = nullptr;
+    bool acquired_ = false;
 };
+
+std::wstring probe_mutex_name(const std::string& kind) {
+    return std::wstring(L"Local\\machine-env-probe-") + wide(kind);
+}
 
 fs::path cache_file(const std::string& kind) {
     return cache_directory() / (wide(kind + ".json"));
 }
 
-std::string cache_read_failure;
+// Why the last read missed, recorded for the caller that asked. It is
+// thread_local rather than shared because a reason belongs to one read: with
+// requests running concurrently, a shared string would let one request's
+// "checksum mismatch" be reported as another request's miss reason, which is a
+// silent wrong answer rather than a crash.
+thread_local std::string cache_read_failure;
 
 // A cache entry carries a checksum over everything that decides the answer, so
 // a file that was edited, truncated, or half-written by something else is
@@ -649,9 +807,32 @@ std::string cache_checksum(const Json& entry) {
 Json read_cache_entry(const std::string& kind, int ttl,
                       bool ignore_expiry = false) {
     cache_read_failure = "no cache file";
-    CacheMutex mutex;
+    // Deliberately lock-free, not an oversight. Waiting for the writer lock
+    // here made a contended read cost the full lock bound before degrading,
+    // which is the most expensive thing this probe could do for no safety
+    // gain. Three properties make a lockless read safe:
+    //   1. A writer never touches the destination in place: it writes a
+    //      separate "<destination>.<pid>-<tick>.tmp" and only then replaces the
+    //      destination with MoveFileExW(REPLACE_EXISTING|WRITE_THROUGH), and
+    //      an NTFS rename within one directory is atomic.
+    //   2. So a reader can only ever observe the previous complete entry or the
+    //      new complete entry, never a half-written file.
+    //   3. Anything that still slips through is caught: the checksum covers
+    //      cached_at, fingerprint, machine_guid and payload, so a torn or
+    //      mixed entry is rejected as a miss and re-probed, never served.
+    // Nothing here writes back, so there is no heal step to skip either.
     const fs::path path = cache_file(kind);
     std::ifstream stream(path, std::ios::binary);
+    // A concurrent rename can leave the destination unopenable for an instant,
+    // which is not the same as the entry being absent. Retrying only when the
+    // file is actually there keeps a cold cache immediate while a busy one is
+    // not reported as a miss: a spurious miss is what makes concurrent callers
+    // repeat work that the cache was supposed to save.
+    for (int attempt = 0; !stream && attempt < 3; ++attempt) {
+        if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) break;
+        Sleep(1);
+        stream.open(path, std::ios::binary);
+    }
     if (!stream) return Json();
     std::ostringstream contents;
     contents << stream.rdbuf();
@@ -716,7 +897,15 @@ Json read_cache_entry(const std::string& kind, int ttl,
 
 bool write_cache_entry(const std::string& kind, const Json& payload,
                        std::string& error) {
-    CacheMutex mutex;
+    NamedMutex mutex(kCacheMutexName, kCacheMutexWaitMs);
+    if (!mutex.acquired()) {
+        // Skipping the write is the point of the bound: waiting any longer
+        // would stall the caller for a cache that is only an optimisation.
+        // not_cached_because carries this back, so a degraded write is
+        // reported rather than silently lost.
+        error = "cache busy";
+        return false;
+    }
     std::error_code ec;
     const fs::path directory = cache_directory();
     fs::create_directories(directory, ec);
@@ -764,7 +953,12 @@ void annotate_cache(Json& payload, const Json& metadata) {
 Json cacheable_probe(const std::string& kind, Json payload,
                      const Json& old_metadata) {
     Json result_metadata = old_metadata;
-    if (!payload.contains("error")) {
+    // A probe that ran out of its budget answered with whatever finished. That
+    // is worth returning, but storing it would serve "did not answer in time"
+    // as a fact for the whole TTL of the entry, long after the host recovered.
+    const Json& over_budget = payload.get("budget_exhausted");
+    const bool partial = over_budget.is_bool() && over_budget.as_bool();
+    if (!payload.contains("error") && !partial) {
         std::string error;
         if (write_cache_entry(kind, payload, error)) {
             Json cache = Json::object();
@@ -775,9 +969,12 @@ Json cacheable_probe(const std::string& kind, Json payload,
             result_metadata["cached"] = false;
             result_metadata["not_cached_because"] = error;
         }
-    } else {
+    } else if (payload.contains("error")) {
         result_metadata["cached"] = false;
         result_metadata["not_cached_because"] = payload.get("error");
+    } else {
+        result_metadata["cached"] = false;
+        result_metadata["not_cached_because"] = "budget exhausted";
     }
     annotate_cache(payload, result_metadata);
     return payload;
@@ -903,6 +1100,11 @@ Json probe_one_endpoint(const wchar_t* host) {
         result["ms"] = 0;
         return result;
     }
+    // Per-phase cap. A host blackholed at the DNS layer can still block for the
+    // system resolver's own timeout (~4s here) regardless of this value, but
+    // probe_network runs the hosts concurrently so the call costs the slowest
+    // endpoint rather than their sum. A hard wall-clock deadline would need a
+    // cancellation/watchdog design rather than a shorter per-phase timeout.
     WinHttpSetTimeouts(session, 1200, 1200, 1200, 1200);
     HINTERNET connection = WinHttpConnect(session, host, INTERNET_DEFAULT_HTTPS_PORT, 0);
     HINTERNET request = connection
@@ -1221,7 +1423,9 @@ Json locate_tool(const std::string& name) {
     return result;
 }
 
-Json probe_toolchain() {
+Json probe_toolchain(bool include_versions) {
+    // One PATH read for every executable this probe looks for.
+    const PathSnapshot path_snapshot;
     Json result = Json::object();
     Json found = Json::object();
     Json versions = Json::object();
@@ -1329,7 +1533,11 @@ Json probe_toolchain() {
 
         // Skip version probing for tools that are expensive, shell wrappers, or
         // whose "--version" text is long/verbose. Discovery never executes
-        // user tooling that isn't a plain .exe.
+        // user tooling that isn't a plain .exe. Running anything at all is
+        // skipped unless the caller asked for versions: locating a tool is a
+        // filesystem question, and answering it used to cost one child process
+        // per tool (measured: the whole call went from ~1.3s to tens of ms).
+        if (!include_versions) continue;
         if (tool.first == std::wstring(L"python") ||
             tool.first == std::wstring(L"pip") ||
             tool.first == std::wstring(L"cl") ||
@@ -1374,6 +1582,10 @@ Json probe_toolchain() {
     result["tools"] = found;
     result["versions"] = versions;
     result["version_unknown"] = version_unknown;
+    // An empty versions map has two very different causes: no version could be
+    // read, or none was asked for. Recording which one it is keeps a caller
+    // from reading "not asked" as "unknown".
+    result["versions_included"] = include_versions;
     result["not_on_path"] = not_on_path;
     result["python_pip_mismatch"] = pip_mismatch;
     if (found.contains("python")) {
@@ -1434,46 +1646,53 @@ std::wstring base64_utf16(const std::wstring& text) {
 }
 
 // Shell syntax support is decided by parsing the construct rather than trusting
-// a version number, so the reported answer is observed behavior.
-Json probe_shell_capabilities(const std::wstring& shell) {
+// a version number, so the reported answer is observed behavior. The answers
+// arrive in the same process invocation as the version fields: starting a shell
+// costs far more than the questions do, so asking them separately made the
+// system probe pay for several cold starts.
+Json probe_shell_capabilities(const ProcessResult& probe) {
     Json capabilities = Json::object();
     capabilities["ampersand_ampersand"] = capability_of_state("unknown", "unknown");
     capabilities["here_string"] = capability_of_state("unknown", "unknown");
     capabilities["non_ascii_pipe_utf8"] = capability_of_state("unknown", "unknown");
-    if (shell.empty()) return capabilities;
+    if (!probe.ok) return capabilities;
 
-    const std::wstring script =
-        L"$o=@()\n"
-        L"try{[void][scriptblock]::Create('$null && $null');"
-        L"$o+='amp=ok'}catch{$o+='amp=no'}\n"
-        L"$hs=\"@'\"+[Environment]::NewLine+'x'+[Environment]::NewLine+\"'@\"\n"
-        L"try{[void][scriptblock]::Create($hs);$o+='here=ok'}"
-        L"catch{$o+='here=no'}\n"
-        L"$o -join ';'\n";
-    const auto parsed = run_process(
-        shell,
-        L"-NoProfile -NonInteractive -EncodedCommand " + base64_utf16(script));
-    if (parsed.ok) {
-        const auto has = [&parsed](const char* token, const char* value) {
-            return parsed.output.find(std::string(token) + "=" + value) !=
-                   std::string::npos;
-        };
-        if (parsed.output.find("amp=") != std::string::npos)
-            capabilities["ampersand_ampersand"] =
-                capability_of_state(measured_state(has("amp", "ok")), "measured");
-        if (parsed.output.find("here=") != std::string::npos)
-            capabilities["here_string"] =
-                capability_of_state(measured_state(has("here", "ok")), "measured");
+    // Read only the capability line, so a version string that happens to
+    // contain "amp=" cannot be mistaken for an answer.
+    std::string answers;
+    std::istringstream lines(probe.output);
+    std::string line;
+    while (std::getline(lines, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.rfind("caps=", 0) == 0) {
+            answers = line.substr(5);
+            break;
+        }
     }
+    const auto has = [&answers](const char* needle) {
+        return answers.find(needle) != std::string::npos;
+    };
+    // Answering "neither ok nor no" is not a measurement, so the field stays
+    // unknown rather than being read as unsupported.
+    if (has("amp=ok") || has("amp=no"))
+        capabilities["ampersand_ampersand"] =
+            capability_of_state(measured_state(has("amp=ok")), "measured");
+    if (has("here=ok") || has("here=no"))
+        capabilities["here_string"] =
+            capability_of_state(measured_state(has("here=ok")), "measured");
 
     // Non-ASCII text is only trustworthy if it survives the shell-to-pipe path
-    // as UTF-8; otherwise reading the output yields mojibake.
-    const auto marker = run_process(
-        shell, L"-NoProfile -NonInteractive -EncodedCommand " +
-                   base64_utf16(L"[Console]::Out.Write('\u6807\u8bb0')"));
-    if (marker.ok && !marker.output.empty())
-        capabilities["non_ascii_pipe_utf8"] = capability_of_state(
-            measured_state(marker.output == utf8(L"\u6807\u8bb0")), "measured");
+    // as UTF-8; otherwise reading the output yields mojibake. It is the last
+    // thing the script writes, so the test is that the output ends with it.
+    if (!probe.output.empty()) {
+        const std::string marker = std::string("mark=") + utf8(L"\u6807\u8bb0");
+        const bool intact =
+            probe.output.size() >= marker.size() &&
+            probe.output.compare(probe.output.size() - marker.size(),
+                                 marker.size(), marker) == 0;
+        capabilities["non_ascii_pipe_utf8"] =
+            capability_of_state(measured_state(intact), "measured");
+    }
     return capabilities;
 }
 
@@ -1534,22 +1753,29 @@ Json probe_apps() {
             }
             const std::wstring subkey =
                 std::wstring(hive.second) + L"\\" + subkey_name.data();
-            const wchar_t* path = subkey.c_str();
+            // One open per application: all five values below live in this key,
+            // and opening it per value cost four extra opens for every entry in
+            // every hive, for an answer this one handle already holds.
+            const RegistryKey app_key(hive.first, subkey.c_str());
+            if (!app_key.valid()) continue;
             DWORD system_component = 0;
-            if (registry_dword(hive.first, path, L"SystemComponent",
-                               system_component) &&
+            if (query_registry_dword(app_key.get(), L"SystemComponent",
+                                     system_component) &&
                 system_component != 0)
                 continue;
-            const auto display = registry_string(hive.first, path, L"DisplayName");
+            const auto display =
+                query_registry_string(app_key.get(), L"DisplayName");
             if (display.empty()) continue;
             Json app = Json::object();
             app["name"] = utf8(display);
-            const auto version = registry_string(hive.first, path, L"DisplayVersion");
+            const auto version =
+                query_registry_string(app_key.get(), L"DisplayVersion");
             if (!version.empty()) app["version"] = utf8(version);
-            const auto publisher = registry_string(hive.first, path, L"Publisher");
+            const auto publisher =
+                query_registry_string(app_key.get(), L"Publisher");
             if (!publisher.empty()) app["publisher"] = utf8(publisher);
             std::wstring location =
-                registry_string(hive.first, path, L"InstallLocation");
+                query_registry_string(app_key.get(), L"InstallLocation");
             // Some installers store the path wrapped in quotes; strip them so the
             // reported location can be used as a path directly.
             if (location.size() >= 2 && location.front() == L'"' &&
@@ -1573,7 +1799,30 @@ Json probe_apps() {
     return result;
 }
 
+// Joins on scope exit. A probe that throws between starting a helper thread and
+// joining it would otherwise destroy a joinable std::thread, which terminates
+// the whole server.
+class ThreadJoiner {
+public:
+    explicit ThreadJoiner(std::thread& thread) : thread_(thread) {}
+    ~ThreadJoiner() {
+        if (thread_.joinable()) thread_.join();
+    }
+    ThreadJoiner(const ThreadJoiner&) = delete;
+    ThreadJoiner& operator=(const ThreadJoiner&) = delete;
+
+private:
+    std::thread& thread_;
+};
+
 Json probe_system() {
+    // One PATH read for the two shell lookups below, and for anything else this
+    // probe searches for.
+    const PathSnapshot path_snapshot;
+    // Snapshot before the probe: the counter is per thread, so the difference
+    // at the end covers exactly the processes this call launched, including
+    // the ones started inside probe_shell_capabilities.
+    const unsigned long long tree_kill_fallbacks_before = tree_kill_fallbacks;
     Json result = Json::object();
     Json os = Json::object();
     Json shell = Json::object();
@@ -1650,47 +1899,86 @@ Json probe_system() {
     const std::wstring pwsh = search_executable(L"pwsh.exe");
     const std::wstring powershell = search_executable(L"powershell.exe");
     const std::wstring& primary_shell = pwsh.empty() ? powershell : pwsh;
-    const auto probe_shell = [](const std::wstring& executable) {
-        return run_process(
-            executable,
-            L"-NoProfile -NonInteractive -Command "
-            L"\"$PSVersionTable.PSVersion.ToString();$PSVersionTable.PSEdition;"
-            L"$Host.Name;Get-ExecutionPolicy\"");
-    };
+    // Everything the primary shell is asked, in one start. Each answer is
+    // prefixed rather than positional: a field the shell fails to answer stays
+    // absent instead of shifting the values after it, and a warning line cannot
+    // be read as a version. The last thing written is the marker, with no
+    // trailing newline, because it is judged by being the end of the output.
+    const std::wstring shell_script =
+        L"$o=@()\n"
+        L"try{$o+='ver='+$PSVersionTable.PSVersion.ToString()}catch{}\n"
+        L"try{$o+='edi='+$PSVersionTable.PSEdition}catch{}\n"
+        L"try{$o+='host='+$Host.Name}catch{}\n"
+        L"try{$o+='pol='+[string](Get-ExecutionPolicy)}catch{}\n"
+        L"$c=@()\n"
+        L"try{[void][scriptblock]::Create('$null && $null');$c+='amp=ok'}"
+        L"catch{$c+='amp=no'}\n"
+        L"$hs=\"@'\"+[Environment]::NewLine+'x'+[Environment]::NewLine+\"'@\"\n"
+        L"try{[void][scriptblock]::Create($hs);$c+='here=ok'}"
+        L"catch{$c+='here=no'}\n"
+        L"$o+='caps='+($c -join ';')\n"
+        L"[Console]::Out.Write((($o -join \"`n\") + \"`nmark=\" + [char]0x6807 "
+        L"+ [char]0x8BB0))";
     if (!primary_shell.empty()) {
         shell["shell_path"] = utf8(primary_shell);
         shell["shell_kind"] = pwsh.empty() ? "windows-powershell" : "pwsh";
-        const auto ps = probe_shell(primary_shell);
-        if (ps.ok) {
-            // Read the values in the order the command emits them, and record
-            // only what was actually produced: a field the shell did not
-            // answer stays absent instead of becoming an empty string, and the
-            // trailing carriage return is not carried into the value.
-            std::istringstream values(ps.output);
-            const std::array<const char*, 4> fields{
-                {"ps_version", "ps_edition", "ps_host",
-                 "execution_policy"}};
-            for (const char* field : fields) {
-                std::string value;
-                if (!std::getline(values, value)) break;
-                while (!value.empty() &&
-                       (value.back() == '\r' || value.back() == '\n' ||
-                        value.back() == ' ' || value.back() == '\t'))
-                    value.pop_back();
-                if (!value.empty()) shell[field] = value;
+        // The legacy version is a second shell start and does not depend on the
+        // first, so it runs alongside it: the call then costs the slower of the
+        // two instead of their sum. It is still only probed when a different
+        // powershell.exe actually exists.
+        const bool probe_legacy = !pwsh.empty() && !powershell.empty();
+        ProcessResult legacy;
+        std::thread legacy_thread;
+        {
+            // Joins on scope exit, so no path can leave a joinable thread
+            // behind (which would terminate the process).
+            ThreadJoiner joiner(legacy_thread);
+            if (probe_legacy) {
+                legacy_thread = std::thread([&legacy, &powershell] {
+                    // Only the version is needed here; asking for more would
+                    // depend on module autoloading and can fail intermittently.
+                    legacy = run_process(
+                        powershell,
+                        L"-NoProfile -NonInteractive -Command "
+                        L"\"$PSVersionTable.PSVersion.ToString()\"");
+                });
             }
+            const auto ps = run_process(
+                primary_shell,
+                L"-NoProfile -NonInteractive -EncodedCommand " +
+                    base64_utf16(shell_script));
+            if (ps.ok) {
+                // Keyed by the prefix, so only what was actually answered is
+                // recorded: a missing answer stays absent instead of becoming
+                // an empty string.
+                std::map<std::string, std::string> answered;
+                std::istringstream lines(ps.output);
+                std::string line;
+                while (std::getline(lines, line)) {
+                    while (!line.empty() &&
+                           (line.back() == '\r' || line.back() == '\n' ||
+                            line.back() == ' ' || line.back() == '\t'))
+                        line.pop_back();
+                    const std::size_t equals = line.find('=');
+                    if (equals == std::string::npos) continue;
+                    answered.emplace(line.substr(0, equals),
+                                     line.substr(equals + 1));
+                }
+                const std::array<std::pair<const char*, const char*>, 4> fields{{
+                    {"ver", "ps_version"},
+                    {"edi", "ps_edition"},
+                    {"host", "ps_host"},
+                    {"pol", "execution_policy"}}};
+                for (const auto& field : fields) {
+                    const auto found = answered.find(field.first);
+                    if (found != answered.end() && !found->second.empty())
+                        shell[field.second] = found->second;
+                }
+            }
+            // Measured, so it stays right even if the version rule would not be.
+            shell["capabilities"] = probe_shell_capabilities(ps);
         }
-        // Measured, so it stays right even if the version rule would not be.
-        shell["capabilities"] = probe_shell_capabilities(primary_shell);
-    }
-    if (!pwsh.empty() && !powershell.empty()) {
-        // Only the version is needed here; asking for more would depend on
-        // module autoloading and can fail intermittently.
-        const auto legacy = run_process(
-            powershell,
-            L"-NoProfile -NonInteractive -Command "
-            L"\"$PSVersionTable.PSVersion.ToString()\"");
-        if (legacy.ok && !legacy.output.empty()) {
+        if (probe_legacy && legacy.ok && !legacy.output.empty()) {
             const std::string legacy_version =
                 legacy.output.substr(0, legacy.output.find_first_of("\r\n"));
             if (!legacy_version.empty())
@@ -1742,19 +2030,157 @@ Json probe_system() {
     result["paths"] = paths;
     result["policies"] = probe_machine_policies();
     result["hardware"] = probe_hardware();
+    // Observed rather than assumed: "job" means every process this probe
+    // launched was bound to a job object, so a timeout kills the whole tree;
+    // "fallback" means at least one launch had to be terminated as a single
+    // process. It sits at the top level so it is visible in detail output
+    // without changing the concise summary.
+    result["process_tree_kill"] =
+        tree_kill_fallbacks == tree_kill_fallbacks_before ? "job" : "fallback";
     result["probed_at"] = current_time_iso();
     return result;
 }
 
 // Network reachability is its own probe so that local system facts never cause
 // an outbound request unless the caller asked for exactly that.
-Json probe_network() {
+Json probe_network(bool offline, const std::vector<std::string>& skip,
+                   int budget_ms) {
     Json result = Json::object();
     Json endpoints = Json::object();
-    endpoints["github_api"] = probe_one_endpoint(L"api.github.com");
-    endpoints["github_raw"] = probe_one_endpoint(L"raw.githubusercontent.com");
-    endpoints["huggingface"] = probe_one_endpoint(L"huggingface.co");
-    endpoints["pypi"] = probe_one_endpoint(L"pypi.org");
+    // The four hosts are independent, so probing them one after another pays
+    // their latencies additively: one slow or unreachable endpoint that waits
+    // out its timeout would hold the whole answer hostage (measured: a single
+    // Hugging Face timeout of ~3s dominated a 4.2s serial call). Running them
+    // concurrently makes the call cost the slowest endpoint instead of the
+    // sum, without changing any result field that callers already rely on.
+    struct Target {
+        const char* key;
+        const wchar_t* host;
+    };
+    static const Target targets[] = {
+        {"github_api", L"api.github.com"},
+        {"github_raw", L"raw.githubusercontent.com"},
+        {"huggingface", L"huggingface.co"},
+        {"pypi", L"pypi.org"},
+    };
+    constexpr std::size_t count = sizeof(targets) / sizeof(targets[0]);
+
+    // A skipped endpoint is answered without touching the network: offline
+    // skips all of them, skip names individual ones. The reason is recorded so
+    // "deliberately not checked" stays distinct from "checked and unreachable",
+    // which is what lets a restricted or privacy-sensitive caller avoid a host
+    // that only stalls (measured: blackholed names cost ~4s at the resolver).
+    std::array<bool, count> should_probe{};
+    for (std::size_t i = 0; i < count; ++i) {
+        const std::string key = targets[i].key;
+        const bool listed =
+            std::find(skip.begin(), skip.end(), key) != skip.end();
+        should_probe[i] = !offline && !listed;
+        if (should_probe[i]) continue;
+        Json entry = Json::object();
+        entry["ok"] = false;
+        entry["skipped"] = true;
+        entry["ms"] = 0;
+        entry["reason"] = offline ? "offline" : "skipped";
+        endpoints[key] = entry;
+    }
+
+    std::array<Json, count> probed;
+    std::array<bool, count> finished{};
+    // The budget turns this call into a race against its own workers: once the
+    // deadline passes the function returns while a probe may still be inside
+    // WinHTTP. Those workers therefore cannot write into this stack frame, so
+    // the result slots live in a shared state that outlives the call and is
+    // released by whichever worker finishes last.
+    struct SharedState {
+        std::mutex mutex;
+        std::condition_variable ready;
+        std::array<Json, count> results;
+        std::array<bool, count> done{};
+        std::size_t started = 0;
+        std::size_t finished = 0;
+    };
+    auto state = std::make_shared<SharedState>();
+    const auto started_at = std::chrono::steady_clock::now();
+
+    std::size_t planned = 0;
+    for (std::size_t i = 0; i < count; ++i)
+        if (should_probe[i]) ++planned;
+    {
+        // Published before any thread starts: a worker that finished before the
+        // count was known would otherwise let the wait see "all done".
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->started = planned;
+    }
+    for (std::size_t i = 0; i < count; ++i) {
+        if (!should_probe[i]) continue;
+        // probe_one_endpoint opens and closes its own WinHTTP session, so the
+        // probes share no mutable state and are safe to run side by side.
+        // targets has static storage duration and is used directly; capturing
+        // it in the lambda would be rejected (static variables cannot be
+        // captured), so only the shared state and the index are captured. The
+        // state is captured by value precisely so a detached worker keeps it
+        // alive on its own.
+        std::thread([state, i]() {
+            Json one = probe_one_endpoint(targets[i].host);
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                state->results[i] = std::move(one);
+                state->done[i] = true;
+                ++state->finished;
+            }
+            state->ready.notify_all();
+        }).detach();
+    }
+
+    bool budget_exhausted = false;
+    if (planned > 0) {
+        std::unique_lock<std::mutex> lock(state->mutex);
+        const auto all_done = [&state] {
+            return state->finished >= state->started;
+        };
+        if (budget_ms <= 0) {
+            // A caller asking for no budget wants every endpoint answered, which
+            // is what the cache writer needs before it stores a result.
+            state->ready.wait(lock, all_done);
+        } else {
+            budget_exhausted = !state->ready.wait_until(
+                lock, started_at + std::chrono::milliseconds(budget_ms),
+                all_done);
+        }
+    }
+    // Read the slots under the same mutex the workers use: a probe that lands
+    // right after the deadline must not be read while it is being written.
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        for (std::size_t i = 0; i < count; ++i) {
+            finished[i] = state->done[i];
+            if (finished[i]) probed[i] = std::move(state->results[i]);
+        }
+    }
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - started_at)
+                                .count();
+    bool any_over_budget = false;
+    for (std::size_t i = 0; i < count; ++i) {
+        if (!should_probe[i]) continue;
+        if (finished[i]) {
+            endpoints[targets[i].key] = std::move(probed[i]);
+            continue;
+        }
+        // Not answered in time is a third answer, distinct from unreachable:
+        // the host was asked and did not answer within the caller's deadline.
+        any_over_budget = true;
+        Json entry = Json::object();
+        entry["ok"] = false;
+        entry["timed_out"] = true;
+        entry["ms"] = static_cast<std::int64_t>(elapsed_ms);
+        entry["reason"] = "budget";
+        endpoints[targets[i].key] = entry;
+    }
+    if (offline) result["offline"] = true;
+    if (budget_ms > 0) result["budget_ms"] = budget_ms;
+    if (any_over_budget) result["budget_exhausted"] = true;
     result["endpoints"] = endpoints;
     result["probed_at"] = current_time_iso();
     return result;
@@ -1771,9 +2197,15 @@ Json with_live_session_facts(const std::string& kind, Json payload) {
 
 // One cache entry per probe category. System and network facts change often, so
 // they expire quickly; the tool and application inventories are stable.
-Json cached_probe(const std::string& kind, bool refresh) {
-    const int ttl =
-        (kind == "toolchain" || kind == "apps") ? kDefaultTtl : kNetworkTtl;
+Json cached_probe(const std::string& kind, bool refresh, int network_budget_ms) {
+    // Versions get an entry of their own rather than sharing the plain tool
+    // inventory: a payload built without versions must never be served to a
+    // caller who asked for them, and versions are stable enough to keep for a
+    // day once measured.
+    const int ttl = (kind == "toolchain" || kind == "toolchain_versions" ||
+                     kind == "apps")
+                        ? kDefaultTtl
+                        : kNetworkTtl;
     if (!refresh) {
         const Json entry = read_cache_entry(kind, ttl);
         if (entry.is_object()) {
@@ -1784,14 +2216,62 @@ Json cached_probe(const std::string& kind, bool refresh) {
         }
     }
 
-    const Json metadata = cache_metadata(
-        refresh ? "refresh requested" : cache_read_failure, false);
-    Json payload = kind == "system"      ? probe_system()
-                   : kind == "toolchain" ? probe_toolchain()
-                   : kind == "apps"      ? probe_apps()
-                                         : probe_network();
-    return with_live_session_facts(
-        kind, cacheable_probe(kind, std::move(payload), metadata));
+    const auto run_probe = [&]() {
+        const Json metadata = cache_metadata(
+            refresh ? "refresh requested" : cache_read_failure, false);
+        Json payload = kind == "system"      ? probe_system()
+                       : kind == "toolchain" ? probe_toolchain(false)
+                       : kind == "toolchain_versions" ? probe_toolchain(true)
+                       : kind == "apps"      ? probe_apps()
+                                             : probe_network(false, {}, network_budget_ms);
+        return with_live_session_facts(
+            kind, cacheable_probe(kind, std::move(payload), metadata));
+    };
+
+    if (!refresh) return run_probe();
+
+    // A refresh is not a licence to probe unconditionally: five clients that
+    // start together would otherwise run five full probes at once, which is how
+    // a refresh storm turns into minutes of duplicated work. Two gates, cheapest
+    // first. An entry written inside the minimum interval answers the refresh
+    // as it stands; a per-kind lock across processes then makes one caller the
+    // only one that probes.
+    const auto coalesced = [&kind](Json& result) {
+        // ignore_expiry is safe here: the age check below is far tighter than
+        // any entry's TTL, and read_cache_entry still rejects a bad checksum, a
+        // foreign machine, or a timestamp in the future.
+        const Json entry = read_cache_entry(kind, 0, true);
+        if (!entry.is_object()) return false;
+        Json payload = entry.get("payload");
+        // A partial or failed result is never stored, but the check keeps an
+        // entry written by something else from being served as a refresh.
+        if (!payload.is_object() || payload.contains("error")) return false;
+        const Json& over_budget = payload.get("budget_exhausted");
+        if (over_budget.is_bool() && over_budget.as_bool()) return false;
+        const auto cached_at = entry.get("cached_at").as_integer();
+        const auto age_ms =
+            (static_cast<std::int64_t>(std::time(nullptr)) - cached_at) * 1000;
+        if (age_ms < 0 || age_ms >= kRefreshMinIntervalMs) return false;
+        Json cache = cache_metadata("refresh coalesced", true, cached_at);
+        // cached stays true: the refreshed answer the caller asked for is in
+        // the cache. reason says the probe itself was skipped.
+        cache["cached"] = true;
+        annotate_cache(payload, cache);
+        result = with_live_session_facts(kind, std::move(payload));
+        return true;
+    };
+    Json result;
+    if (coalesced(result)) return result;
+
+    // The lock covers the probe and the write that publishes its result, so a
+    // waiter always sees either a fresh entry (handled above) or no entry and
+    // then does the work itself. It is separate from the cache lock on purpose:
+    // that one orders file writes, this one orders probes. If it cannot be
+    // acquired the other instance is still probing, and probing anyway is
+    // deliberate — a stalled holder must not cost this caller its answer.
+    NamedMutex probe_lock(probe_mutex_name(kind).c_str(), kProbeMutexWaitMs);
+    if (coalesced(result)) return result;
+    return run_probe();
 }
 
 }  // namespace machine_env

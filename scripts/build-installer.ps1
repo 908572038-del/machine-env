@@ -6,6 +6,12 @@ $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
 $InstallerScript = Join-Path $PSScriptRoot 'machine-env-cpp.nsi'
 $ConfigScript = Join-Path $PSScriptRoot 'configure-mcp.ps1'
+$RegistryScript = Join-Path $PSScriptRoot 'client-registry.ps1'
+foreach ($required in @($InstallerScript, $ConfigScript, $RegistryScript)) {
+    if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+        throw "Missing installer input: $required"
+    }
+}
 $BuildDirectory = Join-Path $Root 'build\installer-build'
 $StagedExe = Join-Path $BuildDirectory 'machine-env-cpp.exe'
 $DefaultExe = Join-Path $Root 'build\machine-env-cpp.exe'
@@ -46,7 +52,7 @@ if (-not $makensis) {
 
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 & $makensis '/V2' "/DSourceExe=$SourceExe" "/DConfigScript=$ConfigScript" `
-    "/DOutputFile=$OutputFile" $InstallerScript
+    "/DRegistryScript=$RegistryScript" "/DOutputFile=$OutputFile" $InstallerScript
 if ($LASTEXITCODE -ne 0) {
     throw "NSIS compilation failed with exit code $LASTEXITCODE"
 }
