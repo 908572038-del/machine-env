@@ -83,6 +83,12 @@ struct Json {
     bool contains(const std::string& key) const {
         return is_object() && as_object().find(key) != as_object().end();
     }
+    // A derived field whose premise has been removed is not false, it is
+    // unanswerable, and an absent field says that where `false` would lie.
+    void erase(const std::string& key) {
+        if (!is_object()) return;
+        as_object().erase(key);
+    }
     const Json& at(const std::string& key) const {
         auto it = as_object().find(key);
         if (it == as_object().end())

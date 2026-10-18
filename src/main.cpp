@@ -898,6 +898,22 @@ void narrow_tools(Json& payload, const std::vector<std::string>& filter) {
     narrow_listed("version_unknown");
     narrow_listed("not_on_path");
     narrow_listed("unresolved_tools");
+
+    // tool_count deliberately keeps meaning "how many tools this probe found"
+    // -- it is the frame the payload was cut out of, the same role count plays
+    // for get_apps -- so a filtered payload would otherwise show a total with
+    // no matching number beside it: 20 next to a single entry. The second
+    // number is made explicit rather than the first one redefined, which would
+    // have broken every caller that reads tool_count as the probe's result.
+    const Json& kept = payload.get("tools");
+    if (kept.is_object())
+        payload["matched_count"] =
+            static_cast<std::int64_t>(kept.as_object().size());
+    // python_pip_mismatch compares two entries. Filter pip out and the
+    // comparison stops being answerable: absent is honest, false would be a
+    // claim this payload cannot support.
+    if (payload.contains("python_pip_mismatch") && !kept.contains("pip"))
+        payload.erase("python_pip_mismatch");
 }
 
 // An inventory of every installed application is mostly noise when a caller

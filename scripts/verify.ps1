@@ -400,6 +400,10 @@ try {
         Assert-That ($singleNames -contains $requested) 'a detailed result keeps the tool that was requested'
         Assert-That ($singleNames.Count -lt $catalogNames.Count) 'a detailed result narrows the catalog to the filter'
         Assert-That ($single.tool_count -eq $toolchain.tool_count) 'the catalog total survives a name filter'
+        # A total with no matching number beside it reads as a contradiction
+        # (20 next to a single entry), so the filtered size is stated as its own
+        # field instead of the total being redefined under the reader's feet.
+        Assert-That ($single.matched_count -eq $singleNames.Count) 'a filtered result reports how many it matched'
         # A null property name is not an entry: an empty map yields $null from
         # .Name, and @($null) is a one-element array, which used to read as an
         # orphan that was not there.
@@ -414,6 +418,14 @@ try {
     $nothing = (Invoke-Stdio @('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_tools","arguments":{"detail":true,"name":"zz-no-such-tool-xyz"}}}'))[0].result.structuredContent
     Assert-That (@($nothing.tools.PSObject.Properties).Count -eq 0) 'a detailed result honours a filter that matches nothing'
     Assert-That ($nothing.tool_count -eq $toolchain.tool_count) 'the catalog total survives a filter that matches nothing'
+    Assert-That ($nothing.matched_count -eq 0) 'a filter that matches nothing reports zero matched'
+    # The mismatch flag is a comparison between two entries. With pip filtered
+    # out it can no longer be judged, and reporting false would claim they agree.
+    if ($toolchain.tools.pip) {
+        $pythonOnly = (Invoke-Stdio @('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_tools","arguments":{"detail":true,"name":"python"}}}'))[0].result.structuredContent
+        Assert-That (-not $pythonOnly.tools.PSObject.Properties.Name.Contains('pip')) 'filtering to python leaves pip out of the payload'
+        Assert-That ($null -eq $pythonOnly.python_pip_mismatch) 'a mismatch is not asserted about a pip that is not in the payload'
+    }
 
     Write-Step 'Tool version opt-in'
     # Reading a version means running the tool: one child process per tool, which
@@ -484,6 +496,24 @@ try {
     Assert-That ([string]$rejected.os.total_mem_mb -eq $trueMemory) 'the tampered figure is not served'
     $healed = (Invoke-Stdio @($readSystem))[0].result.structuredContent
     Assert-That ($healed._cache.hit -eq $true) 'the cache heals itself on the next call'
+
+    Write-Step 'Cache housekeeping'
+    # A write removes its own temporary file when it fails, but nothing runs
+    # after a kill, so each interrupted write leaves one behind and nothing
+    # collects them: one stress run left 4384 orphans and 292 MB beside six real
+    # entries under 20 KB. The sweep is bounded by age so a live write -- the
+    # temp of a concurrent install -- is never touched.
+    $cacheDir = Split-Path -Parent $cacheFile
+    $staleTemp = Join-Path $cacheDir 'system.json.999-1.tmp'
+    $freshTemp = Join-Path $cacheDir 'apps.json.999-2.tmp'
+    [System.IO.File]::WriteAllText($staleTemp, '{"abandoned":true}')
+    [System.IO.File]::WriteAllText($freshTemp, '{"in-flight":true}')
+    (Get-Item -LiteralPath $staleTemp).LastWriteTime = (Get-Date).AddHours(-2)
+    $null = Invoke-Stdio @($handshake, '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_apps","arguments":{"detail":true}}}')
+    Assert-That (-not (Test-Path -LiteralPath $staleTemp)) 'an abandoned temporary file is swept at startup'
+    Assert-That (Test-Path -LiteralPath $freshTemp) 'a temporary file younger than the age guard is left alone'
+    Assert-That (Test-Path -LiteralPath $cacheFile) 'a sweep does not touch a real cache entry'
+    [System.IO.File]::Delete($freshTemp)
 
     Write-Step 'Concurrent request handling'
     # Requests are executed concurrently but answered in the order they were

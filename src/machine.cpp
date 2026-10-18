@@ -721,6 +721,27 @@ Json cache_metadata(const std::string& reason, bool hit,
     return result;
 }
 
+// A write removes its own temporary file when it fails, but nothing runs after
+// a kill or a crash, so every interrupted write leaves one behind and nothing
+// ever collects them. Measured on this machine after one round of stress tests
+// that killed the process: 4384 orphans, 292 MB, beside six real entries under
+// 20 KB -- the cache was 15000 times larger than the data it held. Sweeping is
+// one directory iteration at startup, and the one-hour age guard keeps a
+// concurrent install's fresh temp out of it.
+void sweep_orphan_temporaries(const fs::path& directory) {
+    std::error_code ec;
+    const auto cutoff = fs::file_time_type::clock::now() - std::chrono::hours(1);
+    for (fs::directory_iterator it(directory, ec), end; !ec && it != end;
+         it.increment(ec)) {
+        std::error_code entry_error;
+        const fs::path path = it->path();
+        if (path.extension() != L".tmp") continue;
+        const auto written = fs::last_write_time(path, entry_error);
+        if (entry_error || written > cutoff) continue;
+        fs::remove(path, entry_error);
+    }
+}
+
 fs::path cache_directory() {
     std::wstring local = environment_variable(L"LOCALAPPDATA");
     if (local.empty()) {
@@ -730,7 +751,10 @@ fs::path cache_directory() {
             local = profile.data();
     }
     if (local.empty()) local = environment_variable(L"USERPROFILE");
-    return fs::path(local) / L"machine-env" / L"cache";
+    const fs::path directory = fs::path(local) / L"machine-env" / L"cache";
+    static std::once_flag swept;
+    std::call_once(swept, [&directory] { sweep_orphan_temporaries(directory); });
+    return directory;
 }
 
 // Every lock below is only ever waited for with a bound: a stuck holder must
