@@ -322,6 +322,17 @@ caller: measured on this machine, 100 concurrent `get_network` refreshes went fr
 its own budget, never the holder's speed, and a joiner that runs out of patience
 falls back to an older entry before it falls back to probing.
 
+The default call shape joins too, and there it is a saving in work rather than in
+time: 100 concurrent plain `get_network` calls used to be 100 network probes
+(`attempts=100 inflight_peak=100`) and are now one. Wall clock barely moves —
+2510 ms before, 2514 ms after — because that path is bounded by the probe's own
+budget, not by how many probes run. Anyone citing a latency number for joining
+should say which of the two they mean.
+
+A caller with a different `timeout_ms` does not join: the table is keyed by the
+question, not by the kind, so two callers asking for different network budgets
+never receive each other's partial answer.
+
 A ceiling on simultaneous probes of one kind exists as a backstop
 (`MACHINE_ENV_PROBE_CONCURRENCY`, 16 by default, `0` disables it). It is a bound
 on resources, not a source of speed, and it is **not** what makes the burst above

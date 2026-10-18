@@ -2350,17 +2350,17 @@ public:
         auto attempt = std::move(attempt_);
         attempt_ = nullptr;
         if (!attempt) return;
-        // Only an answer the next caller would have asked for is handed on. A
-        // probe that ran out of its budget, or one that failed, is neither: the
-        // coalescing window above refuses exactly these payloads, and sharing
-        // one would give a caller a truncated or failed answer to a question it
-        // put differently. Those waiters are woken without a copy instead.
-        const Json& over_budget = result.get("budget_exhausted");
-        const bool complete =
-            !(over_budget.is_bool() && over_budget.as_bool()) &&
-            !result.contains("error");
-        finish_attempt(kind_, std::move(attempt), complete ? result : Json(),
-                       complete);
+        // Whatever the probe produced is handed on, including a partial answer
+        // and including a failure. That is only safe because the table is keyed
+        // by the question, not just by the kind: a caller with a different
+        // network budget never joins this attempt, so everyone waiting here
+        // asked for the same thing and would have produced the same answer
+        // themselves. Refusing to share a partial one was the earlier version,
+        // and on a host where the endpoints never finish inside the budget --
+        // every probe therefore partial -- it turned a burst of 100 identical
+        // calls into 100 network probes: 100 x 2.5 s of duplicated work, the
+        // exact storm joining exists to prevent.
+        finish_attempt(kind_, std::move(attempt), std::move(result), true);
     }
     // Wakes the waiters without an answer: the result they wanted is in the
     // cache, so they read it instead of guessing.
@@ -2409,14 +2409,20 @@ Json cached_probe(const std::string& kind, bool refresh, int network_budget_ms) 
             kind, cacheable_probe(kind, std::move(payload), metadata));
     };
 
-    if (!refresh) return run_probe();
-
+    // A cache miss is not a licence to probe unconditionally either. This used
+    // to return straight into run_probe(), which meant the *default* call shape
+    // -- no refresh argument at all -- bypassed the coalescing window, the
+    // cross-process lock and the in-process table, and answered a burst of 100
+    // identical calls with 100 network probes (measured: attempts=100,
+    // inflight_peak=100, 100 x 2.5 s of duplicated work). A miss now joins
+    // whatever is already running, exactly as a refresh does.
+    //
     // A refresh is not a licence to probe unconditionally: five clients that
     // start together would otherwise run five full probes at once, which is how
     // a refresh storm turns into minutes of duplicated work. Two gates, cheapest
-    // first. An entry written inside the minimum interval answers the refresh
-    // as it stands; a per-kind lock across processes then makes one caller the
-    // only one that probes.
+    // first. An entry written inside the minimum interval answers the call as it
+    // stands; a per-kind lock across processes then makes one caller the only
+    // one that probes.
     const auto coalesced = [&kind](Json& result) {
         // ignore_expiry is safe here: the age check below is far tighter than
         // any entry's TTL, and read_cache_entry still rejects a bad checksum, a
@@ -2448,16 +2454,25 @@ Json cached_probe(const std::string& kind, bool refresh, int network_budget_ms) 
     // second one for the same answer. Patience is this caller's own budget, not
     // the holder's speed: a probe that outlives it is a probe this caller stops
     // waiting for, and it is never made to wait without a bound.
+    //
+    // The table is keyed by the question rather than by the kind: two callers
+    // asking for different network budgets are asking different questions, and
+    // handing one the other's partial answer would be worse than making it
+    // wait. Everything else has exactly one shape per kind.
+    const std::string attempt_key =
+        (kind == "network" && network_budget_ms > 0)
+            ? kind + "#" + std::to_string(network_budget_ms)
+            : kind;
     std::shared_ptr<Attempt> attempt;
     bool probing_here = false;
     {
         std::lock_guard<std::mutex> lock(attempt_table_mutex);
-        const auto running = attempt_table.find(kind);
+        const auto running = attempt_table.find(attempt_key);
         if (running != attempt_table.end()) {
             attempt = running->second;
         } else {
             attempt = std::make_shared<Attempt>();
-            attempt_table[kind] = attempt;
+            attempt_table[attempt_key] = attempt;
             probing_here = true;
         }
     }
@@ -2546,7 +2561,7 @@ Json cached_probe(const std::string& kind, bool refresh, int network_budget_ms) 
     // writes, this one orders probes. If it cannot be acquired the other
     // process is still probing, and probing anyway is deliberate — a stalled
     // holder must not cost this caller its answer.
-    AttemptClaim claim(kind, attempt);
+    AttemptClaim claim(attempt_key, attempt);
     NamedMutex probe_lock(probe_mutex_name(kind).c_str(), kProbeMutexWaitMs);
     if (coalesced(result)) {
         // Somebody published while this caller waited for the lock. The waiters

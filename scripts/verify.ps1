@@ -764,6 +764,24 @@ try {
     # Every one of them answered with a fact, not a refusal to answer twice.
     $answered = @($identicalCalls | Where-Object { $_.result.structuredContent.os })
     Assert-That ($answered.Count -eq 3) 'every caller in the burst is answered with the fact, whichever of them probed'
+    # The default call shape -- no refresh argument -- used to return straight
+    # into a probe, so a cache miss never joined anything: 100 identical
+    # get_network calls were 100 network probes. Same check as above, on the
+    # shape a client actually uses most.
+    if (Test-Path -LiteralPath $cacheFile) { [System.IO.File]::Delete($cacheFile) }
+    $plainBurst = Invoke-Stdio @(
+        $handshake,
+        '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_system","arguments":{"detail":true}}}',
+        '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_system","arguments":{"detail":true}}}',
+        '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"get_system","arguments":{"detail":true}}}'
+    )
+    $plainCalls = @($plainBurst | Where-Object { $_.id -ge 2 -and $_.id -le 4 })
+    $plainProbes = @($plainCalls | Where-Object {
+        $cache = $_.result.structuredContent._cache
+        $cache.hit -eq $false -and $cache.shared -ne $true -and $cache.stale -ne $true
+    })
+    Assert-That ($plainCalls.Count -eq 3) 'a burst of three default calls is answered three times'
+    Assert-That ($plainProbes.Count -eq 1) "a burst of three default calls on a cold cache costs one probe (got $($plainProbes.Count))"
 
     Write-Step 'Response ordering'
     # Order is best-effort: kept while the answer ahead is merely slower, given
