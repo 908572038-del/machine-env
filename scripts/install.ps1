@@ -69,7 +69,22 @@ if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
 $installDirectory = Join-Path $env:LOCALAPPDATA 'Programs\machine-env-cpp'
 $server = Join-Path $installDirectory 'machine-env-cpp.exe'
 New-Item -ItemType Directory -Path $installDirectory -Force | Out-Null
-Copy-Item -LiteralPath $builtServer -Destination $server -Force
+# An editor that has already started the server holds the executable open, and
+# the raw failure for that is a bare IOException on Copy-Item, which says
+# nothing about what to close. Upgrading under a running client is the normal
+# case, not an exotic one, so it is worth naming.
+try {
+    Copy-Item -LiteralPath $builtServer -Destination $server -Force
+} catch [System.IO.IOException] {
+    $holders = @(Get-Process -Name 'machine-env-cpp' -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty Id)
+    $who = if ($holders.Count -gt 0) {
+        "The server is running as process $($holders -join ', ')"
+    } else {
+        'The installed executable is in use'
+    }
+    throw "$who, so the installed copy at $server cannot be replaced. Close the editor or client that runs it (or stop that process) and run this again."
+}
 Copy-Item -LiteralPath $configScriptSource -Destination $installDirectory -Force
 Copy-Item -LiteralPath $uninstallScriptSource -Destination $installDirectory -Force
 Copy-Item -LiteralPath $registrySource -Destination $installDirectory -Force

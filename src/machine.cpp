@@ -343,6 +343,16 @@ std::vector<fs::path> directories_by_newest(const fs::path& parent,
 }
 
 std::wstring discover_python_executable() {
+    // PATH is consulted before any install directory is scanned. The question
+    // being answered is "where is the python this machine will run", and the
+    // bare name is what a caller types, so the copy PATH points at is the one
+    // that matters. Scanning first used to answer with a second installation
+    // that PATH does not reach, and then mark it as not on PATH: a truthful
+    // pair of facts that together describe an interpreter nobody will run, and
+    // that made the pip beside the *other* installation look mismatched.
+    const std::wstring on_path = search_executable(L"python.exe");
+    if (!on_path.empty() && !is_windows_apps_path(on_path)) return on_path;
+
     const std::wstring local_app_data = environment_variable(L"LOCALAPPDATA");
     const std::wstring user_profile = environment_variable(L"USERPROFILE");
     std::vector<fs::path> roots;
@@ -380,8 +390,9 @@ std::wstring discover_python_executable() {
         }
     }
 
-    const std::wstring on_path = search_executable(L"python.exe");
-    return is_windows_apps_path(on_path) ? std::wstring{} : on_path;
+    // A WindowsApps alias is a stub that leads to the Store, not an
+    // installation, and nothing was found that actually runs.
+    return {};
 }
 
 // Not finding Visual Studio and failing to look for it are different answers,

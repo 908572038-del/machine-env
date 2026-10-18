@@ -163,8 +163,19 @@ std::string cache_note(const Json& value) {
     if (cache.get("hit").is_bool() && cache.get("hit").as_bool()) {
         output << "\n（缓存命中";
         const Json& age = cache.get("age_seconds");
-        if (age.is_number()) output << "，" << age.as_integer() << " 秒前";
-        output << "）";
+        // Seconds are what the cache stores, but they are not what a reader can
+        // judge quickly: "1390 秒前" has to be divided by sixty before it means
+        // anything, which is how a cached answer gets mistaken for a fresh one.
+        if (age.is_number()) {
+            const long long seconds = age.as_integer();
+            if (seconds < 90)
+                output << "，" << seconds << " 秒前";
+            else if (seconds < 90 * 60)
+                output << "，" << seconds / 60 << " 分钟前";
+            else
+                output << "，" << seconds / 3600 << " 小时前";
+        }
+        output << "；要现场重测加 refresh:true）";
     }
     return output.str();
 }
@@ -289,6 +300,7 @@ std::string summarize_toolchain(const Json& value,
 
     bool first = true;
     bool selected_known = false;
+    int off_path_shown = 0;
     if (tools.is_object()) {
         for (const auto& name : order) {
             const std::string path = string_field(tools, name);
@@ -314,13 +326,22 @@ std::string summarize_toolchain(const Json& value,
                 output << " (" << first_line(version) << ")";
             else if (version_unknown)
                 output << " (版本未知)";
-            if (is_off_path(name)) output << " 不在PATH";
+            if (is_off_path(name)) {
+                output << " 不在PATH";
+                ++off_path_shown;
+            }
             if (name == "pip" &&
                 value.get("python_pip_mismatch").is_bool() &&
                 value.get("python_pip_mismatch").as_bool())
                 output << " 与PYTHON不同源";
         }
     }
+    // The flag is a fact about PATH, not about presence, and a bare label next
+    // to a path invites the opposite reading: that the tool was not found. It
+    // was found -- the path is right there -- and only the bare name will fail.
+    if (off_path_shown > 0)
+        output << "\n（「不在PATH」= 已定位到文件，只是 PATH 中没有它的目录："
+                  "需用绝对路径，或在开发者命令提示符下运行）";
     // A requested name that is not on PATH is still an answer: saying so is the
     // difference between "it is not there" and "nothing was looked for".
     const Json& unresolved = value.get("unresolved_tools");
@@ -490,8 +511,15 @@ std::string summarize_network(const Json& value) {
         output << "，其中 " << over_budget << " 个超过预算未完成";
         const Json& budget = value.get("budget_ms");
         if (budget.is_number())
+            // The old wording promised that a bigger timeout would finish the
+            // job. It does not: each endpoint also has its own per-phase
+            // timeout, so above roughly 4.8 s a larger budget only changes the
+            // reason from "budget" to "timeout". Saying so is the difference
+            // between a caller who retries once and gets a definite answer and
+            // one who concludes the network is broken when it is not.
             output << "（预算 " << budget.as_integer()
-                   << "ms，可传更大的 timeout_ms）";
+                   << "ms；超预算不等于不可达，端点自身也在超时：要确定结论"
+                      "可传 timeout_ms 5000 以上，届时慢端点会记为 timeout）";
     }
     return output.str();
 }
@@ -1441,7 +1469,9 @@ int selftest() {
         "- MAKENSIS = C:\\Program Files (x86)\\NSIS\\makensis.exe\n"
         "- ISCC = C:\\Inno Setup\\ISCC.exe\n"
         "- CLANG = C:\\LLVM\\bin\\clang.exe\n"
-        "- PNPM = C:\\Node\\pnpm.cmd";
+        "- PNPM = C:\\Node\\pnpm.cmd\n"
+        "（「不在PATH」= 已定位到文件，只是 PATH 中没有它的目录："
+        "需用绝对路径，或在开发者命令提示符下运行）";
     if (toolchain_summary != expected_toolchain_summary)
         throw std::runtime_error("toolchain memory format/order test failed");
 

@@ -165,7 +165,14 @@ be legal JSON-RPC and would still break a client that assumes otherwise.
 tool on its own line in a fixed order, as `NAME = PATH`, with the version
 appended when versions were asked for and could be read, a `不在PATH` marker
 when it was found outside PATH, and a `与PYTHON不同源` marker when `pip` belongs
-to a different Python installation than the reported `python`. Reading a version
+to a different Python installation than the reported `python`. The `不在PATH`
+marker means the file was located and PATH simply has no directory for it — the
+usual case for `cl`, `msbuild`, `signtool` and friends, which need a developer
+prompt or an absolute path — so a footnote spells that out rather than leaving a
+bare label to be read as "not installed". `python` itself is resolved by asking
+PATH first, because the question is which interpreter the bare name runs: reading
+an install directory first reported a second copy that PATH never reaches, and
+then flagged the pip beside the *first* copy as belonging elsewhere. Reading a version
 means running the tool, so it is opt-in through `include_versions: true`; without
 it the answer is a filesystem lookup that starts no process, and the summary says
 so rather than leaving a missing version to be read as an unknown one. Versions
@@ -190,7 +197,10 @@ alternatives, and spaces inside one alternative are part of the phrase, so
 `"visual studio"` does not also match a publisher named `... Studios`.
 
 Concise summaries append their cache status when it matters: a cached result
-shows its age. The operating system caption is derived from the build number, so
+shows its age in the largest unit that still reads at a glance (`23 分钟前`, not
+`1390 秒前`) and names the way to get a live one (`refresh: true`), because an
+answer that silently arrives from cache is easily mistaken for a fresh probe.
+The operating system caption is derived from the build number, so
 Windows 11 is not reported with the legacy `Windows 10` registry product name.
 Pass `detail: true` to any tool to receive the full JSON data, including cache
 metadata and the detailed fields behind the summary.
@@ -230,7 +240,10 @@ The tool and application inventories are cached for 24 hours. System facts and
 network state are cached for 10 minutes. Cache files live under the current
 user's `%LOCALAPPDATA%\machine-env\cache`; writes are atomic and protected by a
 named Windows mutex. Entries are invalidated when the server executable
-changes or their TTL expires. Cache failures do not prevent probes from
+changes — an entry records the binary's fingerprint, so an upgrade re-probes
+instead of answering from a snapshot taken by a different build — or when their
+TTL expires. A cached answer is therefore never one the previous build measured
+under different rules. Cache failures do not prevent probes from
 returning results. PATH results contain existing directories only; file paths
 and nonexistent entries are omitted and counted.
 

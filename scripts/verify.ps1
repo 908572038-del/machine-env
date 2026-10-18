@@ -339,6 +339,50 @@ try {
     $vsWarning = -join ([char]0x68C0, [char]0x6D4B, [char]0x672A, [char]0x5B8C, [char]0x6210)
     Assert-That ($toolchainText.Contains($vsWarning) -eq ($detection -eq 'unknown')) 'the Visual Studio warning appears only when the look itself failed'
 
+    Write-Step 'Tool resolution contract'
+    # "Where is python" means the python the bare name runs. Answering from an
+    # install directory that PATH does not reach, and then flagging that copy as
+    # not on PATH, is two true facts that together describe an interpreter the
+    # caller will never run -- and it made the pip that does run look like it
+    # belonged to a different installation.
+    $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $composedPath = (@($machinePath, $userPath) | Where-Object { $_ }) -join ';'
+    $onPathPython = $null
+    foreach ($directory in ($composedPath -split ';')) {
+        if ([string]::IsNullOrWhiteSpace($directory)) { continue }
+        $candidate = Join-Path $directory 'python.exe'
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            $onPathPython = $candidate
+            break
+        }
+    }
+    if ($onPathPython -and $onPathPython -notmatch 'WindowsApps') {
+        $reportedPython = [System.IO.Path]::GetFullPath([string]$toolchain.tools.python)
+        $expectedPython = [System.IO.Path]::GetFullPath($onPathPython)
+        Assert-That ([string]::Equals($reportedPython, $expectedPython,
+                                       [System.StringComparison]::OrdinalIgnoreCase)) `
+            'the reported python is the one the bare name runs'
+        Assert-That (-not (@($toolchain.not_on_path) -contains 'python')) 'a python that PATH reaches is not flagged as off PATH'
+    } else {
+        Write-Host '   --  no python on PATH outside WindowsApps, so the PATH-first rule is not exercised here' -ForegroundColor DarkGray
+    }
+    if ($toolchain.tools.python) {
+        Assert-That (Test-Path -LiteralPath $toolchain.tools.python) 'a reported python path exists on disk'
+        Assert-That ($toolchain.python_root -eq (Split-Path -Parent ([string]$toolchain.tools.python))) 'python_root is the directory of the reported python'
+    }
+    if ($toolchain.tools.pip) {
+        Assert-That (Test-Path -LiteralPath $toolchain.tools.pip) 'a reported pip path exists on disk'
+    }
+    if ($toolchain.tools.pip -and $toolchain.python_root) {
+        $pipBesidePython = Join-Path $toolchain.python_root 'Scripts\pip.exe'
+        if ([string]::Equals([System.IO.Path]::GetFullPath([string]$toolchain.tools.pip),
+                             [System.IO.Path]::GetFullPath($pipBesidePython),
+                             [System.StringComparison]::OrdinalIgnoreCase)) {
+            Assert-That ($toolchain.python_pip_mismatch -eq $false) 'a pip beside the reported python is not called a mismatch'
+        }
+    }
+
     Write-Step 'Detailed tool filter'
     # A detailed result hands the probed payload back, so a name filter that only
     # shaped the summary used to be accepted and then ignored: asking for one
