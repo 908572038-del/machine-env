@@ -275,6 +275,22 @@ try {
     $dependencyRule = (ConvertFrom-CodePoints 0x4E0D, 0x8981) + '[^' + [char]0x3002 +
                       ']{0,24}' + (ConvertFrom-CodePoints 0x5206, 0x8F6E)
     Assert-That ($injected -match $dependencyRule) 'the dependency rule stays a prohibition rather than advice'
+    # The check above cannot tell "do not" from "do not, but you may": the
+    # softening words leave both characters in place. The prohibition is the
+    # whole value of the clause, so the clause is also required to carry no
+    # permission vocabulary at all. Slicing from the clause's own first word
+    # keeps this off the rest of the rule, where those words are harmless.
+    $clauseStart = $injected.LastIndexOf((ConvertFrom-CodePoints 0x8C03, 0x7528, 0x4E4B, 0x95F4, 0x82E5, 0x6709, 0x4F9D, 0x8D56))
+    Assert-That ($clauseStart -ge 0) 'the dependency clause is still present'
+    $dependencyClause = if ($clauseStart -ge 0) { $injected.Substring($clauseStart) } else { '' }
+    $softeners = [ordered]@{
+        (ConvertFrom-CodePoints 0x5EFA, 0x8BAE) = 'suggests'
+        (ConvertFrom-CodePoints 0x53EF, 0x4EE5) = 'permits'
+        (ConvertFrom-CodePoints 0x8003, 0x8651) = 'invites consideration'
+    }
+    foreach ($softener in $softeners.Keys) {
+        Assert-That (-not $dependencyClause.Contains([string]$softener)) "the dependency clause does not $($softeners[$softener]) instead of prohibiting"
+    }
 
     Write-Step 'Protocol edges'
     $handshake = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}'
