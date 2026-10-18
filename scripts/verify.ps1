@@ -4,12 +4,14 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
+$script:assertionCount = 0
 
 function Write-Step([string]$Text) {
     Write-Host "`n== $Text" -ForegroundColor Cyan
 }
 
 function Assert-That([bool]$Condition, [string]$Text) {
+    $script:assertionCount++
     if (-not $Condition) {
         throw "verification failed: $Text"
     }
@@ -254,48 +256,100 @@ try {
         -join ($Codes | ForEach-Object { [char]$_ })
     }
     $injected = ([string]$byId['1'].result.instructions).Trim()
-    Assert-That ($injected.Length -gt 100) 'initialize carries the injectable rule'
-    $obligations = [ordered]@{
-        (ConvertFrom-CodePoints 0x672C, 0x673A, 0x73AF, 0x5883, 0x5FC5, 0x987B, 0x5B9E, 0x6D4B) = 'the rule requires measuring the machine rather than assuming'
-        (ConvertFrom-CodePoints 0x5148, 0x67E5) = 'the rule requires consulting this MCP first'
-        (ConvertFrom-CodePoints 0x53EA, 0x8BFB) = 'the rule states this MCP is read-only'
-        (ConvertFrom-CodePoints 0x4E0D, 0x4E0B, 0x8F7D) = 'the rule withholds downloads'
-        ((ConvertFrom-CodePoints 0x4E0D, 0x652F, 0x6301) + ' &&') = 'the rule carries the shell-constraint guidance'
-        'source=unknown' = 'the rule defines what an unverified source means'
-        (ConvertFrom-CodePoints 0x6709, 0x4F9D, 0x8D56) = 'the rule keeps dependent calls in separate rounds'
-    }
-    foreach ($obligation in $obligations.Keys) {
-        Assert-That ($injected.Contains([string]$obligation)) $obligations[$obligation]
+    $clauseMarker = ConvertFrom-CodePoints 0x8C03, 0x7528, 0x4E4B, 0x95F4, 0x82E5, 0x6709, 0x4F9D, 0x8D56
+    $forbidWord = ConvertFrom-CodePoints 0x4E0D, 0x8981
+    $adviceWord = ConvertFrom-CodePoints 0x5EFA, 0x8BAE
+    $roundWord = ConvertFrom-CodePoints 0x5206, 0x8F6E
+    $sendWord = ConvertFrom-CodePoints 0x53D1, 0x9001
+    $softeners = [ordered]@{
+        (ConvertFrom-CodePoints 0x5EFA, 0x8BAE) = 'suggests'
+        (ConvertFrom-CodePoints 0x53EF, 0x4EE5) = 'permits'
+        (ConvertFrom-CodePoints 0x8003, 0x8651) = 'invites consideration'
     }
     # A keyword proves the topic survived; it cannot tell an obligation from a
     # suggestion. The dependency rule is the one clause whose whole value is that
     # it forbids something, so it is checked in its imperative form: "not in the
     # same batch, send in separate rounds". Softened to advice ("consider sending
     # separately") the keyword would still match and the rule would be gone.
-    $dependencyRule = (ConvertFrom-CodePoints 0x4E0D, 0x8981) + '[^' + [char]0x3002 +
-                      ']{0,24}' + (ConvertFrom-CodePoints 0x5206, 0x8F6E)
-    Assert-That ($injected -match $dependencyRule) 'the dependency rule stays a prohibition rather than advice'
-    # The check above cannot tell "do not" from "do not, but you may": the
-    # softening words leave both characters in place. The prohibition is the
-    # whole value of the clause, so the clause is also required to carry no
-    # permission vocabulary at all. Slicing from the clause's own first word
-    # keeps this off the rest of the rule, where those words are harmless.
-    $clauseStart = $injected.LastIndexOf((ConvertFrom-CodePoints 0x8C03, 0x7528, 0x4E4B, 0x95F4, 0x82E5, 0x6709, 0x4F9D, 0x8D56))
-    Assert-That ($clauseStart -ge 0) 'the dependency clause is still present'
-    $dependencyClause = if ($clauseStart -ge 0) { $injected.Substring($clauseStart) } else { '' }
-    # Deleting the clause makes the slice empty, which would make every check
-    # below pass. The two words are asserted first so an empty slice cannot be
-    # mistaken for a clean one.
-    Assert-That ($dependencyClause.Contains((ConvertFrom-CodePoints 0x5206, 0x8F6E))) 'the dependency clause still names the action it requires'
-    Assert-That ($dependencyClause.Contains((ConvertFrom-CodePoints 0x53D1, 0x9001))) 'the dependency clause still says to send in rounds'
-    $softeners = [ordered]@{
-        (ConvertFrom-CodePoints 0x5EFA, 0x8BAE) = 'suggests'
-        (ConvertFrom-CodePoints 0x53EF, 0x4EE5) = 'permits'
-        (ConvertFrom-CodePoints 0x8003, 0x8651) = 'invites consideration'
+    #
+    # This is a function rather than a run of assertions because it also has to
+    # be run against text that is deliberately broken. An assertion nobody has
+    # ever seen fail is a claim, not a test: this block once had an empty-clause
+    # hole that made all three of its vocabulary checks pass on nothing at all,
+    # and nothing in the suite would have found it. The list of problems, not a
+    # sequence of throws, is what makes that possible.
+    function Get-RuleProblems([string]$Text) {
+        $problems = New-Object System.Collections.Generic.List[string]
+        if ($Text.Length -le 100) { $problems.Add('rule-truncated') }
+        $obligations = [ordered]@{
+            (ConvertFrom-CodePoints 0x672C, 0x673A, 0x73AF, 0x5883, 0x5FC5, 0x987B, 0x5B9E, 0x6D4B) = 'measure-the-machine'
+            (ConvertFrom-CodePoints 0x5148, 0x67E5) = 'consult-first'
+            (ConvertFrom-CodePoints 0x53EA, 0x8BFB) = 'read-only'
+            (ConvertFrom-CodePoints 0x4E0D, 0x4E0B, 0x8F7D) = 'no-downloads'
+            ((ConvertFrom-CodePoints 0x4E0D, 0x652F, 0x6301) + ' &&') = 'shell-constraint'
+            'source=unknown' = 'unknown-source'
+            (ConvertFrom-CodePoints 0x6709, 0x4F9D, 0x8D56) = 'dependent-rounds'
+        }
+        foreach ($obligation in $obligations.Keys) {
+            if (-not $Text.Contains([string]$obligation)) {
+                $problems.Add('missing-' + $obligations[$obligation])
+            }
+        }
+        $prohibition = $forbidWord + '[^' + [char]0x3002 + ']{0,24}' + $roundWord
+        if (-not ($Text -match $prohibition)) { $problems.Add('dependency-softened') }
+        # Slicing from the clause's own first word keeps the vocabulary check off
+        # the rest of the rule, where those words are harmless.
+        $clauseStart = $Text.LastIndexOf($clauseMarker)
+        if ($clauseStart -lt 0) {
+            $problems.Add('dependency-clause-missing')
+            # With no clause the slice would be empty, and an empty slice
+            # contains no forbidden word. Stopping here is what closes that hole.
+            return $problems
+        }
+        $clause = $Text.Substring($clauseStart)
+        if (-not $clause.Contains($roundWord)) { $problems.Add('clause-names-no-action') }
+        if (-not $clause.Contains($sendWord)) { $problems.Add('clause-does-not-say-send') }
+        foreach ($softener in $softeners.Keys) {
+            if ($clause.Contains([string]$softener)) { $problems.Add('softened-to-advice') }
+        }
+        return $problems
     }
-    foreach ($softener in $softeners.Keys) {
-        Assert-That (-not $dependencyClause.Contains([string]$softener)) "the dependency clause does not soften into advice (found the word that $($softeners[$softener]))"
+    $ruleProblems = @(Get-RuleProblems $injected)
+    $problemList = if ($ruleProblems.Count -eq 0) { '' } else { ' (problems: ' + ($ruleProblems -join ', ') + ')' }
+    Assert-That ($ruleProblems.Count -eq 0) ('the initialize rule carries every obligation, still forbids rather than advises, and its clause still names the action' + $problemList)
+    # The checker only earns trust by biting. Each mutation below is a way this
+    # rule could be lost while the script stayed green, applied to the real text
+    # rather than to a fixture -- a fixture would test the fixture. Every mutation
+    # must both change the text and be caught: a mutation the source no longer
+    # contains proves nothing, and would otherwise pass in silence.
+    $clauseAt = $injected.LastIndexOf($clauseMarker)
+    $mutations = @(
+        @{ Name = 'the prohibition is softened into a suggestion'
+           Text = $injected.Replace($forbidWord, $adviceWord)
+           Expect = 'dependency-softened' },
+        @{ Name = 'the dependency clause is deleted outright'
+           Text = if ($clauseAt -ge 0) { $injected.Substring(0, $clauseAt) } else { $injected }
+           Expect = 'dependency-clause-missing' },
+        @{ Name = 'the rule is emptied'
+           Text = ''
+           Expect = 'rule-truncated' }
+    )
+    foreach ($mutation in $mutations) {
+        Assert-That ($mutation.Text -ne $injected) "the self-test can still break the rule when $($mutation.Name)"
+        $caught = @(Get-RuleProblems $mutation.Text)
+        Assert-That ($caught -contains $mutation.Expect) "the checker catches it when $($mutation.Name) (reported: $(if ($caught.Count -eq 0) { 'nothing' } else { $caught -join ', ' }))"
     }
+    # The table is itself a thing that can be emptied: delete every row and the
+    # loop above runs zero times and the suite stays green -- the same hole one
+    # level up. So the table is held to the standard it exists to enforce: one
+    # mutation per hole class, named by the problem it must produce. A fourth
+    # mutation is welcome; losing one is not.
+    $holeClasses = @('dependency-softened', 'dependency-clause-missing', 'rule-truncated')
+    foreach ($hole in $holeClasses) {
+        $covered = @($mutations | Where-Object { $_.Expect -eq $hole }).Count
+        Assert-That ($covered -ge 1) "the self-test still has a mutation that trips $hole"
+    }
+    Assert-That ((@($mutations | ForEach-Object { $_.Name } | Sort-Object -Unique)).Count -eq @($mutations).Count) 'no two self-test mutations share a name'
 
     Write-Step 'Protocol edges'
     $handshake = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}'
@@ -550,6 +604,33 @@ try {
     $skippedEntries = @($entries | Where-Object { $_.Value.skipped -eq $true })
     Assert-That ($entries.Count -gt 0 -and $skippedEntries.Count -eq $entries.Count) 'offline skips every endpoint'
     Assert-That (@($skippedEntries | Where-Object { $_.Value.reason -ne 'offline' }).Count -eq 0) 'a skipped endpoint records why'
+    # The budget window belongs to a summary that reports endpoints over budget.
+    # With every endpoint skipped there is nothing over budget, so the offline
+    # summary must not state one -- and a reader who sees a window there would be
+    # reading a promise about a probe that never happened.
+    #
+    # The negative half is checked together with its positive half on purpose: a
+    # summary that lost its budget sentence everywhere would satisfy "offline
+    # states none" while telling every other caller nothing. The offline form is
+    # asserted first so an empty or truncated summary cannot pass as a clean one.
+    $windowPattern = (ConvertFrom-CodePoints 0x9884, 0x7B97) + '\s*\d+\s*ms'
+    $proseOffline = [string](Invoke-Stdio @('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_network","arguments":{"offline":true}}}'))[0].result.content[0].text
+    Assert-That ($proseOffline.Length -gt 20 -and $proseOffline -match ((ConvertFrom-CodePoints 0x5168, 0x90E8, 0x7AEF, 0x70B9, 0x5DF2, 0x8DF3, 0x8FC7))) 'an offline probe still describes itself rather than returning a blank summary'
+    Assert-That ($proseOffline -notmatch $windowPattern) 'an offline summary does not state a budget window for endpoints it never tried'
+    # The other half of that pair, on a budget tight enough that endpoints really
+    # do run out: whenever a summary reports one over budget it has to say which
+    # budget. This is an implication rather than a flat expectation because a
+    # host fast enough to finish four endpoints inside the floor would make a
+    # flat expectation fail for a reason that is not a defect. When that happens
+    # the line reports SKIP, not OK -- a check that silently did nothing is worse
+    # than one that says so.
+    $proseTight = [string](Invoke-Stdio @('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_network","arguments":{"refresh":true,"timeout_ms":1}}}'))[0].result.content[0].text
+    $overBudgetWord = ConvertFrom-CodePoints 0x8D85, 0x8FC7, 0x9884, 0x7B97
+    if ($proseTight.Contains($overBudgetWord)) {
+        Assert-That ($proseTight -match $windowPattern) 'a summary that reports an endpoint over budget also states which budget ran out'
+    } else {
+        Write-Host '   SKIP a summary that reports an endpoint over budget also states which budget ran out (this host finished every endpoint inside the floor budget; the implication had no subject)' -ForegroundColor DarkYellow
+    }
     # Out-of-range budgets are clamped rather than rejected: a rejected call
     # would cost the caller the whole answer instead of the nearest budget.
     $floor = (Invoke-Stdio @('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_network","arguments":{"offline":true,"timeout_ms":1,"detail":true}}}'))[0].result.structuredContent
@@ -764,7 +845,10 @@ try {
     ) | Where-Object { Test-Path -LiteralPath $_ }
     Assert-That ($strayConfigs.Count -eq 0) 'uninstalling creates no configuration for a client that was never registered'
 
-    Write-Host "`nVERIFY: PASS" -ForegroundColor Green
+    # The count is reported by the run rather than counted by whoever reads the
+    # log. "We have N assertions" was a figure copied by hand from a scrollback,
+    # which is how it goes stale the first time a block is merged.
+    Write-Host "`nVERIFY: PASS ($script:assertionCount assertions)" -ForegroundColor Green
 } finally {
     $env:LOCALAPPDATA = $savedLocalAppData
     $env:APPDATA = $savedAppData
