@@ -537,6 +537,39 @@ try {
     Assert-That ($coalesced._meta.elapsed_ms -le $probed._meta.elapsed_ms) 'a coalesced refresh costs no more than the probe it replaces'
     Assert-That ($coalesced.structuredContent.count -gt 0) 'a coalesced refresh still returns the fact, not an empty answer'
 
+    Write-Step 'Response ordering'
+    # Order is best-effort: kept while the answer ahead is merely slower, given
+    # up only after the window has passed. A client that positions answers
+    # instead of correlating them by id can turn the window off entirely.
+    $slowThenFast = @(
+        $handshake,
+        '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_network","arguments":{"refresh":true,"timeout_ms":2500}}}',
+        '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_apps","arguments":{"limit":1}}}',
+        '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"get_apps","arguments":{"limit":1}}}'
+    )
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    $ordered = Invoke-Stdio $slowThenFast
+    $clock.Stop()
+    $orderedIds = (@($ordered) | ForEach-Object { [string]$_.id }) -join ','
+    if ($clock.ElapsedMilliseconds -gt 600) {
+        Assert-That ($orderedIds -eq '1,3,4,2') "a slow answer does not hold back the ones behind it (got $orderedIds)"
+    } else {
+        Write-Host '   SKIP  the slow request finished too quickly to exercise the window' -ForegroundColor DarkYellow
+    }
+    $savedWindow = $env:MACHINE_ENV_REORDER_WINDOW_MS
+    $env:MACHINE_ENV_REORDER_WINDOW_MS = '0'
+    try {
+        $strict = Invoke-Stdio $slowThenFast
+        $strictIds = (@($strict) | ForEach-Object { [string]$_.id }) -join ','
+        Assert-That ($strictIds -eq '1,2,3,4') "the window can be turned off for a position-based client (got $strictIds)"
+    } finally {
+        if ($null -eq $savedWindow) {
+            Remove-Item Env:MACHINE_ENV_REORDER_WINDOW_MS -ErrorAction SilentlyContinue
+        } else {
+            $env:MACHINE_ENV_REORDER_WINDOW_MS = $savedWindow
+        }
+    }
+
     Write-Step 'Live session'
     $live = @(Invoke-LiveSession @(
         $handshake,

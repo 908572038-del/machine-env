@@ -15,6 +15,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cwctype>
 #include <iostream>
 #include <iomanip>
@@ -999,7 +1000,10 @@ Json dispatch(const Json& request, bool& has_response) {
             "测试、运行命令时，先查本 MCP 再作答。本 MCP 只读：未经用户明确要求或批准，"
             "不下载、不安装、不运行安装程序，不修改全局环境。未检测到即说明缺失或给出"
             "替代方案，不要假设已安装；source=unknown 表示未验证，不得当作支持。"
-            "留意返回值中的约束（如不支持 &&、原生输出非 UTF-8）并据此改写命令。";
+            "留意返回值中的约束（如不支持 &&、原生输出非 UTF-8）并据此改写命令。"
+            "同一批并发调用中，若某个请求明显更慢，其后的答案可能先到："
+            "响应请按 id 关联，不要按到达顺序对应请求；需要严格按序可设 "
+            "MACHINE_ENV_REORDER_WINDOW_MS=0。";
         Json response = Json::object();
         response["jsonrpc"] = "2.0";
         response["id"] = id;
@@ -1653,25 +1657,89 @@ int wmain(int argc, wchar_t** argv) {
         // answer per request, in the sequence it asked, even though JSON-RPC
         // correlates them by id: emitting out of order would be legal and still
         // break a client that assumes otherwise.
+        //
+        // Preserving it absolutely has a price that only shows up in a burst:
+        // with a 2.5 s network probe first, forty-nine 20 ms calls behind it
+        // were all still unanswered at 2.5 s -- the same requests, sent in a
+        // different order, finish in 22 ms. The window below keeps the order a
+        // client expects as long as the answer ahead is merely slower, and gives
+        // up on it only when waiting would cost more than the window itself.
+        // Set MACHINE_ENV_REORDER_WINDOW_MS=0 to get strict ordering back.
         std::mutex emit_mutex;
-        std::map<std::uint64_t, std::pair<bool, Json>> completed;
+        struct Pending {
+            bool respond = false;
+            Json response;
+            std::chrono::steady_clock::time_point ready_at;
+        };
+        std::map<std::uint64_t, Pending> completed;
         std::uint64_t next_to_emit = 0;
         std::uint64_t next_sequence = 0;
+        std::uint64_t reorder_skips = 0;
+        std::int64_t reorder_max_hold_ms = 0;
+        std::chrono::steady_clock::time_point last_reorder_report{};
         std::vector<std::thread> workers;
+
+        const int reorder_window_ms = [] {
+            constexpr int kDefault = 200;
+            constexpr int kMax = 2000;
+            constexpr DWORD kBufferChars = 32;
+            wchar_t buffer[kBufferChars]{};
+            const DWORD length = GetEnvironmentVariableW(
+                L"MACHINE_ENV_REORDER_WINDOW_MS", buffer, kBufferChars);
+            if (length == 0 || length >= kBufferChars) return kDefault;
+            const int requested = _wtoi(buffer);
+            if (requested < 0) return 0;
+            return requested > kMax ? kMax : requested;
+        }();
 
         // Writes every answer whose turn has come. Called with the mutex free so
         // the flush never happens while another thread is waiting to record its
-        // result; the map is the buffer for answers that finished early.
+        // result; the map is the buffer for answers that finished early. An
+        // answer that has waited out the window is emitted ahead of a gap,
+        // because a gap is a promise about order, not a reason to hold data the
+        // caller could already use.
         const auto emit_ready = [&]() {
             std::lock_guard<std::mutex> lock(emit_mutex);
-            for (auto entry = completed.find(next_to_emit);
-                 entry != completed.end();
-                 entry = completed.find(next_to_emit)) {
-                if (entry->second.first)
-                    std::cout << dump_json(entry->second.second) << '\n'
+            for (;;) {
+                auto entry = completed.find(next_to_emit);
+                if (entry != completed.end()) {
+                    if (entry->second.respond)
+                        std::cout << dump_json(entry->second.response) << '\n'
+                                  << std::flush;
+                    completed.erase(entry);
+                    ++next_to_emit;
+                    continue;
+                }
+                if (reorder_window_ms <= 0 || completed.empty()) return;
+                auto oldest = completed.begin();
+                for (auto candidate = completed.begin();
+                     candidate != completed.end(); ++candidate)
+                    if (candidate->second.ready_at < oldest->second.ready_at)
+                        oldest = candidate;
+                const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - oldest->second.ready_at);
+                if (waited.count() < reorder_window_ms) return;
+                if (oldest->second.respond)
+                    std::cout << dump_json(oldest->second.response) << '\n'
                               << std::flush;
-                completed.erase(entry);
-                ++next_to_emit;
+                completed.erase(oldest);
+                ++reorder_skips;
+                // How long an answer was actually held before the order promise
+                // was given up is the number a client cares about, so it is
+                // reported alongside the count rather than left to be inferred
+                // from the window setting.
+                if (waited.count() > reorder_max_hold_ms)
+                    reorder_max_hold_ms = waited.count();
+                const auto now = std::chrono::steady_clock::now();
+                if (last_reorder_report.time_since_epoch().count() == 0 ||
+                    now - last_reorder_report >= std::chrono::seconds(5)) {
+                    last_reorder_report = now;
+                    std::cerr << "machine-env-cpp: emitted past a gap after "
+                              << waited.count() << " ms (window "
+                              << reorder_window_ms << " ms, "
+                              << reorder_skips << " reordered, max hold "
+                              << reorder_max_hold_ms << " ms)\n";
+                }
             }
         };
 
@@ -1679,8 +1747,21 @@ int wmain(int argc, wchar_t** argv) {
                                 Json response) {
             {
                 std::lock_guard<std::mutex> lock(emit_mutex);
-                completed[sequence] = {respond, std::move(response)};
+                completed[sequence] =
+                    Pending{respond, std::move(response),
+                            std::chrono::steady_clock::now()};
             }
+            emit_ready();
+            if (reorder_window_ms <= 0) return;
+            // A finished answer that is still behind a gap cannot expect the
+            // slow request to wake it: that request is still asleep itself. This
+            // worker is already finished, so it waits out the window and flushes
+            // -- which is how the reorder costs no thread of its own.
+            {
+                std::lock_guard<std::mutex> lock(emit_mutex);
+                if (next_to_emit > sequence) return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(reorder_window_ms));
             emit_ready();
         };
 
@@ -1715,26 +1796,41 @@ int wmain(int argc, wchar_t** argv) {
                 record(sequence, true, std::move(response));
                 continue;
             }
-            workers.emplace_back([&, sequence, request]() {
+            // One request's work, named so it can also run on the reading
+            // thread when no worker can be started. A probe is bounded by its
+            // own budget, so running inline costs latency, not correctness.
+            const auto serve = [&](std::uint64_t sequence_number,
+                                   const Json& request_value) {
                 bool send_response = false;
                 Json response;
                 try {
                     try {
-                        response = dispatch(request, send_response);
+                        response = dispatch(request_value, send_response);
                     } catch (const std::exception& error) {
                         // A probe that failed is an internal error for this
                         // request, not a parse error, and must echo the id.
                         response =
-                            rpc_error(request.get("id"), -32603, error.what());
+                            rpc_error(request_value.get("id"), -32603, error.what());
                         send_response = true;
                     }
                 } catch (...) {
-                    response = rpc_error(request.get("id"), -32603,
+                    response = rpc_error(request_value.get("id"), -32603,
                                          "internal error while dispatching");
                     send_response = true;
                 }
-                record(sequence, send_response, std::move(response));
-            });
+                record(sequence_number, send_response, std::move(response));
+            };
+            try {
+                workers.emplace_back([&, sequence, request]() { serve(sequence, request); });
+            } catch (const std::exception&) {
+                // No worker can be started, which only happens once the process
+                // is already out of thread resources. Answering from the reading
+                // thread degrades this session to serial execution; returning an
+                // error instead would drop an answer that could still be given,
+                // and letting the exception escape ended the process and lost
+                // every request in flight.
+                serve(sequence, request);
+            }
         }
         // Every answer still owed is written before the process leaves: the loop
         // stops reading at end of input, which means "no more requests", not

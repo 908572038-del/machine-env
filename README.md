@@ -155,11 +155,26 @@ which is where call-level measurements live so they never mix into the probed
 facts. Each tool description restates the read-only constraint, so a harness
 that does not inject `initialize.instructions` still sees it.
 
-Requests are dispatched concurrently and answered in the order they were asked.
-A client that pipelines calls pays for the slowest probe instead of the sum of
-all of them (measured: a burst of four calls went from 5.6s to 2.6s), while still
-receiving exactly one answer per request, in sequence — out-of-order answers would
-be legal JSON-RPC and would still break a client that assumes otherwise.
+Requests are dispatched concurrently and answered by `id`, which is how JSON-RPC
+2.0 correlates them. A client that pipelines calls pays for the slowest probe
+instead of the sum of all of them (measured: a burst of four calls went from 5.6s
+to 2.6s). Answers are emitted in request order while every earlier request can
+still complete promptly, but a finished answer is not held indefinitely behind a
+call that has genuinely stalled: once it has waited longer than the reorder window
+(default 200 ms, set by `MACHINE_ENV_REORDER_WINDOW_MS`, range 0–2000), it is
+emitted ahead of the missing earlier response, so one slow call cannot add its full
+latency to every answer behind it. Responses are matched to requests by `id`; a
+client that needs strictly in-order emission sets `MACHINE_ENV_REORDER_WINDOW_MS=0`
+(the per-client install writes this for a known positional reader). Emitting out of
+order is legal JSON-RPC 2.0, and reading responses positionally without checking
+`id` is relying on behaviour the protocol does not promise. Execution order within
+one batch is unconstrained too — the requests run concurrently and may complete in
+any order — so calls that depend on each other must be sent in separate rounds
+(wait for one batch's responses before sending the next) rather than batched
+together on the assumption that they run in request order. This matters most for
+side-effecting calls; every tool here is read-only and idempotent, so batching
+purely to save a round trip is safe, but the rule keeps a caller from carrying a
+"batched calls run in order" habit into a server where it would not hold.
 
 `get_tools` reports each detected
 tool on its own line in a fixed order, as `NAME = PATH`, with the version
