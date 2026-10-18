@@ -283,13 +283,18 @@ try {
     $clauseStart = $injected.LastIndexOf((ConvertFrom-CodePoints 0x8C03, 0x7528, 0x4E4B, 0x95F4, 0x82E5, 0x6709, 0x4F9D, 0x8D56))
     Assert-That ($clauseStart -ge 0) 'the dependency clause is still present'
     $dependencyClause = if ($clauseStart -ge 0) { $injected.Substring($clauseStart) } else { '' }
+    # Deleting the clause makes the slice empty, which would make every check
+    # below pass. The two words are asserted first so an empty slice cannot be
+    # mistaken for a clean one.
+    Assert-That ($dependencyClause.Contains((ConvertFrom-CodePoints 0x5206, 0x8F6E))) 'the dependency clause still names the action it requires'
+    Assert-That ($dependencyClause.Contains((ConvertFrom-CodePoints 0x53D1, 0x9001))) 'the dependency clause still says to send in rounds'
     $softeners = [ordered]@{
         (ConvertFrom-CodePoints 0x5EFA, 0x8BAE) = 'suggests'
         (ConvertFrom-CodePoints 0x53EF, 0x4EE5) = 'permits'
         (ConvertFrom-CodePoints 0x8003, 0x8651) = 'invites consideration'
     }
     foreach ($softener in $softeners.Keys) {
-        Assert-That (-not $dependencyClause.Contains([string]$softener)) "the dependency clause does not $($softeners[$softener]) instead of prohibiting"
+        Assert-That (-not $dependencyClause.Contains([string]$softener)) "the dependency clause does not soften into advice (found the word that $($softeners[$softener]))"
     }
 
     Write-Step 'Protocol edges'
