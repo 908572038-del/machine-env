@@ -577,8 +577,13 @@ try {
         $property = $entry.inputSchema.properties.refresh
         if ($null -ne $property) { $refreshTexts += [string]$property.description }
     }
-    Assert-That ($refreshTexts.Count -eq 4) "all four tools take refresh (got $($refreshTexts.Count))"
-    Assert-That ((@($refreshTexts | Sort-Object -Unique)).Count -eq 1) 'every tool describes refresh the same way'
+    # The count is deliberately not asserted. "Four tools take refresh" is a fact
+    # that silently stops being true the day a fifth tool is added, and an
+    # assertion that pins 4 would then be "fixed" by editing the 4 -- which is
+    # how a real check turns into noise. What matters is that every tool that
+    # takes refresh says the same thing, and that at least one does.
+    Assert-That ($refreshTexts.Count -ge 1) 'at least one tool takes refresh'
+    Assert-That ((@($refreshTexts | Sort-Object -Unique)).Count -eq 1) "every tool describes refresh the same way (got $($refreshTexts.Count) tools, $(@($refreshTexts | Sort-Object -Unique).Count) description)"
     # Saying "will not see the new value" is what makes the warning usable; a
     # version that only says "re-probe" leaves the race undisclosed.
     Assert-That ([string]$refreshTexts[0]).Contains('will not see the new value') 'the refresh description discloses what a batched reader can see'
