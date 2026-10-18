@@ -736,6 +736,34 @@ try {
     Assert-That ($coalesced.structuredContent._cache.reason -eq 'refresh coalesced') 'a refresh inside the minimum interval is coalesced'
     Assert-That ($coalesced._meta.elapsed_ms -le $probed._meta.elapsed_ms) 'a coalesced refresh costs no more than the probe it replaces'
     Assert-That ($coalesced.structuredContent.count -gt 0) 'a coalesced refresh still returns the fact, not an empty answer'
+    # Three identical refreshes in one batch need one probe, not three. Which of
+    # the three pays for it is a race and is not asserted; how many pay is not.
+    # This is the only evidence in the suite that the in-process attempt table
+    # works, so it counts real probes rather than reading a counter:
+    # hit=false && shared=false && stale=false is exactly "this call probed".
+    # Force a miss first. A probe from a moment ago would put all three inside
+    # the five-second coalescing window, and the burst would then cost zero
+    # probes -- correct behaviour, but it would leave "did joining work" untested
+    # while looking green.
+    if (Test-Path -LiteralPath $cacheFile) { [System.IO.File]::Delete($cacheFile) }
+    $identical = Invoke-Stdio @(
+        $handshake,
+        '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_system","arguments":{"refresh":true,"detail":true}}}',
+        '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_system","arguments":{"refresh":true,"detail":true}}}',
+        '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"get_system","arguments":{"refresh":true,"detail":true}}}'
+    )
+    # The handshake is answered too, so the three calls are picked out by id
+    # rather than counted out of everything that came back.
+    $identicalCalls = @($identical | Where-Object { $_.id -ge 2 -and $_.id -le 4 })
+    Assert-That ($identicalCalls.Count -eq 3) 'a burst of three identical refreshes is answered three times'
+    $realProbes = @($identicalCalls | Where-Object {
+        $cache = $_.result.structuredContent._cache
+        $cache.hit -eq $false -and $cache.shared -ne $true -and $cache.stale -ne $true
+    })
+    Assert-That ($realProbes.Count -eq 1) "a burst of three identical refreshes costs one probe (got $($realProbes.Count))"
+    # Every one of them answered with a fact, not a refusal to answer twice.
+    $answered = @($identicalCalls | Where-Object { $_.result.structuredContent.os })
+    Assert-That ($answered.Count -eq 3) 'every caller in the burst is answered with the fact, whichever of them probed'
 
     Write-Step 'Response ordering'
     # Order is best-effort: kept while the answer ahead is merely slower, given

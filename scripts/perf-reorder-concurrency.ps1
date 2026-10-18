@@ -233,12 +233,31 @@ foreach ($kind in $slowKinds) {
         ("max hold={0}ms (limit {1}ms) reordered={2}" -f $win.MaxHold, ($WindowMs + 50), $win.Reordered)
     }
 
-    # ---- the slow answer itself must not be pushed back ----
-    $slowSlack = $win.SlowArrive - $win.SlowElapsed
-    $slowOk = ($slowSlack -le 150)
-    if (-not $slowOk) { $script:failures.Add("$($kind.name)/slow-self : arrive-elapsed=$slowSlack ms > 150 ms") }
-    Add-Row -Case ($kind.name + '/slow-self') -Verdict $(if ($slowOk) { 'PASS' } else { 'FAIL' }) -Detail `
-    ("arrive={0}ms own_elapsed={1}ms slack={2}ms" -f $win.SlowArrive, $win.SlowElapsed, $slowSlack)
+    # ---- the slow answer itself must not be pushed back BY THE WINDOW ----
+    # arrive - own_elapsed is not "the window's hold": it is everything that happened to
+    # this request before its handler started (cross-process probe lock, thread pool,
+    # scheduling) PLUS the emit hold. Asserting a fixed 150 ms on it produced two false
+    # reds on the frozen baseline - network 2392 ms and tools-versions 72837 ms - where
+    # the reorder hold was correctly 207/214 ms and the gap was queueing long before the
+    # window existed. The only honest test is a differential one: the window run must not
+    # queue the slow request more than the strict run did, beyond the window itself.
+    $slowGapWin = $win.SlowArrive - $win.SlowElapsed
+    $slowGapStrict = if ($null -ne $strict.SlowArrive -and $null -ne $strict.SlowElapsed) { $strict.SlowArrive - $strict.SlowElapsed } else { $null }
+    if ($null -eq $slowGapStrict) {
+        Add-Row -Case ($kind.name + '/slow-queue') -Verdict 'INFO' -Detail ("queue gap window={0}ms (no strict baseline to compare)" -f $slowGapWin)
+    } else {
+        $addedByWindow = $slowGapWin - $slowGapStrict
+        $slowOk = ($addedByWindow -le 50)
+        if (-not $slowOk) { $script:failures.Add("$($kind.name)/slow-queue : the window added $addedByWindow ms of delay to the slow request (window $slowGapWin ms vs strict $slowGapStrict ms)") }
+        Add-Row -Case ($kind.name + '/slow-queue') -Verdict $(if ($slowOk) { 'PASS' } else { 'FAIL' }) -Detail `
+        ("queue gap window={0}ms strict={1}ms added={2}ms (limit 50)" -f $slowGapWin, $slowGapStrict, $addedByWindow)
+        # Anything the request waited for before its handler ran is a separate finding and
+        # must not be read as a reorder cost: report it, do not fail on it here.
+        if ($slowGapStrict -gt 150) {
+            Add-Row -Case ($kind.name + '/pre-queue') -Verdict 'INFO' -Detail `
+            ("the slow request waited {0}ms before its handler started, in the STRICT run too - that is a lock/queue cost, not a reorder cost" -f $slowGapStrict)
+        }
+    }
 
     # ---- observation only: did the window actually reorder anything? ----
     if ($null -ne $win.Reordered) {
@@ -248,7 +267,8 @@ foreach ($kind in $slowKinds) {
 
 Write-Host ''
 $reportPath = Join-Path $OutDir ("reorder-{0}.csv" -f ([DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss')))
-$script:rows | Export-Csv -Path $reportPath -NoTypeInformation -Encoding UTF8
+# Fingerprint inside the report: a CSV row without one is a number with no build attached.
+$script:rows | Select-Object *, @{ n = 'fingerprint'; e = { $fingerprint } } | Export-Csv -Path $reportPath -NoTypeInformation -Encoding UTF8
 Write-Host "report: $reportPath"
 
 $skip = @($script:rows | Where-Object { $_.verdict -eq 'SKIP' }).Count

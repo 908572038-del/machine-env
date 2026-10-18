@@ -699,12 +699,15 @@ Json string_schema(const char* description) {
 
 Json tools() {
     Json list = Json::array();
-    // One string, four tools: four copies of a timing promise drift, and this is
-    // the only place a caller is told what refresh actually does. The coalescing
-    // window is formatted from the constant the behaviour uses, so the sentence
-    // cannot outlive a change to it; it is stated in milliseconds because a
-    // seconds figure would have to be rounded, and rounding a window turns a
-    // 2500 ms setting into "2 seconds" -- a second lie of its own.
+    // One string, shared by every tool that takes refresh: a copy per tool would
+    // drift, and this is the only place a caller is told what refresh actually
+    // does. The number of such tools is not written here on purpose -- a count
+    // word in a comment stops being true the day a tool is added, and nothing
+    // fails. The coalescing window is formatted from the constant the behaviour
+    // uses, so the sentence cannot outlive a change to it; it is stated in
+    // milliseconds because a seconds figure would have to be rounded, and
+    // rounding a window turns a 2500 ms setting into "2 seconds" -- a second lie
+    // of its own.
     const std::string refresh_description =
         "Bypass the cache and re-probe. A complete probe result is stored for "
         "later callers, so a non-refresh call sent in the same batch may be "
@@ -715,7 +718,12 @@ Json tools() {
         std::to_string(refresh_min_interval_ms()) +
         " ms of the previous one is coalesced rather than repeated: the result "
         "then says \"refresh coalesced\" and the facts are the probe that already "
-        "ran, not a new one.";
+        "ran, not a new one. A call may also be answered by a probe that was "
+        "already running for another caller (the result says \"attempt shared\") "
+        "or, if that probe outlasts this call, by an older entry whose age is "
+        "reported (\"probe still running\" or \"probe failed, stale kept\"); "
+        "either way the answer states which of these happened, so a caller that "
+        "needs a fresh fact can tell whether it got one.";
 
     Json system = object_schema();
     system["properties"]["refresh"] =
@@ -1774,25 +1782,40 @@ int wmain(int argc, wchar_t** argv) {
         }();
         // Written by the reading thread before it hands the request to a worker,
         // read while emitting an answer, so it lives under the same mutex as the
-        // buffer rather than being a second thing to keep in step.
-        std::map<std::uint64_t, std::string> tool_by_sequence;
+        // buffer rather than being a second thing to keep in step. A call number
+        // is assigned here: one-based, counting nothing but tools/call, because
+        // a harness reads this line to pair a tool call with its answer and
+        // should never have to know that initialize and tools/list also consume
+        // numbers it will not see. The ordering sequence above is untouched --
+        // it still numbers every request, which is what the emitter needs.
+        struct ToolCall {
+            std::string tool;
+            std::uint64_t call_seq = 0;
+        };
+        std::map<std::uint64_t, ToolCall> call_by_sequence;
+        std::uint64_t calls_seen = 0;
 
         const auto emit_response = [&](std::uint64_t sequence, const Pending& pending,
                                        bool reordered) {
             std::cout << dump_json(pending.response) << '\n' << std::flush;
             if (!diag_enabled) return;
+            const auto named = call_by_sequence.find(sequence);
+            // A response to anything but a tool call gets no line at all: the
+            // fields describe a probe-backed call, and a handshake has neither a
+            // probe nor a call number to report.
+            if (named == call_by_sequence.end()) return;
             // How long a finished answer stood in the buffer before it was
             // written: near zero when its turn came in order, and the measured
             // hold when the order promise was given up for it.
             const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - pending.ready_at);
-            const auto named = tool_by_sequence.find(sequence);
-            const char* tool =
-                named == tool_by_sequence.end() ? "-" : named->second.c_str();
-            std::cerr << "machine-env-cpp diag: seq=" << sequence << " tool=" << tool
+            std::cerr << "machine-env-cpp diag: seq=" << named->second.call_seq
+                      << " tool=" << named->second.tool
                       << " wait_ms=" << waited.count()
-                      << " reordered=" << (reordered ? 1 : 0) << '\n';
-            tool_by_sequence.erase(sequence);
+                      << " reordered=" << (reordered ? 1 : 0)
+                      << " attempts=" << probe_attempts_started_total()
+                      << " inflight_peak=" << probe_inflight_peak() << '\n';
+            call_by_sequence.erase(named);
         };
 
         // Writes every answer whose turn has come. Called with the mutex free so
@@ -1951,8 +1974,10 @@ int wmain(int argc, wchar_t** argv) {
             };
             if (request.get("method").as_string() == "tools/call") {
                 std::lock_guard<std::mutex> lock(emit_mutex);
-                tool_by_sequence[sequence] =
-                    request.get("params").get("name").as_string();
+                ToolCall call;
+                call.tool = request.get("params").get("name").as_string();
+                call.call_seq = ++calls_seen;
+                call_by_sequence[sequence] = call;
             }
             try {
                 auto finished = std::make_shared<std::atomic_bool>(false);

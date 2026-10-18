@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -34,6 +35,13 @@ namespace fs = std::filesystem;
 constexpr char kServerVersion[] = "0.3.1";
 constexpr int kDefaultTtl = 24 * 60 * 60;
 constexpr int kNetworkTtl = 10 * 60;
+// Installing a compiler or a package manager and then being told it is not
+// there is the failure a long TTL buys: the inventory was measured before the
+// install and every call for the next day repeats it. An hour is short enough
+// that the answer catches up within a working session and long enough that a
+// batch of calls shares one probe -- locating tools without running them costs
+// well under a second, so the shorter window is affordable.
+constexpr int kToolchainTtl = 60 * 60;
 
 std::string utf8(const std::wstring& value) {
     if (value.empty()) return {};
@@ -771,6 +779,57 @@ constexpr DWORD kProbeMutexWaitMs = 3000;
 // five clients starting together would otherwise run five full probes.
 constexpr int kRefreshMinIntervalMs = 5000;
 
+// Two counters a load harness reads and nothing else does. They are counted
+// where a probe actually starts, not where a request arrives: a caller that
+// joins a running attempt, is answered by the coalescing window, or reads an
+// entry starts no probe at all, so counting requests instead would make the
+// number rise with traffic and hide the only thing it is meant to show -- how
+// much probe work was running at once, and what the worst of it was.
+std::atomic<std::uint64_t> g_probe_attempts_started{0};
+std::atomic<std::uint64_t> g_probe_inflight{0};
+std::atomic<std::uint64_t> g_probe_inflight_peak{0};
+
+// Counts one probe for its whole duration, including every failure path, so the
+// gauge returns to zero however the probe ended. A probe that is itself built
+// from another probe (get_system reports hardware, which is also a standalone
+// question) counts once: `depth` is per thread, so only the outermost scope
+// moves the counters and one request can never look like two.
+class ProbeAttemptScope {
+public:
+    ProbeAttemptScope() {
+        if (depth() != 0) {
+            ++depth();
+            return;
+        }
+        ++depth();
+        g_probe_attempts_started.fetch_add(1, std::memory_order_relaxed);
+        const std::uint64_t now =
+            g_probe_inflight.fetch_add(1, std::memory_order_acq_rel) + 1;
+        std::uint64_t peak = g_probe_inflight_peak.load(std::memory_order_relaxed);
+        while (peak < now &&
+               !g_probe_inflight_peak.compare_exchange_weak(
+                   peak, now, std::memory_order_relaxed, std::memory_order_relaxed)) {
+        }
+    }
+    ~ProbeAttemptScope() {
+        if (--depth() != 0) return;
+        g_probe_inflight.fetch_sub(1, std::memory_order_acq_rel);
+    }
+    ProbeAttemptScope(const ProbeAttemptScope&) = delete;
+    ProbeAttemptScope& operator=(const ProbeAttemptScope&) = delete;
+
+private:
+    static int& depth() {
+        static thread_local int value = 0;
+        return value;
+    }
+};
+
+// The two getters are defined below the anonymous namespace, with the other
+// exported functions: a definition in here would have internal linkage and the
+// declaration in machine.hpp would never be satisfied.
+
+
 class NamedMutex {
 public:
     NamedMutex(const wchar_t* name, DWORD timeout_ms)
@@ -1348,6 +1407,7 @@ Json probe_display_adapters(bool& enumeration_incomplete) {
 }
 
 Json probe_hardware() {
+    ProbeAttemptScope attempt_scope;
     Json result = Json::object();
     unsigned family = 0, model = 0, stepping = 0;
     unsigned long long xcr0 = 0;
@@ -1436,6 +1496,14 @@ const std::vector<std::string>& tool_catalog_names() {
 const char* server_version() { return kServerVersion; }
 
 int refresh_min_interval_ms() { return kRefreshMinIntervalMs; }
+
+std::uint64_t probe_attempts_started_total() {
+    return g_probe_attempts_started.load(std::memory_order_relaxed);
+}
+
+std::uint64_t probe_inflight_peak() {
+    return g_probe_inflight_peak.load(std::memory_order_relaxed);
+}
 
 Json locate_tool(const std::string& name) {
     Json result = Json::object();
@@ -2232,17 +2300,92 @@ Json with_live_session_facts(const std::string& kind, Json payload) {
     return payload;
 }
 
+// One probe per kind at a time inside this process, and everyone else receives
+// that probe's answer. The cross-process mutex orders probes between processes
+// but cannot hand a result over, so a waiter that lost that race had nothing to
+// wait for and probed too; because every waiter's patience expired at the same
+// mark, one slow probe became all of them at once. Measured on this machine
+// before this table existed: 100 concurrent refreshes of get_network held at 120
+// threads for three seconds, then 505 at once, p50 4429 ms for a probe that
+// takes 1219 ms. Sharing the answer removes the reason to queue at all.
+struct Attempt {
+    std::mutex mutex;
+    std::condition_variable ready;
+    bool done = false;
+    // An answer worth giving to someone else. A probe that failed, or one that
+    // was answered from the cache before it started, wakes the waiters without
+    // giving them anything: they must judge for themselves.
+    bool shareable = false;
+    Json result;
+};
+
+std::mutex attempt_table_mutex;
+std::map<std::string, std::shared_ptr<Attempt>> attempt_table;
+
+void finish_attempt(const std::string& kind, std::shared_ptr<Attempt> attempt,
+                    Json result, bool shareable) {
+    {
+        std::lock_guard<std::mutex> lock(attempt->mutex);
+        attempt->result = std::move(result);
+        attempt->shareable = shareable;
+        attempt->done = true;
+    }
+    attempt->ready.notify_all();
+    std::lock_guard<std::mutex> lock(attempt_table_mutex);
+    const auto entry = attempt_table.find(kind);
+    if (entry != attempt_table.end() && entry->second == attempt)
+        attempt_table.erase(entry);
+}
+
+// Holds this caller's claim on the attempt it created, and releases it on every
+// way out including an exception. A claim that outlived its probe would make
+// every later refresh wait out its patience for an answer that is never coming.
+class AttemptClaim {
+public:
+    AttemptClaim(std::string kind, std::shared_ptr<Attempt> attempt)
+        : kind_(std::move(kind)), attempt_(std::move(attempt)) {}
+    ~AttemptClaim() { release(); }
+
+    void publish(Json result) {
+        auto attempt = std::move(attempt_);
+        attempt_ = nullptr;
+        if (!attempt) return;
+        // Only an answer the next caller would have asked for is handed on. A
+        // probe that ran out of its budget, or one that failed, is neither: the
+        // coalescing window above refuses exactly these payloads, and sharing
+        // one would give a caller a truncated or failed answer to a question it
+        // put differently. Those waiters are woken without a copy instead.
+        const Json& over_budget = result.get("budget_exhausted");
+        const bool complete =
+            !(over_budget.is_bool() && over_budget.as_bool()) &&
+            !result.contains("error");
+        finish_attempt(kind_, std::move(attempt), complete ? result : Json(),
+                       complete);
+    }
+    // Wakes the waiters without an answer: the result they wanted is in the
+    // cache, so they read it instead of guessing.
+    void release() {
+        auto attempt = std::move(attempt_);
+        attempt_ = nullptr;
+        if (attempt) finish_attempt(kind_, std::move(attempt), Json(), false);
+    }
+    AttemptClaim(const AttemptClaim&) = delete;
+    AttemptClaim& operator=(const AttemptClaim&) = delete;
+
+private:
+    std::string kind_;
+    std::shared_ptr<Attempt> attempt_;
+};
+
 // One cache entry per probe category. System and network facts change often, so
 // they expire quickly; the tool and application inventories are stable.
 Json cached_probe(const std::string& kind, bool refresh, int network_budget_ms) {
     // Versions get an entry of their own rather than sharing the plain tool
     // inventory: a payload built without versions must never be served to a
-    // caller who asked for them, and versions are stable enough to keep for a
-    // day once measured.
-    const int ttl = (kind == "toolchain" || kind == "toolchain_versions" ||
-                     kind == "apps")
-                        ? kDefaultTtl
-                        : kNetworkTtl;
+    // caller who asked for them.
+    const int ttl = (kind == "toolchain" || kind == "toolchain_versions")
+                        ? kToolchainTtl
+                        : (kind == "apps" ? kDefaultTtl : kNetworkTtl);
     if (!refresh) {
         const Json entry = read_cache_entry(kind, ttl);
         if (entry.is_object()) {
@@ -2254,6 +2397,7 @@ Json cached_probe(const std::string& kind, bool refresh, int network_budget_ms) 
     }
 
     const auto run_probe = [&]() {
+        ProbeAttemptScope attempt_scope;
         const Json metadata = cache_metadata(
             refresh ? "refresh requested" : cache_read_failure, false);
         Json payload = kind == "system"      ? probe_system()
@@ -2300,15 +2444,119 @@ Json cached_probe(const std::string& kind, bool refresh, int network_budget_ms) 
     Json result;
     if (coalesced(result)) return result;
 
+    // Join the probe already running in this process rather than starting a
+    // second one for the same answer. Patience is this caller's own budget, not
+    // the holder's speed: a probe that outlives it is a probe this caller stops
+    // waiting for, and it is never made to wait without a bound.
+    std::shared_ptr<Attempt> attempt;
+    bool probing_here = false;
+    {
+        std::lock_guard<std::mutex> lock(attempt_table_mutex);
+        const auto running = attempt_table.find(kind);
+        if (running != attempt_table.end()) {
+            attempt = running->second;
+        } else {
+            attempt = std::make_shared<Attempt>();
+            attempt_table[kind] = attempt;
+            probing_here = true;
+        }
+    }
+
+    if (!probing_here) {
+        // A network probe carries its own deadline; everything else is bounded
+        // by the same patience the lock used to get.
+        const int patience_ms = [&]() {
+            if (kind == "network" && network_budget_ms > 0) {
+                const int with_slack = network_budget_ms + 400;
+                return with_slack > 8000 ? 8000 : with_slack;
+            }
+            return static_cast<int>(kProbeMutexWaitMs);
+        }();
+        bool reuse = false;
+        // Whether the probe this caller waited on ended at all. It separates
+        // "still running" from "ran and failed" below, which look identical to
+        // the fallback and are very different to whoever reads the answer.
+        bool answered = false;
+        Json shared;
+        {
+            std::unique_lock<std::mutex> lock(attempt->mutex);
+            answered = attempt->ready.wait_for(
+                lock, std::chrono::milliseconds(patience_ms),
+                [&attempt] { return attempt->done; });
+            if (answered && attempt->shareable && attempt->result.is_object()) {
+                shared = attempt->result;
+                reuse = true;
+            }
+        }
+        if (reuse) {
+            // A probe ran while this caller waited, so the answer is as fresh as
+            // one it ran itself: zero seconds old. `cached` says "this call wrote
+            // an entry", and this one did not -- the probe's owner did -- so it
+            // stays false; `shared` carries the part that is true. `hit` is also
+            // false: nothing was read from an entry. A reader who wants to count
+            // real probes counts answers with hit, shared and stale all false.
+            Json cache =
+                cache_metadata("attempt shared", false, std::time(nullptr));
+            cache["cached"] = false;
+            cache["shared"] = true;
+            annotate_cache(shared, cache);
+            return shared;
+        }
+        // The probe running for us ended without an answer, or outlived this
+        // caller's patience. A previous entry still says more than a second
+        // probe running beside the first, so prefer it and say how old it is:
+        // an answer labelled stale without an age is one a reader cannot weigh,
+        // and the age is the only thing that makes the label useful.
+        if (coalesced(result)) return result;
+        const Json stale = read_cache_entry(kind, 0, true);
+        if (stale.is_object()) {
+            Json payload = stale.get("payload");
+            if (payload.is_object() && !payload.contains("error")) {
+                // hit stays true: this answer did come out of an entry, and the
+                // reader must be told its age. The reason separates the two ways
+                // of arriving here -- a probe still in flight, or one that ran
+                // and failed -- because "still running" invites a retry that a
+                // failed probe would only repeat.
+                //
+                // The timestamp is read defensively. This is the branch that runs
+                // when a probe is wedged, against an entry somebody else wrote,
+                // possibly a build older than this one; a missing key here would
+                // turn "the answer is old" into an exception thrown while
+                // answering, and the caller would lose the answer entirely. A
+                // zero asks cache_metadata for no age at all, which is the safe
+                // degradation: the label survives, the arithmetic does not.
+                const std::int64_t stale_at =
+                    stale.contains("cached_at") ? stale.get("cached_at").as_integer()
+                                                : 0;
+                Json cache = cache_metadata(
+                    answered ? "probe failed, stale kept" : "probe still running",
+                    true, stale_at);
+                cache["cached"] = false;
+                cache["stale"] = true;
+                annotate_cache(payload, cache);
+                return with_live_session_facts(kind, std::move(payload));
+            }
+        }
+        return run_probe();
+    }
+
     // The lock covers the probe and the write that publishes its result, so a
-    // waiter always sees either a fresh entry (handled above) or no entry and
-    // then does the work itself. It is separate from the cache lock on purpose:
-    // that one orders file writes, this one orders probes. If it cannot be
-    // acquired the other instance is still probing, and probing anyway is
-    // deliberate — a stalled holder must not cost this caller its answer.
+    // waiter always sees either a fresh entry (handled above) or an attempt to
+    // join. It is separate from the cache lock on purpose: that one orders file
+    // writes, this one orders probes. If it cannot be acquired the other
+    // process is still probing, and probing anyway is deliberate — a stalled
+    // holder must not cost this caller its answer.
+    AttemptClaim claim(kind, attempt);
     NamedMutex probe_lock(probe_mutex_name(kind).c_str(), kProbeMutexWaitMs);
-    if (coalesced(result)) return result;
-    return run_probe();
+    if (coalesced(result)) {
+        // Somebody published while this caller waited for the lock. The waiters
+        // behind us can read the same entry, so they are woken without a copy.
+        claim.release();
+        return result;
+    }
+    Json probed = run_probe();
+    claim.publish(probed);
+    return probed;
 }
 
 }  // namespace machine_env

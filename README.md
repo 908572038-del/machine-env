@@ -259,8 +259,11 @@ installing or uninstalling to refresh its server list.
 
 ## Cache and latency
 
-The tool and application inventories are cached for 24 hours. System facts and
-network state are cached for 10 minutes. Cache files live under the current
+The tool inventories are cached for an hour and the application inventory for 24
+hours: an inventory that outlives the install it was taken before is the failure
+mode of a long TTL, and locating tools without running them costs well under a
+second, so the shorter window is affordable. System facts and network state are
+cached for 10 minutes. Cache files live under the current
 user's `%LOCALAPPDATA%\machine-env\cache`; writes are atomic and protected by a
 named Windows mutex. Entries are invalidated when the server executable
 changes — an entry records the binary's fingerprint, so an upgrade re-probes
@@ -287,6 +290,42 @@ named lock, so five editors opening at once cost one probe instead of five. Wait
 for that lock is bounded: a stalled holder costs a duplicate probe, never the
 answer. A partial result (one that ran out of its budget) is never served as a
 refresh and never stored.
+
+Inside one process, a call that needs a probe of a kind already being probed joins
+that probe instead of starting a second one, and reports what happened rather than
+passing the answer off as its own work. Which of those it was is readable from
+`_cache`, so a client can count real probes without inferring them from a counter.
+The four flags answer four different questions and none of them implies another:
+
+- `hit` — the answer came out of a cache entry;
+- `stale` — that entry was older than its TTL, and its `age_seconds` says by how
+  much;
+- `shared` — the answer came from a probe another caller was already running;
+- `cached` — **this call wrote an entry**. It says nothing about where the data
+  came from, and a call can be answered from an entry while writing nothing.
+
+| what the caller got | `_cache` |
+|---|---|
+| the answer of a probe it ran itself, stored | `reason: "refresh requested"`, `hit: false`, `cached: true` |
+| the answer of a probe it ran itself, not stored (budget ran out, or it failed) | same, with `cached: false` and `not_cached_because` |
+| a fresh entry | `reason: "fresh"`, `hit: true`, no `cached` field |
+| an entry from inside the coalescing window | `reason: "refresh coalesced"`, `hit: true`, `cached: true` |
+| the answer of a probe already running for someone else | `reason: "attempt shared"`, `hit: false`, `shared: true`, `cached: false` |
+| an older entry, because the probe it waited on is still running past its patience | `reason: "probe still running"`, `hit: true`, `stale: true`, with `age_seconds` |
+| an older entry, because the probe it waited on failed | `reason: "probe failed, stale kept"`, `hit: true`, `stale: true`, with `age_seconds` |
+
+A real probe is exactly `hit: false`, `shared: false`, `stale: false`.
+
+Joining is why a burst of identical refreshes costs one probe rather than one per
+caller: measured on this machine, 100 concurrent `get_network` refreshes went from
+4430 ms at 521 threads to 1690 ms at 136. The patience a joiner gives a probe is
+its own budget, never the holder's speed, and a joiner that runs out of patience
+falls back to an older entry before it falls back to probing.
+
+A ceiling on simultaneous probes of one kind exists as a backstop
+(`MACHINE_ENV_PROBE_CONCURRENCY`, 16 by default, `0` disables it). It is a bound
+on resources, not a source of speed, and it is **not** what makes the burst above
+cheap — joining is. Do not credit it with a latency number.
 
 Probes that start child processes kill the whole tree on timeout through a job
 object, so a grandchild cannot outlive the timeout and hold the output pipe

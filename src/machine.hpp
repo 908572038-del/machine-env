@@ -2,6 +2,7 @@
 
 #include "json.hpp"
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -56,5 +57,12 @@ Json probe_network(bool offline, const std::vector<std::string>& skip,
 // stored, so a caller-supplied budget never invalidates it.
 Json cached_probe(const std::string& kind, bool refresh,
                   int network_budget_ms = kNetworkBudgetMs);
+// Counted where a probe actually starts, not where a request arrives: a caller
+// that joins a running probe, reads a cache entry, or is answered by the
+// coalescing window starts no probe. `total` counts probes since start, `peak`
+// is the largest number that were ever running at the same time. Read only by
+// the diagnostics line; no behaviour depends on either number.
+std::uint64_t probe_attempts_started_total();
+std::uint64_t probe_inflight_peak();
 
 }  // namespace machine_env
