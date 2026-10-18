@@ -49,13 +49,25 @@ std::string first_line(const std::string& value) {
     return value.substr(0, end);
 }
 
+// Reads whatever is already available, up to `size` bytes, and returns as soon
+// as one byte has arrived. istream::read is the wrong primitive here: it only
+// returns when the whole buffer is full or the input has ended, and a real MCP
+// client holds its end of the pipe open for the life of the session, so the
+// server would sit inside that call and never parse the very first request --
+// the handshake times out while stderr still says "server ready".
+std::streamsize read_block(char* buffer, std::size_t size) {
+    const int got = ::_read(_fileno(stdin), buffer,
+                            static_cast<unsigned int>(size));
+    return got > 0 ? static_cast<std::streamsize>(got) : 0;
+}
+
 // Messages are read in blocks, not one byte at a time. A per-character read
 // costs a virtual call and a stream test for every byte, so receiving a request
 // was dominated by the cost of copying it in rather than by anything the server
 // measured. The size limit still applies while reading: bytes past the cap are
 // consumed and counted but never stored, so an oversized message is rejected
 // without ever being allocated in full.
-bool read_message(std::istream& input, std::string& line, bool& oversized) {
+bool read_message(std::string& line, bool& oversized) {
     constexpr std::size_t kMaxMessageBytes = 8 * 1024 * 1024;
     constexpr std::size_t kBlockBytes = 64 * 1024;
     // A block read cannot stop at a newline, so the bytes of the next message
@@ -80,8 +92,7 @@ bool read_message(std::istream& input, std::string& line, bool& oversized) {
             return true;
         }
         pending.clear();
-        input.read(block.data(), static_cast<std::streamsize>(block.size()));
-        const std::streamsize got = input.gcount();
+        const std::streamsize got = read_block(block.data(), block.size());
         if (got <= 0) return !line.empty() || oversized;
         pending.assign(block.data(), static_cast<std::size_t>(got));
     }
@@ -1627,7 +1638,7 @@ int wmain(int argc, wchar_t** argv) {
             emit_ready();
         };
 
-        while (read_message(std::cin, line, oversized)) {
+        while (read_message(line, oversized)) {
             const std::uint64_t sequence = next_sequence++;
             if (oversized) {
                 std::cerr << "machine-env-cpp: rejected oversized JSON-RPC message\n";

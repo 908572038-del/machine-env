@@ -95,7 +95,11 @@ obligations, asserts the protocol contract
 `resources/list`), then tampers with a cache entry to confirm it is rejected and
 re-probed rather than served, then uninstalls and confirms nothing was left
 behind. It only touches a temporary profile, so a real installation is never
-disturbed.
+disturbed. Most of it feeds the server a file and closes the pipe, which cannot
+tell "answers" apart from "answers once the input ends", so a separate live
+session keeps stdin open and requires each answer to come back while it is still
+open — that is the case a real client is in, and the one a blocking block read
+used to hang.
 
 `install.ps1` accepts `-SkipBuild` to reuse an existing `build\machine-env-cpp.exe`
 instead of rebuilding, which keeps re-installs and verification quick.
@@ -263,9 +267,13 @@ requests, so `refresh` still sees a PATH edited a moment ago.
 
 Requests are read in 64 KB blocks instead of one byte at a time, which is what
 makes receiving a large message cheap (rejecting a 9 MB message went from ~330ms
-to ~25ms). The 8 MiB limit still applies while reading: bytes past it are
-consumed and counted but never stored, so an oversized message is refused without
-being held in memory, and the next message on the stream is still read correctly.
+to ~2ms). The block read asks for whatever is already on the pipe and returns as
+soon as one byte arrives: `istream::read` returns only when the buffer is full or
+the input has ended, so against a client that keeps stdin open it would sit in
+the call forever and the handshake would time out while stderr still said "server
+ready". The 8 MiB limit still applies while reading: bytes past it are consumed
+and counted but never stored, so an oversized message is refused without being
+held in memory, and the next message on the stream is still read correctly.
 
 `get_network` uses HTTPS HEAD requests to GitHub, Hugging Face, and PyPI, and
 reports a reason such as `dns`, `connect`, `timeout`, or `tls` when a target is

@@ -85,7 +85,11 @@ foreach ($c in $clients) {
 }
 
 Write-Step 'Verifying actual MCP stdio connection'
-$wirePath = Join-Path $env:TEMP "machine-env-install-$PID.jsonl"
+# stdin stays open for the whole check, and every answer has to arrive while it
+# is still open. Piping a file into the server proves that it answers at all,
+# but only once the pipe ends -- a server that never answers a connected client
+# passes that test and then fails inside the editor, which is how a build that
+# could not complete a handshake came to be installed and reported as verified.
 $requests = @(
     ([ordered]@{
         jsonrpc = '2.0'
@@ -113,15 +117,12 @@ $requests = @(
         params = @{ name = 'get_tools'; arguments = @{ detail = $true } }
     } | ConvertTo-Json -Depth 20 -Compress)
 )
-[System.IO.File]::WriteAllLines(
-    $wirePath, $requests, [System.Text.Encoding]::ASCII
-)
 
 $start = New-Object System.Diagnostics.ProcessStartInfo
-$start.FileName = $env:ComSpec
-$start.Arguments = '/d /c type "' + $wirePath + '" | "' + $server + '"'
+$start.FileName = $server
 $start.WorkingDirectory = $Root
 $start.UseShellExecute = $false
+$start.RedirectStandardInput = $true
 $start.RedirectStandardOutput = $true
 $start.RedirectStandardError = $true
 $utf8 = New-Object System.Text.UTF8Encoding $false
@@ -133,19 +134,28 @@ try {
     if (-not $process.Start()) {
         throw 'Could not start the native MCP server.'
     }
-    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    # Drained in the background: a full stderr pipe would block the server.
     $stderrTask = $process.StandardError.ReadToEndAsync()
+    $responses = New-Object System.Collections.Generic.List[object]
+    foreach ($request in $requests) {
+        $process.StandardInput.WriteLine($request)
+        $process.StandardInput.Flush()
+        # A notification has no id and is not answered, so it is not waited for.
+        if ($request -notmatch '"id"\s*:') { continue }
+        $lineTask = $process.StandardOutput.ReadLineAsync()
+        if (-not $lineTask.Wait(30000)) {
+            throw 'MCP stdio verification timed out: a request was written but not answered while stdin was still open.'
+        }
+        $responses.Add(($lineTask.Result | ConvertFrom-Json -ErrorAction Stop))
+    }
+    # Closing stdin is the shutdown signal; a session that ends cleanly lets the
+    # process end cleanly too.
+    $process.StandardInput.Close()
     if (-not $process.WaitForExit(30000)) {
         $process.Kill()
-        throw 'MCP stdio verification timed out.'
+        throw 'MCP stdio verification timed out on shutdown.'
     }
-    $stdout = $stdoutTask.GetAwaiter().GetResult()
     $stderr = $stderrTask.GetAwaiter().GetResult()
-    $responses = @(
-        $stdout -split "`r?`n" |
-            Where-Object { $_ } |
-            ForEach-Object { $_ | ConvertFrom-Json -ErrorAction Stop }
-    )
     if ($responses.Count -ne 4) {
         throw "Expected 4 JSON-RPC responses; received $($responses.Count). stderr: $stderr"
     }
@@ -192,7 +202,6 @@ try {
     Write-Ok "tools probe: $($toolsResult.tool_count) detected"
 } finally {
     $process.Dispose()
-    Remove-Item -LiteralPath $wirePath -Force -ErrorAction SilentlyContinue
 }
 
 Write-Host "`nINSTALL COMPLETE - machine-env-cpp MCP is configured for: $($clients -join ', ')." -ForegroundColor Green

@@ -52,6 +52,60 @@ function Invoke-Stdio([string[]]$Messages) {
     }
 }
 
+# Drives the server the way a client does: stdin stays open for the whole
+# session and every answer has to arrive while it is still open. Feeding a file
+# and closing the pipe answers "does the server ever respond", not "does it
+# respond now" -- a read that only returns when the pipe ends looks identical
+# under the first question and times out under the second.
+function Invoke-LiveSession([string[]]$Messages, [int]$WaitMs = 20000,
+                            [int]$SplitFirstAt = 0) {
+    $start = New-Object System.Diagnostics.ProcessStartInfo
+    $start.FileName = $script:Server
+    $start.UseShellExecute = $false
+    $start.RedirectStandardInput = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $start.StandardOutputEncoding = New-Object System.Text.UTF8Encoding $false
+    $start.StandardErrorEncoding = New-Object System.Text.UTF8Encoding $false
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $start
+    if (-not $process.Start()) { throw 'could not start the MCP server' }
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    $answers = New-Object System.Collections.Generic.List[object]
+    $first = $true
+    try {
+        foreach ($message in $Messages) {
+            if ($first -and $SplitFirstAt -gt 0 -and $SplitFirstAt -lt $message.Length) {
+                # The pipe sits idle between the two halves: a read that assumes
+                # a message arrives in one piece has to answer across the gap.
+                $process.StandardInput.Write($message.Substring(0, $SplitFirstAt))
+                $process.StandardInput.Flush()
+                Start-Sleep -Milliseconds 150
+                $process.StandardInput.WriteLine($message.Substring($SplitFirstAt))
+            } else {
+                $process.StandardInput.WriteLine($message)
+            }
+            $process.StandardInput.Flush()
+            $lineTask = $process.StandardOutput.ReadLineAsync()
+            if (-not $lineTask.Wait($WaitMs)) {
+                throw "the server stayed silent for $WaitMs ms while stdin was still open"
+            }
+            $answers.Add(($lineTask.Result | ConvertFrom-Json -ErrorAction Stop))
+            $first = $false
+        }
+    } finally {
+        # Closing stdin is the shutdown signal, so this also asserts that a
+        # session which ends cleanly lets the process end cleanly.
+        try { $process.StandardInput.Close() } catch { }
+        if (-not $process.WaitForExit(15000)) {
+            $process.Kill()
+            $process.WaitForExit(5000)
+        }
+        $process.Dispose()
+    }
+    return $answers.ToArray()
+}
+
 if (-not $SkipBuild) {
     Write-Step 'Build and native self-test'
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'build.ps1')
@@ -408,6 +462,21 @@ try {
     Assert-That ($coalesced.structuredContent._cache.reason -eq 'refresh coalesced') 'a refresh inside the minimum interval is coalesced'
     Assert-That ($coalesced._meta.elapsed_ms -le $probed._meta.elapsed_ms) 'a coalesced refresh costs no more than the probe it replaces'
     Assert-That ($coalesced.structuredContent.count -gt 0) 'a coalesced refresh still returns the fact, not an empty answer'
+
+    Write-Step 'Live session'
+    $live = @(Invoke-LiveSession @(
+        $handshake,
+        '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}',
+        '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_apps","arguments":{"limit":1}}}'
+    ))
+    Assert-That (@($live).Count -eq 3) "a connected session gets one answer per request (got $($live.Count))"
+    Assert-That ($live[0].result.serverInfo.name -eq 'machine-env-cpp') 'the handshake is answered while stdin is still open'
+    $liveOrder = (@($live) | ForEach-Object { [string]$_.id }) -join ','
+    Assert-That ($liveOrder -eq '1,2,3') "a connected session is answered in request order (got $liveOrder)"
+    # The first request is written in two pieces with the pipe idle in between,
+    # so a message is never assumed to arrive in one write.
+    $splitLive = @(Invoke-LiveSession @($handshake) -SplitFirstAt 40)
+    Assert-That ($splitLive[0].result.serverInfo.name -eq 'machine-env-cpp') 'a request split across two writes is still answered'
 
     Write-Step 'Uninstall'
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $installDirectory 'uninstall-portable.ps1')
