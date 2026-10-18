@@ -20,6 +20,11 @@ Json locate_tool(const std::string& name);
 // The version reported by initialize and by --version, so the two cannot
 // disagree about which build is running.
 const char* server_version();
+// The coalescing window a refresh is subject to. Exported so the argument
+// description can be written from the same number the behaviour uses: a
+// description that states a window in words is the one place a constant change
+// silently becomes a lie.
+int refresh_min_interval_ms();
 Json probe_hardware();
 // Reading a version means starting the tool, which costs tens to hundreds of
 // milliseconds each and can spawn ~20 processes for the whole catalog. Versions

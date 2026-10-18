@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstdint>
@@ -21,6 +22,7 @@
 #include <iomanip>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -697,10 +699,27 @@ Json string_schema(const char* description) {
 
 Json tools() {
     Json list = Json::array();
+    // One string, four tools: four copies of a timing promise drift, and this is
+    // the only place a caller is told what refresh actually does. The coalescing
+    // window is formatted from the constant the behaviour uses, so the sentence
+    // cannot outlive a change to it; it is stated in milliseconds because a
+    // seconds figure would have to be rounded, and rounding a window turns a
+    // 2500 ms setting into "2 seconds" -- a second lie of its own.
+    const std::string refresh_description =
+        "Bypass the cache and re-probe. A complete probe result is stored for "
+        "later callers, so a non-refresh call sent in the same batch may be "
+        "answered from the entry written before this one and will not see the new "
+        "value; send it in its own round when a later call must see the refreshed "
+        "facts. A partial result (the budget ran out) and an error are not stored. "
+        "A refresh within " +
+        std::to_string(refresh_min_interval_ms()) +
+        " ms of the previous one is coalesced rather than repeated: the result "
+        "then says \"refresh coalesced\" and the facts are the probe that already "
+        "ran, not a new one.";
 
     Json system = object_schema();
     system["properties"]["refresh"] =
-        boolean_schema("Bypass the cache and re-probe.");
+        boolean_schema(refresh_description.c_str());
     system["properties"]["detail"] =
         boolean_schema("Return the full JSON result instead of a concise summary.");
     list.as_array().push_back(tool_definition(
@@ -710,7 +729,7 @@ Json tools() {
 
     Json tool_list = object_schema();
     tool_list["properties"]["refresh"] =
-        boolean_schema("Bypass the cache and re-probe.");
+        boolean_schema(refresh_description.c_str());
     tool_list["properties"]["detail"] =
         boolean_schema("Return the full JSON result instead of a concise summary.");
     tool_list["properties"]["name"] = string_schema(
@@ -725,7 +744,7 @@ Json tools() {
         tool_list));
     Json apps = object_schema();
     apps["properties"]["refresh"] =
-        boolean_schema("Bypass the cache and re-probe.");
+        boolean_schema(refresh_description.c_str());
     apps["properties"]["detail"] =
         boolean_schema("Return the full JSON result instead of a concise summary.");
     apps["properties"]["filter"] = string_schema(
@@ -753,7 +772,7 @@ Json tools() {
 
     Json network = object_schema();
     network["properties"]["refresh"] =
-        boolean_schema("Bypass the cache and re-probe.");
+        boolean_schema(refresh_description.c_str());
     network["properties"]["detail"] =
         boolean_schema("Return the full JSON result instead of a concise summary.");
     network["properties"]["offline"] = boolean_schema(
@@ -1001,9 +1020,9 @@ Json dispatch(const Json& request, bool& has_response) {
             "不下载、不安装、不运行安装程序，不修改全局环境。未检测到即说明缺失或给出"
             "替代方案，不要假设已安装；source=unknown 表示未验证，不得当作支持。"
             "留意返回值中的约束（如不支持 &&、原生输出非 UTF-8）并据此改写命令。"
-            "同一批并发调用中，若某个请求明显更慢，其后的答案可能先到："
-            "响应请按 id 关联，不要按到达顺序对应请求；需要严格按序可设 "
-            "MACHINE_ENV_REORDER_WINDOW_MS=0。";
+            "同一批请求基本按发送顺序返回；某个请求较慢时，排在它后面、已完成的"
+            "结果会先返回，请按 id 关联响应而不是按到达顺序。调用之间若有依赖"
+            "（例如 refresh 之后要读到新值），不要压进同一批，分轮发送。";
         Json response = Json::object();
         response["jsonrpc"] = "2.0";
         response["id"] = id;
@@ -1331,18 +1350,42 @@ int selftest() {
         }
     }
 
-    const Json refreshed_system = cached_probe("system", true);
+    // A second instance of this server — another client, or a load test — can be
+    // holding the cache write lock, and waiting for it is bounded at 2 s by
+    // design. That is contention, not a broken cache, so retry briefly and, if
+    // the lock stays busy, skip the persistence assertions instead of failing a
+    // build on a machine that merely has two clients open. Nothing can hide
+    // behind this branch: "cache busy" is produced only when the named mutex was
+    // not acquired, so a genuine write failure reports a different reason.
+    Json refreshed_system = cached_probe("system", true);
+    const auto write_reason = [](const Json& probe) {
+        return string_field(probe.get("_cache"), "not_cached_because");
+    };
+    for (int attempt = 0; attempt < 2 && write_reason(refreshed_system) == "cache busy";
+         ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        refreshed_system = cached_probe("system", true);
+    }
+    const bool persistence_skipped = write_reason(refreshed_system) == "cache busy";
     if (refreshed_system.contains("error") ||
-        !refreshed_system.get("_cache").get("cached").as_bool())
+        (!persistence_skipped &&
+         !refreshed_system.get("_cache").get("cached").as_bool()))
         throw std::runtime_error("system cache write test failed");
-    const Json cached_system = cached_probe("system", false);
-    if (!cached_system.get("_cache").get("hit").as_bool() ||
-        cached_system.get("os").get("caption").as_string() !=
-            refreshed_system.get("os").get("caption").as_string())
-        throw std::runtime_error("system cache round-trip test failed");
-    // A local system probe must never carry network data.
-    if (cached_system.contains("network"))
+    if (persistence_skipped)
+        std::cerr << "machine-env-cpp selftest: cache persistence skipped "
+                     "(another instance holds the cache)\n";
+    // A local system probe must never carry network data, cached or fresh.
+    if (refreshed_system.contains("network"))
         throw std::runtime_error("system probe leaked network data");
+    if (!persistence_skipped) {
+        const Json cached_system = cached_probe("system", false);
+        if (!cached_system.get("_cache").get("hit").as_bool() ||
+            cached_system.get("os").get("caption").as_string() !=
+                refreshed_system.get("os").get("caption").as_string())
+            throw std::runtime_error("system cache round-trip test failed");
+        if (cached_system.contains("network"))
+            throw std::runtime_error("system probe leaked network data");
+    }
     bool has_response = false;
     const Json negotiated = dispatch(
         parse_json(R"({"jsonrpc":"2.0","id":3,"method":"initialize","params":{"protocolVersion":"not-supported"}})"),
@@ -1677,7 +1720,31 @@ int wmain(int argc, wchar_t** argv) {
         std::uint64_t reorder_skips = 0;
         std::int64_t reorder_max_hold_ms = 0;
         std::chrono::steady_clock::time_point last_reorder_report{};
-        std::vector<std::thread> workers;
+        // A std::thread holds its OS handle until it is joined, so keeping every
+        // worker until end of input leaks one handle per request: a session that
+        // makes ten thousand calls holds ten thousand handles and then joins ten
+        // thousand finished threads on the way out. Each worker publishes
+        // `finished` as its last act, so only workers that have already returned
+        // are joined here and the join never blocks the reading thread.
+        struct Worker {
+            std::thread thread;
+            std::shared_ptr<std::atomic_bool> finished;
+        };
+        std::vector<Worker> workers;
+        constexpr std::size_t kReapAfter = 32;
+
+        const auto reap_finished_workers = [&]() {
+            auto keep = workers.begin();
+            for (auto slot = workers.begin(); slot != workers.end(); ++slot) {
+                if (slot->finished->load(std::memory_order_acquire)) {
+                    slot->thread.join();
+                    continue;
+                }
+                if (keep != slot) *keep = std::move(*slot);
+                ++keep;
+            }
+            workers.erase(keep, workers.end());
+        };
 
         const int reorder_window_ms = [] {
             constexpr int kDefault = 200;
@@ -1692,6 +1759,42 @@ int wmain(int argc, wchar_t** argv) {
             return requested > kMax ? kMax : requested;
         }();
 
+        // Per-response diagnostics are off by default: they exist for load
+        // harnesses, and a client should not have to filter them out of its own
+        // stderr. The aggregate line further down is rate limited to one per
+        // five seconds, which makes it useless for counting a burst shorter than
+        // that -- it reports zero, not a small number.
+        const bool diag_enabled = [] {
+            constexpr DWORD kBufferChars = 8;
+            wchar_t buffer[kBufferChars]{};
+            const DWORD length =
+                GetEnvironmentVariableW(L"MACHINE_ENV_DIAG", buffer, kBufferChars);
+            if (length == 0 || length >= kBufferChars) return false;
+            return _wtoi(buffer) != 0;
+        }();
+        // Written by the reading thread before it hands the request to a worker,
+        // read while emitting an answer, so it lives under the same mutex as the
+        // buffer rather than being a second thing to keep in step.
+        std::map<std::uint64_t, std::string> tool_by_sequence;
+
+        const auto emit_response = [&](std::uint64_t sequence, const Pending& pending,
+                                       bool reordered) {
+            std::cout << dump_json(pending.response) << '\n' << std::flush;
+            if (!diag_enabled) return;
+            // How long a finished answer stood in the buffer before it was
+            // written: near zero when its turn came in order, and the measured
+            // hold when the order promise was given up for it.
+            const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - pending.ready_at);
+            const auto named = tool_by_sequence.find(sequence);
+            const char* tool =
+                named == tool_by_sequence.end() ? "-" : named->second.c_str();
+            std::cerr << "machine-env-cpp diag: seq=" << sequence << " tool=" << tool
+                      << " wait_ms=" << waited.count()
+                      << " reordered=" << (reordered ? 1 : 0) << '\n';
+            tool_by_sequence.erase(sequence);
+        };
+
         // Writes every answer whose turn has come. Called with the mutex free so
         // the flush never happens while another thread is waiting to record its
         // result; the map is the buffer for answers that finished early. An
@@ -1704,25 +1807,37 @@ int wmain(int argc, wchar_t** argv) {
                 auto entry = completed.find(next_to_emit);
                 if (entry != completed.end()) {
                     if (entry->second.respond)
-                        std::cout << dump_json(entry->second.response) << '\n'
-                                  << std::flush;
+                        emit_response(entry->first, entry->second, false);
                     completed.erase(entry);
                     ++next_to_emit;
                     continue;
                 }
                 if (reorder_window_ms <= 0 || completed.empty()) return;
-                auto oldest = completed.begin();
-                for (auto candidate = completed.begin();
-                     candidate != completed.end(); ++candidate)
-                    if (candidate->second.ready_at < oldest->second.ready_at)
-                        oldest = candidate;
-                const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - oldest->second.ready_at);
-                if (waited.count() < reorder_window_ms) return;
-                if (oldest->second.respond)
-                    std::cout << dump_json(oldest->second.response) << '\n'
-                              << std::flush;
-                completed.erase(oldest);
+                // The entry that gives up on order is chosen in request order,
+                // not in finishing order. `completed` is keyed by sequence, so
+                // the first entry that has waited out the window is the earliest
+                // request that can be written without waiting any longer.
+                // Choosing the one that *finished* first instead emitted two
+                // answers that stalled together in whatever order their clocks
+                // happened to disagree on, which is out of order for no reason
+                // a client could see.
+                const auto now = std::chrono::steady_clock::now();
+                auto escape = completed.end();
+                auto waited = std::chrono::milliseconds(0);
+                for (auto candidate = completed.begin(); candidate != completed.end();
+                     ++candidate) {
+                    const auto held =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            now - candidate->second.ready_at);
+                    if (held.count() < reorder_window_ms) continue;
+                    escape = candidate;
+                    waited = held;
+                    break;
+                }
+                if (escape == completed.end()) return;
+                if (escape->second.respond)
+                    emit_response(escape->first, escape->second, true);
+                completed.erase(escape);
                 ++reorder_skips;
                 // How long an answer was actually held before the order promise
                 // was given up is the number a client cares about, so it is
@@ -1730,7 +1845,6 @@ int wmain(int argc, wchar_t** argv) {
                 // from the window setting.
                 if (waited.count() > reorder_max_hold_ms)
                     reorder_max_hold_ms = waited.count();
-                const auto now = std::chrono::steady_clock::now();
                 if (last_reorder_report.time_since_epoch().count() == 0 ||
                     now - last_reorder_report >= std::chrono::seconds(5)) {
                     last_reorder_report = now;
@@ -1766,22 +1880,37 @@ int wmain(int argc, wchar_t** argv) {
         };
 
         while (read_message(line, oversized)) {
-            const std::uint64_t sequence = next_sequence++;
             if (oversized) {
                 std::cerr << "machine-env-cpp: rejected oversized JSON-RPC message\n";
                 // Answer rather than stay silent, so the client is not left
                 // waiting for a response that never comes.
-                record(sequence, true,
+                record(next_sequence++, true,
                        rpc_error(Json(), -32600, "message exceeds 8 MiB"));
                 continue;
             }
+            // A line is split on '\n' only, so a CRLF client hands back a line
+            // that still ends in '\r'. For a message that is harmless trailing
+            // whitespace, but a line holding nothing except that '\r' is not an
+            // empty line: it was parsed as JSON and answered with a parse error
+            // for a request the client never made, which a client that pads its
+            // stream with a blank line reads as a failure of the previous call.
+            while (!line.empty() &&
+                   (line.back() == '\r' || line.back() == '\n' || line.back() == ' ' ||
+                    line.back() == '\t'))
+                line.pop_back();
             // A client that emits a BOM would otherwise fail every handshake.
             if (line.size() >= 3 &&
                 static_cast<unsigned char>(line[0]) == 0xef &&
                 static_cast<unsigned char>(line[1]) == 0xbb &&
                 static_cast<unsigned char>(line[2]) == 0xbf)
                 line.erase(0, 3);
+            // A line that asks for nothing gets no sequence number. Numbering it
+            // anyway left a permanent hole in the order: with the reorder window
+            // at zero the emitter waits for a position that will never be filled
+            // and stops answering for the rest of the session, so a stray blank
+            // line from a client would hang every later call.
             if (line.empty()) continue;
+            const std::uint64_t sequence = next_sequence++;
             Json request;
             try {
                 request = parse_json(line);
@@ -1820,8 +1949,19 @@ int wmain(int argc, wchar_t** argv) {
                 }
                 record(sequence_number, send_response, std::move(response));
             };
+            if (request.get("method").as_string() == "tools/call") {
+                std::lock_guard<std::mutex> lock(emit_mutex);
+                tool_by_sequence[sequence] =
+                    request.get("params").get("name").as_string();
+            }
             try {
-                workers.emplace_back([&, sequence, request]() { serve(sequence, request); });
+                auto finished = std::make_shared<std::atomic_bool>(false);
+                std::thread worker([&, sequence, request, finished]() {
+                    serve(sequence, request);
+                    finished->store(true, std::memory_order_release);
+                });
+                workers.push_back(Worker{std::move(worker), finished});
+                if (workers.size() >= kReapAfter) reap_finished_workers();
             } catch (const std::exception&) {
                 // No worker can be started, which only happens once the process
                 // is already out of thread resources. Answering from the reading
@@ -1837,7 +1977,7 @@ int wmain(int argc, wchar_t** argv) {
         // "abandon the ones in flight". A probe is bounded by its own budget, so
         // this wait is bounded too.
         for (auto& worker : workers)
-            if (worker.joinable()) worker.join();
+            if (worker.thread.joinable()) worker.thread.join();
         emit_ready();
     } catch (const std::exception& error) {
         std::cerr << "machine-env-cpp fatal: " << error.what() << '\n';

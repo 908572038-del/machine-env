@@ -58,7 +58,7 @@ function Invoke-Stdio([string[]]$Messages) {
 # respond now" -- a read that only returns when the pipe ends looks identical
 # under the first question and times out under the second.
 function Invoke-LiveSession([string[]]$Messages, [int]$WaitMs = 20000,
-                            [int]$SplitFirstAt = 0) {
+                            [int]$SplitFirstAt = 0, [switch]$ShowDiagnostics) {
     $start = New-Object System.Diagnostics.ProcessStartInfo
     $start.FileName = $script:Server
     $start.UseShellExecute = $false
@@ -103,7 +103,67 @@ function Invoke-LiveSession([string[]]$Messages, [int]$WaitMs = 20000,
         }
         $process.Dispose()
     }
+    if ($ShowDiagnostics) {
+        # The process has exited by now, so the stderr read completes. The lines
+        # are handed back through a script-scoped variable rather than mixed into
+        # the answers: they are not responses and must never be counted as one.
+        $null = $stderrTask.Wait(5000)
+        if ($stderrTask.IsCompleted) {
+            $script:liveDiagnostics = @($stderrTask.Result -split "`r?`n" |
+                Where-Object { $_ -match 'diag:' })
+        }
+    }
     return $answers.ToArray()
+}
+
+# The handle count of a session that is still connected is the only place the
+# worker pool is visible from outside: a std::thread holds its OS handle until it
+# is joined, so a server that keeps every worker until end of input grows by
+# about one handle per request. Sampling it in the middle of the session is what
+# makes the difference visible -- after stdin closes the process is on its way
+# out, and the growth is gone.
+function Measure-LiveSessionHandles([string]$Handshake, [int]$Count) {
+    $start = New-Object System.Diagnostics.ProcessStartInfo
+    $start.FileName = $script:Server
+    $start.UseShellExecute = $false
+    $start.RedirectStandardInput = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $start.StandardOutputEncoding = New-Object System.Text.UTF8Encoding $false
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $start
+    if (-not $process.Start()) { throw 'could not start the MCP server' }
+    $null = $process.StandardError.ReadToEndAsync()
+    $answered = 0
+    $baseline = 0
+    $final = 0
+    try {
+        $process.StandardInput.WriteLine($Handshake)
+        $process.StandardInput.Flush()
+        $null = $process.StandardOutput.ReadLine()
+        $process.Refresh()
+        $baseline = $process.HandleCount
+        for ($index = 0; $index -lt $Count; ++$index) {
+            $process.StandardInput.WriteLine(
+                '{"jsonrpc":"2.0","id":' + ($index + 2) + ',"method":"ping"}')
+            $process.StandardInput.Flush()
+            $lineTask = $process.StandardOutput.ReadLineAsync()
+            if (-not $lineTask.Wait(20000)) {
+                throw "the server stopped answering after $answered pings"
+            }
+            ++$answered
+        }
+        $process.Refresh()
+        $final = $process.HandleCount
+    } finally {
+        try { $process.StandardInput.Close() } catch { }
+        if (-not $process.WaitForExit(15000)) {
+            $process.Kill()
+            $process.WaitForExit(5000)
+        }
+        $process.Dispose()
+    }
+    return [pscustomobject]@{ Answered = $answered; Baseline = $baseline; Final = $final }
 }
 
 if (-not $SkipBuild) {
@@ -202,10 +262,19 @@ try {
         (ConvertFrom-CodePoints 0x4E0D, 0x4E0B, 0x8F7D) = 'the rule withholds downloads'
         ((ConvertFrom-CodePoints 0x4E0D, 0x652F, 0x6301) + ' &&') = 'the rule carries the shell-constraint guidance'
         'source=unknown' = 'the rule defines what an unverified source means'
+        (ConvertFrom-CodePoints 0x6709, 0x4F9D, 0x8D56) = 'the rule keeps dependent calls in separate rounds'
     }
     foreach ($obligation in $obligations.Keys) {
         Assert-That ($injected.Contains([string]$obligation)) $obligations[$obligation]
     }
+    # A keyword proves the topic survived; it cannot tell an obligation from a
+    # suggestion. The dependency rule is the one clause whose whole value is that
+    # it forbids something, so it is checked in its imperative form: "not in the
+    # same batch, send in separate rounds". Softened to advice ("consider sending
+    # separately") the keyword would still match and the rule would be gone.
+    $dependencyRule = (ConvertFrom-CodePoints 0x4E0D, 0x8981) + '[^' + [char]0x3002 +
+                      ']{0,24}' + (ConvertFrom-CodePoints 0x5206, 0x8F6E)
+    Assert-That ($injected -match $dependencyRule) 'the dependency rule stays a prohibition rather than advice'
 
     Write-Step 'Protocol edges'
     $handshake = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}'
@@ -476,6 +545,30 @@ try {
     Assert-That ($null -ne $budgetSchema) 'the schema advertises timeout_ms'
     Assert-That ($budgetSchema.minimum -eq 200 -and $budgetSchema.maximum -eq 10000) 'the schema carries the budget bounds'
 
+    Write-Step 'Shared argument descriptions'
+    # Four tools take `refresh`, and the warning it carries is a timing promise
+    # rather than a synonym for "re-probe". Four copies of that text drift; one
+    # constant cannot. Equality across all four is the check that catches a tool
+    # being added with a weaker description of its own.
+    $catalog = @((Invoke-Stdio @($handshake, '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'))[1].result.tools)
+    $refreshTexts = @()
+    foreach ($entry in $catalog) {
+        $property = $entry.inputSchema.properties.refresh
+        if ($null -ne $property) { $refreshTexts += [string]$property.description }
+    }
+    Assert-That ($refreshTexts.Count -eq 4) "all four tools take refresh (got $($refreshTexts.Count))"
+    Assert-That ((@($refreshTexts | Sort-Object -Unique)).Count -eq 1) 'every tool describes refresh the same way'
+    # Saying "will not see the new value" is what makes the warning usable; a
+    # version that only says "re-probe" leaves the race undisclosed.
+    Assert-That ([string]$refreshTexts[0]).Contains('will not see the new value') 'the refresh description discloses what a batched reader can see'
+    Assert-That ([string]$refreshTexts[0]).Contains('coalesced') 'the refresh description says a repeat inside the interval is coalesced'
+    # The window is formatted from the constant, so the sentence cannot drift
+    # from the behaviour; what is asserted here is that the number is still a
+    # usable one. It is stated in milliseconds on purpose: any unit that has to
+    # be rounded turns a 2500 ms setting into "2 seconds", and a description that
+    # rounds is a description that lies by a little.
+    Assert-That ([string]$refreshTexts[0] -match 'within [1-9]\d* ms') 'the refresh description states a positive coalescing window in milliseconds'
+
     Write-Step 'Cache integrity'
     # A cache entry is not trusted blindly: an entry changed by something else
     # must be discarded and re-probed, never served as fact.
@@ -562,11 +655,47 @@ try {
         $strict = Invoke-Stdio $slowThenFast
         $strictIds = (@($strict) | ForEach-Object { [string]$_.id }) -join ','
         Assert-That ($strictIds -eq '1,2,3,4') "the window can be turned off for a position-based client (got $strictIds)"
+        # A line that asks for nothing must not consume a position. When it did,
+        # strict mode waited for an answer that could never come and the session
+        # went silent after the blank line -- which is the failure a caller sees
+        # as "the server hung", not as "the server skipped a line".
+        $afterBlank = Invoke-Stdio @(
+            '{"jsonrpc":"2.0","id":1,"method":"ping"}',
+            '',
+            '{"jsonrpc":"2.0","id":2,"method":"ping"}'
+        )
+        $blankIds = (@($afterBlank) | ForEach-Object { [string]$_.id }) -join ','
+        Assert-That (@($afterBlank).Count -eq 2) "a blank line is not answered (got $(@($afterBlank).Count))"
+        Assert-That ($blankIds -eq '1,2') "a blank line does not silence the rest of a strict session (got $blankIds)"
     } finally {
         if ($null -eq $savedWindow) {
             Remove-Item Env:MACHINE_ENV_REORDER_WINDOW_MS -ErrorAction SilentlyContinue
         } else {
             $env:MACHINE_ENV_REORDER_WINDOW_MS = $savedWindow
+        }
+    }
+
+    Write-Step 'Per-response diagnostics'
+    # The load harnesses read this line instead of the aggregate one, which is
+    # rate limited to one report per five seconds and therefore reports zero for
+    # any burst shorter than that.
+    $savedDiag = $env:MACHINE_ENV_DIAG
+    $env:MACHINE_ENV_DIAG = '1'
+    try {
+        $diagnosed = Invoke-LiveSession @(
+            $handshake,
+            '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_system","arguments":{"detail":true}}}'
+        ) -ShowDiagnostics
+        Assert-That (@($diagnosed).Count -eq 2) 'a diagnosed session still answers every request'
+        $diagLine = (@($script:liveDiagnostics) | Where-Object { $_ -match 'tool=get_system' } |
+            Select-Object -First 1)
+        Assert-That ($null -ne $diagLine) 'the diagnostic line names the tool that was called'
+        Assert-That ([string]$diagLine -match 'diag: seq=\d+ tool=get_system wait_ms=\d+ reordered=[01]') "the diagnostic line carries the sequence, the wait, and whether it was reordered (got '$diagLine')"
+    } finally {
+        if ($null -eq $savedDiag) {
+            Remove-Item Env:MACHINE_ENV_DIAG -ErrorAction SilentlyContinue
+        } else {
+            $env:MACHINE_ENV_DIAG = $savedDiag
         }
     }
 
@@ -584,6 +713,13 @@ try {
     # so a message is never assumed to arrive in one write.
     $splitLive = @(Invoke-LiveSession @($handshake) -SplitFirstAt 40)
     Assert-That ($splitLive[0].result.serverInfo.name -eq 'machine-env-cpp') 'a request split across two writes is still answered'
+    # Serving a call must not cost a handle that lasts as long as the session.
+    # 300 calls leave the pool at the size of what is in flight, not at 300,
+    # so the bound below is generous on purpose: it fails a leak, not a nuance.
+    $pool = Measure-LiveSessionHandles -Handshake $handshake -Count 300
+    $poolGrowth = $pool.Final - $pool.Baseline
+    Assert-That ($pool.Answered -eq 300) "a long session answers every call (got $($pool.Answered))"
+    Assert-That ($poolGrowth -lt 80) "a long session does not hold a handle per call (grew by $poolGrowth over 300)"
 
     Write-Step 'Uninstall'
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $installDirectory 'uninstall-portable.ps1')

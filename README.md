@@ -165,16 +165,24 @@ call that has genuinely stalled: once it has waited longer than the reorder wind
 emitted ahead of the missing earlier response, so one slow call cannot add its full
 latency to every answer behind it. Responses are matched to requests by `id`; a
 client that needs strictly in-order emission sets `MACHINE_ENV_REORDER_WINDOW_MS=0`
-(the per-client install writes this for a known positional reader). Emitting out of
-order is legal JSON-RPC 2.0, and reading responses positionally without checking
-`id` is relying on behaviour the protocol does not promise. Execution order within
-one batch is unconstrained too — the requests run concurrently and may complete in
-any order — so calls that depend on each other must be sent in separate rounds
-(wait for one batch's responses before sending the next) rather than batched
-together on the assumption that they run in request order. This matters most for
-side-effecting calls; every tool here is read-only and idempotent, so batching
-purely to save a round trip is safe, but the rule keeps a caller from carrying a
-"batched calls run in order" habit into a server where it would not hold.
+in the environment the server is started with — nothing sets it per client today, so
+the window is on unless it was set explicitly. If per-client installs ever write it,
+the rule is to write it only on an explicit signal that a client reads responses
+positionally, and to fall back to `0` when unsure: guessing "positional" merely
+forgoes the ordering optimization, whereas guessing "non-positional" for a client
+that cannot match by `id` would corrupt correlation. Emitting out of order is legal
+JSON-RPC 2.0, and reading responses positionally without checking `id` is relying on
+behaviour the protocol does not promise. Request execution is concurrent, so the
+order in which calls complete is not a promise either. Calls that depend on each
+other must be sent in separate rounds — wait for one batch's responses before
+sending the next — rather than batched together on the assumption that they run in
+request order. The tools only read the environment and never change the system, but
+that is not the same as having no ordering dependency: `get_network` with
+`refresh: true` writes the cache, and a concurrent non-refresh call can read the
+entry from before that refresh, so a refresh-then-read pair must be split into
+separate rounds like any other dependency.
+This section must stay in step with the concurrency note in `initialize.instructions`;
+change both together.
 
 `get_tools` reports each detected
 tool on its own line in a fixed order, as `NAME = PATH`, with the version
@@ -319,7 +327,10 @@ answer, distinct from unreachable: the host was asked and did not answer in time
 never mistaken for a complete one. A probe that ran out of budget is returned but
 never cached, so a timeout cannot be served as a fact for the next ten minutes.
 Pass a larger `timeout_ms` for a slow link; a cached answer is always a complete
-one, so a budgeted caller is still served from the cache.
+one, so a budgeted caller is still served from the cache. Raising the budget does
+not, however, turn an unreachable host into a reachable one — each endpoint carries
+its own WinHTTP timeouts, so past roughly 4.8 s the answer becomes `timed_out`
+instead of `budget_exhausted` without changing whether the host answers at all.
 
 `offline: true` skips every endpoint and reports each one as skipped without
 opening a socket; `skip_endpoints` names individual hosts (`github_api`,

@@ -1435,6 +1435,8 @@ const std::vector<std::string>& tool_catalog_names() {
 
 const char* server_version() { return kServerVersion; }
 
+int refresh_min_interval_ms() { return kRefreshMinIntervalMs; }
+
 Json locate_tool(const std::string& name) {
     Json result = Json::object();
     const std::wstring base = wide(name);
