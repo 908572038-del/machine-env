@@ -730,6 +730,10 @@ Json tools() {
         boolean_schema(refresh_description.c_str());
     system["properties"]["detail"] =
         boolean_schema("Return the full JSON result instead of a concise summary.");
+    system["properties"]["measure_syntax"] = boolean_schema(
+        "Parse shell constructs to decide support instead of deriving it from "
+        "the announced version. Costs about 450ms of a ~1.7s cold PowerShell "
+        "start; the derived answer is marked source=derived.");
     list.as_array().push_back(tool_definition(
         "get_system",
         "Windows, shell, and hardware facts including display adapters and their memory, plus measured shell capabilities and machine policies. Local only: it never makes a network request.",
@@ -1071,7 +1075,7 @@ Json dispatch(const Json& request, bool& has_response) {
             std::vector<const char*> arguments;
         };
         static const std::map<std::string, ToolSpec> specs{
-            {"get_system", {"system", nullptr, {"refresh", "detail"}}},
+            {"get_system", {"system", nullptr, {"refresh", "detail", "measure_syntax"}}},
             {"get_tools",
              {"toolchain", "name",
               {"refresh", "detail", "name", "include_versions"}}},
@@ -1098,6 +1102,7 @@ Json dispatch(const Json& request, bool& has_response) {
         bool refresh = false;
         bool offline_net = false;
         bool include_versions = false;
+        bool measure_syntax = false;
         std::vector<std::string> skip_endpoints;
         std::vector<std::string> filter;
         int budget_ms = kNetworkBudgetMs;
@@ -1149,6 +1154,14 @@ Json dispatch(const Json& request, bool& has_response) {
                                   include_versions, validation_error))
                 return rpc_error(id, -32602, validation_error);
         }
+        if (kind == "system") {
+            // Deriving shell syntax support from the announced version costs
+            // nothing; parsing each construct costs ~450ms of a cold start. A
+            // caller that wants the second answer asks for it.
+            if (!optional_boolean(arguments, "measure_syntax", false,
+                                  measure_syntax, validation_error))
+                return rpc_error(id, -32602, validation_error);
+        }
         if (kind == "apps") {
             // Clamped for the same reason as the network budget: a page that
             // asks for more than the cap is better served than refused. limit
@@ -1197,7 +1210,7 @@ Json dispatch(const Json& request, bool& has_response) {
         if (kind == "network" && (offline_net || !skip_endpoints.empty())) {
             payload = probe_network(offline_net, skip_endpoints, budget_ms);
         } else if (kind == "network") {
-            payload = cached_probe(kind, refresh, budget_ms);
+            payload = cached_probe(kind, refresh, budget_ms, false);
         } else {
             // Versions are cached separately so a payload built without them is
             // never served to a caller who asked for them, and the fast path is
@@ -1205,7 +1218,8 @@ Json dispatch(const Json& request, bool& has_response) {
             const std::string cache_kind =
                 (kind == "toolchain" && include_versions) ? "toolchain_versions"
                                                           : kind;
-            payload = cached_probe(cache_kind, refresh);
+            payload = cached_probe(cache_kind, refresh, kNetworkBudgetMs,
+                                   measure_syntax);
         }
         if (kind == "toolchain") {
             resolve_requested_tools(payload, filter);
@@ -1289,7 +1303,9 @@ int selftest() {
             throw std::runtime_error("display adapter entry is incomplete");
     }
 
-    const Json local_environment = probe_system();
+    // A self-test asks for the measured answer, so the derived path is not
+    // checked by testing only itself.
+    const Json local_environment = probe_system(true);
     if (!local_environment.get("os").is_object() ||
         !local_environment.get("paths").is_object() ||
         !local_environment.get("hardware").is_object() ||
@@ -1365,14 +1381,14 @@ int selftest() {
     // build on a machine that merely has two clients open. Nothing can hide
     // behind this branch: "cache busy" is produced only when the named mutex was
     // not acquired, so a genuine write failure reports a different reason.
-    Json refreshed_system = cached_probe("system", true);
+    Json refreshed_system = cached_probe("system", true, kNetworkBudgetMs, false);
     const auto write_reason = [](const Json& probe) {
         return string_field(probe.get("_cache"), "not_cached_because");
     };
     for (int attempt = 0; attempt < 2 && write_reason(refreshed_system) == "cache busy";
          ++attempt) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        refreshed_system = cached_probe("system", true);
+        refreshed_system = cached_probe("system", true, kNetworkBudgetMs, false);
     }
     const bool persistence_skipped = write_reason(refreshed_system) == "cache busy";
     if (refreshed_system.contains("error") ||
@@ -1386,7 +1402,7 @@ int selftest() {
     if (refreshed_system.contains("network"))
         throw std::runtime_error("system probe leaked network data");
     if (!persistence_skipped) {
-        const Json cached_system = cached_probe("system", false);
+        const Json cached_system = cached_probe("system", false, kNetworkBudgetMs, false);
         if (!cached_system.get("_cache").get("hit").as_bool() ||
             cached_system.get("os").get("caption").as_string() !=
                 refreshed_system.get("os").get("caption").as_string())

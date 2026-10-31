@@ -35,7 +35,12 @@ Json probe_hardware();
 // a payload built without them.
 Json probe_toolchain(bool include_versions = false);
 Json probe_apps();
-Json probe_system();
+// Shell syntax support is reported from the announced version by default.
+// Asking the shell to parse a construct costs about 450ms of a 1.7s cold
+// start, and the version rules for the constructs have no exceptions; passing
+// true has each one actually parsed, which is what a caller that doubts the
+// version should ask for.
+Json probe_system(bool measure_syntax);
 // Wall-clock budget for a whole network probe. A host blackholed at the DNS
 // layer can stall the resolver past every per-phase WinHTTP timeout, so a
 // per-phase cap alone cannot bound the call; this is the deadline for the call
@@ -56,7 +61,7 @@ Json probe_network(bool offline, const std::vector<std::string>& skip,
 // by construction a complete one, since a probe that ran out of budget is never
 // stored, so a caller-supplied budget never invalidates it.
 Json cached_probe(const std::string& kind, bool refresh,
-                  int network_budget_ms = kNetworkBudgetMs);
+                  int network_budget_ms, bool measure_syntax);
 // Counted where a probe actually starts, not where a request arrives: a caller
 // that joins a running probe, reads a cache entry, or is answered by the
 // coalescing window starts no probe. `total` counts probes since start, `peak`

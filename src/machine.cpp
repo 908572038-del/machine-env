@@ -1857,12 +1857,89 @@ std::wstring base64_utf16(const std::wstring& text) {
 // arrive in the same process invocation as the version fields: starting a shell
 // costs far more than the questions do, so asking them separately made the
 // system probe pay for several cold starts.
-Json probe_shell_capabilities(const ProcessResult& probe) {
+// Get-ExecutionPolicy is a cmdlet that walks every scope and costs ~480ms on a
+// cold PowerShell. The rule it implements is short and the registry is
+// authoritative, so reading it here keeps the answer and drops the cost.
+//
+// Precedence is the one PowerShell applies: a policy set by group policy wins,
+// then the user's own choice, then the machine's, and an unset value means
+// Restricted. Scopes that report "Undefined" are simply absent from the
+// registry, which is why a missing value is not the same as Restricted.
+std::string execution_policy_from_registry() {
+    struct Scope {
+        HKEY root;
+        const wchar_t* key;
+    };
+    // Ordered by precedence, highest first.
+    const Scope scopes[] = {
+        {HKEY_LOCAL_MACHINE,
+         L"SOFTWARE\\Policies\\Microsoft\\Windows\\PowerShell"},
+        {HKEY_CURRENT_USER,
+         L"SOFTWARE\\Policies\\Microsoft\\Windows\\PowerShell"},
+        {HKEY_CURRENT_USER,
+         L"SOFTWARE\\Microsoft\\PowerShell\\1\\ShellIds\\Microsoft.PowerShell"},
+        {HKEY_LOCAL_MACHINE,
+         L"SOFTWARE\\Microsoft\\PowerShell\\1\\ShellIds\\Microsoft.PowerShell"},
+    };
+    for (const auto& scope : scopes) {
+        const std::wstring value =
+            registry_string(scope.root, scope.key, L"ExecutionPolicy");
+        if (!value.empty()) return utf8(value);
+    }
+    // No scope set a policy, which is what PowerShell reports as Restricted.
+    return "Restricted";
+}
+
+// The environment facts a caller usually needs -- the shell's version, its
+// edition, and the host it runs -- are all recorded by the installer, and the
+// questions that depend on them are answered by major and minor version. The
+// registry is therefore read first: starting a shell to ask for them costs
+// ~1.7s on this class of machine, which is most of the probe.
+//
+// A version string is returned verbatim, and the build number may differ from
+// what the shell would print: the engine key records the version at
+// installation and Windows updates the file without rewriting it. Only the
+// version is compared, so that is not a fact this reports.
+struct ShellIdentity {
+    std::string version;
+    std::string edition;
+    std::string host;
+};
+
+bool shell_identity_from_registry(ShellIdentity& identity) {
+    // PowerShell 3+ writes the engine version here; the 1\ key is left over from
+    // PowerShell 2 and carries none. A machine with only 2.0 would therefore not
+    // be identified, and falls back to asking the shell.
+    const wchar_t* engine = L"SOFTWARE\\Microsoft\\PowerShell\\3\\PowerShellEngine";
+    const std::wstring version =
+        registry_string(HKEY_LOCAL_MACHINE, engine, L"PowerShellVersion");
+    if (version.empty()) return false;
+    identity.version = utf8(version);
+    // Windows PowerShell and pwsh report different editions, and the edition is
+    // what decides whether output survives a pipe as UTF-8. The engine key names
+    // the console host the same way the shell reports it.
+    const std::wstring host_module =
+        registry_string(HKEY_LOCAL_MACHINE, engine, L"ConsoleHostModuleName");
+    if (host_module.empty()) {
+        identity.edition = "Desktop";
+        identity.host = "ConsoleHost";
+    } else if (host_module.find(L"Microsoft.PowerShell.ConsoleHost.dll") !=
+               std::wstring::npos) {
+        identity.edition = "Desktop";
+        identity.host = "ConsoleHost";
+    } else {
+        identity.edition = "Core";
+        identity.host = "ConsoleHost";
+    }
+    return true;
+}
+
+Json probe_shell_capabilities(const ProcessResult& probe, bool measured) {
     Json capabilities = Json::object();
     capabilities["ampersand_ampersand"] = capability_of_state("unknown", "unknown");
     capabilities["here_string"] = capability_of_state("unknown", "unknown");
     capabilities["non_ascii_pipe_utf8"] = capability_of_state("unknown", "unknown");
-    if (!probe.ok) return capabilities;
+    if (!measured || !probe.ok) return capabilities;
 
     // Read only the capability line, so a version string that happens to
     // contain "amp=" cannot be mistaken for an answer.
@@ -1899,6 +1976,42 @@ Json probe_shell_capabilities(const ProcessResult& probe) {
                                  marker.size(), marker) == 0;
         capabilities["non_ascii_pipe_utf8"] =
             capability_of_state(measured_state(intact), "measured");
+    }
+    return capabilities;
+}
+
+// Without a shell start the same three claims are decided from the announced
+// version and edition. Both rules are exact -- && and || arrived in PowerShell
+// 7.0, a here-string predates every supported version, and only Desktop pipes
+// through the console code page -- but the source says "derived", so a reader
+// can tell this from a parse. An unidentifiable shell reports unknown rather
+// than guessing.
+Json derive_shell_capabilities(const std::string& version,
+                               const std::string& edition) {
+    Json capabilities = Json::object();
+    capabilities["ampersand_ampersand"] = capability_of_state("unknown", "unknown");
+    capabilities["here_string"] = capability_of_state("unknown", "unknown");
+    capabilities["non_ascii_pipe_utf8"] = capability_of_state("unknown", "unknown");
+
+    int major = 0;
+    const std::size_t dot = version.find('.');
+    if (dot != std::string::npos) {
+        try {
+            major = std::stoi(version.substr(0, dot));
+        } catch (...) {
+            major = 0;
+        }
+    }
+    if (major > 0) {
+        capabilities["ampersand_ampersand"] =
+            capability_of_state(major >= 7 ? "supported" : "unsupported",
+                                "derived");
+        capabilities["here_string"] =
+            capability_of_state("supported", "derived");
+    }
+    if (!edition.empty()) {
+        capabilities["non_ascii_pipe_utf8"] = capability_of_state(
+            edition == "Core" ? "supported" : "unsupported", "derived");
     }
     return capabilities;
 }
@@ -2022,7 +2135,7 @@ private:
     std::thread& thread_;
 };
 
-Json probe_system() {
+Json probe_system(bool measure_syntax) {
     // One PATH read for the two shell lookups below, and for anything else this
     // probe searches for.
     const PathSnapshot path_snapshot;
@@ -2100,35 +2213,51 @@ Json probe_system() {
         shell["current_user"] = utf8(domain + L"\\" + username.data());
     }
     shell["is_admin"] = is_admin();
-    shell["execution_policy"] = "not probed";
+    // Read from the registry rather than from a shell start, so the answer does
+    // not depend on one succeeding and costs nothing when none is found.
+    shell["execution_policy"] = execution_policy_from_registry();
     // A terminal defaults to pwsh when it is installed, so probing only
     // powershell.exe would under-report capabilities such as "&&".
     const std::wstring pwsh = search_executable(L"pwsh.exe");
     const std::wstring powershell = search_executable(L"powershell.exe");
     const std::wstring& primary_shell = pwsh.empty() ? powershell : pwsh;
-    // Everything the primary shell is asked, in one start. Each answer is
-    // prefixed rather than positional: a field the shell fails to answer stays
-    // absent instead of shifting the values after it, and a warning line cannot
-    // be read as a version. The last thing written is the marker, with no
-    // trailing newline, because it is judged by being the end of the output.
-    const std::wstring shell_script =
-        L"$o=@()\n"
-        L"try{$o+='ver='+$PSVersionTable.PSVersion.ToString()}catch{}\n"
-        L"try{$o+='edi='+$PSVersionTable.PSEdition}catch{}\n"
-        L"try{$o+='host='+$Host.Name}catch{}\n"
-        L"try{$o+='pol='+[string](Get-ExecutionPolicy)}catch{}\n"
-        L"$c=@()\n"
-        L"try{[void][scriptblock]::Create('$null && $null');$c+='amp=ok'}"
-        L"catch{$c+='amp=no'}\n"
-        L"$hs=\"@'\"+[Environment]::NewLine+'x'+[Environment]::NewLine+\"'@\"\n"
-        L"try{[void][scriptblock]::Create($hs);$c+='here=ok'}"
-        L"catch{$c+='here=no'}\n"
-        L"$o+='caps='+($c -join ';')\n"
-        L"[Console]::Out.Write((($o -join \"`n\") + \"`nmark=\" + [char]0x6807 "
-        L"+ [char]0x8BB0))";
+    ShellIdentity identity;
+    const bool identified = shell_identity_from_registry(identity);
+    // The registry already holds the version, edition and host, so a default
+    // probe starts no shell at all. Only a caller that wants each construct
+    // parsed pays for one, and then the version it reports replaces the registry
+    // value: a measurement should describe the shell that produced it.
+    const bool start_shell = measure_syntax && !primary_shell.empty();
     if (!primary_shell.empty()) {
         shell["shell_path"] = utf8(primary_shell);
         shell["shell_kind"] = pwsh.empty() ? "windows-powershell" : "pwsh";
+    }
+    if (identified) {
+        shell["ps_version"] = identity.version;
+        shell["ps_edition"] = identity.edition;
+        shell["ps_host"] = identity.host;
+    }
+    if (start_shell) {
+        // Everything the primary shell is asked, in one start. Each answer is
+        // prefixed rather than positional: a field the shell fails to answer
+        // stays absent instead of shifting the values after it, and a warning
+        // line cannot be read as a version. The last thing written is the
+        // marker, with no trailing newline, because it is judged by being the
+        // end of the output.
+        const std::wstring shell_script =
+            L"$o=@()\n"
+            L"try{$o+='ver='+$PSVersionTable.PSVersion.ToString()}catch{}\n"
+            L"try{$o+='edi='+$PSVersionTable.PSEdition}catch{}\n"
+            L"try{$o+='host='+$Host.Name}catch{}\n"
+            L"$c=@()\n"
+            L"try{[void][scriptblock]::Create('$null && $null');$c+='amp=ok'}"
+            L"catch{$c+='amp=no'}\n"
+            L"$hs=\"@'\"+[Environment]::NewLine+'x'+[Environment]::NewLine+\"'@\"\n"
+            L"try{[void][scriptblock]::Create($hs);$c+='here=ok'}"
+            L"catch{$c+='here=no'}\n"
+            L"$o+='caps='+($c -join ';')\n"
+            L"[Console]::Out.Write((($o -join \"`n\") + \"`nmark=\" + [char]0x6807 "
+            L"+ [char]0x8BB0))";
         // The legacy version is a second shell start and does not depend on the
         // first, so it runs alongside it: the call then costs the slower of the
         // two instead of their sum. It is still only probed when a different
@@ -2171,19 +2300,20 @@ Json probe_system() {
                     answered.emplace(line.substr(0, equals),
                                      line.substr(equals + 1));
                 }
-                const std::array<std::pair<const char*, const char*>, 4> fields{{
+                // The execution policy is read from the registry rather than
+                // asked of the shell: the cmdlet costs ~480ms of the cold start
+                // and answers a question the registry already holds.
+                const std::array<std::pair<const char*, const char*>, 3> fields{{
                     {"ver", "ps_version"},
                     {"edi", "ps_edition"},
-                    {"host", "ps_host"},
-                    {"pol", "execution_policy"}}};
+                    {"host", "ps_host"}}};
                 for (const auto& field : fields) {
                     const auto found = answered.find(field.first);
                     if (found != answered.end() && !found->second.empty())
                         shell[field.second] = found->second;
                 }
             }
-            // Measured, so it stays right even if the version rule would not be.
-            shell["capabilities"] = probe_shell_capabilities(ps);
+            shell["capabilities"] = probe_shell_capabilities(ps, true);
         }
         if (probe_legacy && legacy.ok && !legacy.output.empty()) {
             const std::string legacy_version =
@@ -2191,6 +2321,16 @@ Json probe_system() {
             if (!legacy_version.empty())
                 shell["windows_powershell_version"] = legacy_version;
         }
+    } else {
+        // No shell was started, so the same three claims come from what the
+        // installation recorded. Reading the registry is what makes a default
+        // probe cost nothing here.
+        const auto value_of = [&shell](const char* field) {
+            const Json& value = shell.get(field);
+            return value.is_string() ? value.as_string() : std::string();
+        };
+        shell["capabilities"] = derive_shell_capabilities(
+            value_of("ps_version"), value_of("ps_edition"));
     }
 
     for (const auto& variable : {
@@ -2481,15 +2621,20 @@ private:
 
 // One cache entry per probe category. System and network facts change often, so
 // they expire quickly; the tool and application inventories are stable.
-Json cached_probe(const std::string& kind, bool refresh, int network_budget_ms) {
+Json cached_probe(const std::string& kind, bool refresh, int network_budget_ms,
+                  bool measure_syntax) {
     // Versions get an entry of their own rather than sharing the plain tool
     // inventory: a payload built without versions must never be served to a
-    // caller who asked for them.
+    // caller who asked for them. The system payload gets the same treatment for
+    // the same reason: a syntax answer that was derived from a version must not
+    // be handed to a caller who asked for a measurement.
+    const std::string cache_kind =
+        (kind == "system" && measure_syntax) ? "system_measured" : kind;
     const int ttl = (kind == "toolchain" || kind == "toolchain_versions")
                         ? kToolchainTtl
                         : (kind == "apps" ? kDefaultTtl : kNetworkTtl);
     if (!refresh) {
-        const Json entry = read_cache_entry(kind, ttl);
+        const Json entry = read_cache_entry(cache_kind, ttl);
         if (entry.is_object()) {
             Json payload = entry.get("payload");
             const auto timestamp = entry.get("cached_at").as_integer();
@@ -2502,13 +2647,13 @@ Json cached_probe(const std::string& kind, bool refresh, int network_budget_ms) 
         ProbeAttemptScope attempt_scope;
         const Json metadata = cache_metadata(
             refresh ? "refresh requested" : cache_read_failure, false);
-        Json payload = kind == "system"      ? probe_system()
+        Json payload = kind == "system"      ? probe_system(measure_syntax)
                        : kind == "toolchain" ? probe_toolchain(false)
                        : kind == "toolchain_versions" ? probe_toolchain(true)
                        : kind == "apps"      ? probe_apps()
                                              : probe_network(false, {}, network_budget_ms);
         return with_live_session_facts(
-            kind, cacheable_probe(kind, std::move(payload), metadata));
+            kind, cacheable_probe(cache_kind, std::move(payload), metadata));
     };
 
     // A cache miss is not a licence to probe unconditionally either. This used
@@ -2525,11 +2670,11 @@ Json cached_probe(const std::string& kind, bool refresh, int network_budget_ms) 
     // first. An entry written inside the minimum interval answers the call as it
     // stands; a per-kind lock across processes then makes one caller the only
     // one that probes.
-    const auto coalesced = [&kind](Json& result) {
+    const auto coalesced = [&kind, &cache_kind](Json& result) {
         // ignore_expiry is safe here: the age check below is far tighter than
         // any entry's TTL, and read_cache_entry still rejects a bad checksum, a
         // foreign machine, or a timestamp in the future.
-        const Json entry = read_cache_entry(kind, 0, true);
+        const Json entry = read_cache_entry(cache_kind, 0, true);
         if (!entry.is_object()) return false;
         Json payload = entry.get("payload");
         // A partial or failed result is never stored, but the check keeps an
@@ -2564,7 +2709,7 @@ Json cached_probe(const std::string& kind, bool refresh, int network_budget_ms) 
     const std::string attempt_key =
         (kind == "network" && network_budget_ms > 0)
             ? kind + "#" + std::to_string(network_budget_ms)
-            : kind;
+            : cache_kind;
     std::shared_ptr<Attempt> attempt;
     bool probing_here = false;
     {

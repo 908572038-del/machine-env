@@ -22,10 +22,16 @@ builders, and Windows SDK packaging tools.
 Every tool accepts `refresh` to bypass its cache and `detail` for the full JSON.
 Capability fields report how the answer was obtained: `measured` was observed by
 running a harmless probe, `derived` follows from a version, and `unknown` means
-it was not verified and must not be read as support. Shell syntax support such as
-`&&` and here-strings is decided by parsing the construct, and non-ASCII output
-is checked by a round-trip, so the answer does not depend on trusting a version
-string.
+it was not verified and must not be read as support.
+
+Shell syntax support defaults to `derived`: starting Windows PowerShell costs
+about 1.7s on a low-power machine, which is most of the system probe, and the
+version rules have no exceptions (`&&` and `||` arrived in 7.0, a here-string
+predates every supported version, and only the Desktop edition pipes through the
+console code page). Pass `measure_syntax: true` to have each construct actually
+parsed and the non-ASCII round-trip run; those answers are `measured` and cached
+under their own key, so neither answer is ever served for the other. The same
+call returns the shell's own version rather than the one its installer recorded.
 
 Uncertainty is always stated rather than smoothed over: an unexpandable
 `REG_EXPAND_SZ` value counts as unknown instead of being reported as a literal
