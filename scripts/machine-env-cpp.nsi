@@ -25,7 +25,7 @@ Unicode true
 !endif
 
 !define AppName "machine-env-cpp"
-!define AppVersion "0.3.1"
+!define AppVersion "0.3.2"
 !define UninstallKey "Software\Microsoft\Windows\CurrentVersion\Uninstall\machine-env-cpp"
 
 Name "${AppName}"
@@ -56,6 +56,15 @@ Section "Install"
   Pop $0
   Pop $1
   SetOutPath "$INSTDIR"
+  ; A client holds the server open for as long as it is open, so the running copy
+  ; has to go before the new one lands. Windows will not let a running executable
+  ; be overwritten but will let it be renamed, so it is moved aside first: the
+  ; rename succeeds even if the taskkill above lost a race with a restart, and a
+  ; copy that cannot be deleted yet costs nothing. Leftovers are cleared here on
+  ; the next install.
+  IfFileExists "$INSTDIR\machine-env-cpp.exe" 0 +3
+    Rename "$INSTDIR\machine-env-cpp.exe" "$INSTDIR\machine-env-cpp.exe.old"
+  Delete /REBOOTOK "$INSTDIR\machine-env-cpp.exe.old"
   File /oname=machine-env-cpp.exe "${SourceExe}"
   File /oname=configure-mcp.ps1 "${ConfigScript}"
   File /oname=client-registry.ps1 "${RegistryScript}"
@@ -99,9 +108,15 @@ Section "Uninstall"
 
   DeleteRegKey HKCU "${UninstallKey}"
   Delete "$INSTDIR\machine-env-cpp.exe"
+  Delete "$INSTDIR\machine-env-cpp.exe.old"
   Delete "$INSTDIR\configure-mcp.ps1"
   Delete "$INSTDIR\client-registry.ps1"
-  Delete "$INSTDIR\Uninstall.exe"
+  ; The portable scripts are not this installer's files, but they land in the same
+  ; directory when someone installed that way first. Leaving them behind is what
+  ; makes an uninstalled folder look installed.
+  Delete "$INSTDIR\install-portable.ps1"
+  Delete "$INSTDIR\uninstall-portable.ps1"
+  Delete /REBOOTOK "$INSTDIR\Uninstall.exe"
   RMDir "$INSTDIR"
 
   ; A file that could not be removed must not be reported as a clean removal.
