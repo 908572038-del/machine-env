@@ -64,5 +64,10 @@ Json cached_probe(const std::string& kind, bool refresh,
 // the diagnostics line; no behaviour depends on either number.
 std::uint64_t probe_attempts_started_total();
 std::uint64_t probe_inflight_peak();
+// Self-test hook: asserts that a WindowsApps alias is classified from its
+// reparse payload rather than from the file. Returns an empty string on
+// success and a description of the failure otherwise. Kept here because the
+// classification lives in an anonymous namespace in machine.cpp.
+std::string appexec_alias_selftest();
 
 }  // namespace machine_env

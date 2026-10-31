@@ -1671,6 +1671,16 @@ int selftest() {
     std::cout << "Concise and detailed tool results: OK\n";
     std::cout << "Measured shell capabilities: OK\n";
     std::cout << "Toolchain format, order, and name filter: OK\n";
+    // A WindowsApps alias only counts as a tool when its reparse payload
+    // names a real entry point. winget.exe (live) and a dead python3.exe are
+    // byte-identical on disk, so this asserts the payload parse rather than
+    // file existence.
+    {
+        const std::string alias_failure = appexec_alias_selftest();
+        if (!alias_failure.empty())
+            throw std::runtime_error(alias_failure);
+    }
+    std::cout << "WindowsApps alias payload resolution: OK\n";
     std::cout << "Installed application inventory and filter: OK\n";
     std::cout << "Network summary and failure reason: OK\n";
     std::cout << "Protocol negotiation: OK\n";

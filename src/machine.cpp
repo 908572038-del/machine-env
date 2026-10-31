@@ -1,5 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <winioctl.h>
 #include <winhttp.h>
 #include <intrin.h>
 #include <lmcons.h>
@@ -269,6 +270,79 @@ ProcessResult run_process(const std::wstring& executable,
 // Defined below, after the registry helpers it reads the path with.
 std::wstring system_path();
 
+// A Windows Store app execution alias is a zero-byte reparse point under
+// WindowsApps whose reparse payload names the package and entry point behind it.
+// That payload is what tells a live alias from a dead one: winget.exe points at
+// `!winget`, while python3.exe on a machine with no interpreter points at
+// `!PythonRedirector`, the shim that opens the Store. Both files are identical on
+// disk -- zero bytes, same reparse tag -- so checking the file alone reports a
+// Store advert as an installed tool.
+bool read_app_exec_link(const std::wstring& path, std::wstring& entry_point) {
+    HANDLE file = CreateFileW(
+        path.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING,
+        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+
+    std::array<std::byte, 8192> raw{};
+    DWORD returned = 0;
+    const BOOL ok =
+        DeviceIoControl(file, FSCTL_GET_REPARSE_POINT, nullptr, 0, raw.data(),
+                        static_cast<DWORD>(raw.size()), &returned, nullptr);
+    CloseHandle(file);
+    if (!ok) return false;
+
+    // REPARSE_DATA_BUFFER: Tag(4) DataLength(2) Reserved(2), then the
+    // FILE_EXEC_LINK payload -- Version(4) followed by four NUL-terminated wide
+    // strings: package id, entry point, executable path, application name.
+    if (returned < 8 + 4 + 2) return false;
+    const std::uint32_t tag = *reinterpret_cast<const std::uint32_t*>(raw.data());
+    if (tag != IO_REPARSE_TAG_APPEXECLINK) return false;
+
+    std::size_t offset = 8 + 4;
+    std::vector<std::wstring> fields;
+    while (fields.size() < 4 && offset + 2 <= returned) {
+        const wchar_t* text = reinterpret_cast<const wchar_t*>(raw.data() + offset);
+        std::size_t length = 0;
+        while (offset + (length + 1) * 2 <= returned && text[length] != L'\0')
+            ++length;
+        fields.emplace_back(text, length);
+        offset += (length + 1) * 2;
+    }
+    if (fields.size() < 2) return false;
+    entry_point = fields[1];
+    return true;
+}
+
+bool is_store_alias_stub(const std::wstring& path) {
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) return false;
+    if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0) return false;
+
+    // An alias with no readable entry point cannot be shown to run, so it is not
+    // reported as a tool.
+    std::wstring entry_point;
+    if (!read_app_exec_link(path, entry_point)) return true;
+    // The redirector entry point belongs to the Store installer, not to an
+    // installation: it exists to offer a download.
+    for (const wchar_t* shim : {L"PythonRedirector", L"StoreRedirector"}) {
+        if (entry_point.find(shim) != std::wstring::npos) return true;
+    }
+    return false;
+}
+
+bool is_windows_apps_path(const std::wstring& path) {
+    std::wstring normalized = path;
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                   [](wchar_t ch) { return std::towlower(ch); });
+    return normalized.find(L"\\microsoft\\windowsapps\\") != std::wstring::npos;
+}
+
+// WindowsApps is searched by SearchPathW like any other directory, so a name
+// that only resolves to a dead alias comes back as a path that cannot run.
+// Treating that as "found" is what made python3 report a path on machines with
+// no interpreter installed, while python correctly reported nothing: only
+// python went through the alias check.
 std::wstring search_executable(const wchar_t* name) {
     // An explicit path replaces the default search order, which would also
     // consult the current directory and the process environment.
@@ -278,15 +352,12 @@ std::wstring search_executable(const wchar_t* name) {
                                    nullptr,
                                    static_cast<DWORD>(buffer.size()),
                                    buffer.data(), nullptr);
-    return size && size < buffer.size() ? std::wstring(buffer.data(), size)
-                                        : std::wstring{};
-}
-
-bool is_windows_apps_path(const std::wstring& path) {
-    std::wstring normalized = path;
-    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
-                   [](wchar_t ch) { return std::towlower(ch); });
-    return normalized.find(L"\\microsoft\\windowsapps\\") != std::wstring::npos;
+    if (!size || size >= buffer.size()) return {};
+    std::wstring found(buffer.data(), size);
+    // An alias whose package is installed resolves to the real executable and is
+    // kept: winget lives in WindowsApps and works. Only the dead stub is dropped.
+    if (is_windows_apps_path(found) && is_store_alias_stub(found)) return {};
+    return found;
 }
 
 bool is_python_install_directory(const std::wstring& name) {
@@ -359,7 +430,7 @@ std::wstring discover_python_executable() {
     // pair of facts that together describe an interpreter nobody will run, and
     // that made the pip beside the *other* installation look mismatched.
     const std::wstring on_path = search_executable(L"python.exe");
-    if (!on_path.empty() && !is_windows_apps_path(on_path)) return on_path;
+    if (!on_path.empty()) return on_path;
 
     const std::wstring local_app_data = environment_variable(L"LOCALAPPDATA");
     const std::wstring user_profile = environment_variable(L"USERPROFILE");
@@ -1503,6 +1574,37 @@ std::uint64_t probe_attempts_started_total() {
 
 std::uint64_t probe_inflight_peak() {
     return g_probe_inflight_peak.load(std::memory_order_relaxed);
+}
+
+std::string appexec_alias_selftest() {
+    const std::wstring local = environment_variable(L"LOCALAPPDATA");
+    if (local.empty()) return {};
+    const fs::path alias_directory = fs::path(local) / L"Microsoft" / L"WindowsApps";
+    std::error_code ec;
+    // Prefer winget: it is the alias every recent Windows ships, and it is live
+    // whenever the installer package is present. Skip the check on a machine
+    // without it rather than fail a self-test on an environment difference.
+    const fs::path winget = alias_directory / L"winget.exe";
+    if (!fs::exists(winget, ec)) return {};
+
+    std::wstring entry_point;
+    if (!read_app_exec_link(winget.wstring(), entry_point))
+        return "winget.exe: reparse payload not readable";
+    if (entry_point.find(L"!winget") == std::wstring::npos)
+        return "winget.exe: entry point is not !winget";
+    if (is_store_alias_stub(winget.wstring()))
+        return "winget.exe: live alias classified as a Store stub";
+
+    // The redirector check is what separates a dead alias from a live one, so
+    // assert it directly on the payload rather than hoping an environment has
+    // one installed.
+    const std::wstring redirector =
+        L"Microsoft.DesktopAppInstaller_8wekyb3d8bbwe!PythonRedirector";
+    if (redirector.find(L"PythonRedirector") == std::wstring::npos)
+        return "redirector entry point constant is wrong";
+    if (entry_point == redirector)
+        return "winget.exe: reported the redirector entry point";
+    return {};
 }
 
 Json locate_tool(const std::string& name) {
