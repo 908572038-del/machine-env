@@ -1,0 +1,113 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.config }}
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [Release, Debug]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -A x64
+          -DCMAKE_CONFIGURATION_TYPES=${{ matrix.config }}
+
+      - name: Build
+        run: cmake --build build --config ${{ matrix.config }} --parallel
+
+      # The probe answers questions about the machine it runs on, so this asserts
+      # behaviour rather than a fixed expected value: the runner's own tool set
+      # differs from a developer's.
+      - name: Native self-test
+        shell: pwsh
+        run: |
+          $exe = './build/${{ matrix.config }}/machine-env-cpp.exe'
+          & $exe --selftest
+          if ($LASTEXITCODE -ne 0) {
+              throw "selftest failed with exit code $LASTEXITCODE"
+          }
+
+      # A Store alias is a zero-byte reparse point, so a probe that answers from
+      # the file reports an interpreter that is not installed. GitHub's images
+      # ship the aliases without the packages, which is exactly the shape that
+      # made python3 look installed here.
+      - name: Store aliases are not tools
+        shell: pwsh
+        run: |
+          $exe = './build/${{ matrix.config }}/machine-env-cpp.exe'
+          $wire = Join-Path $env:RUNNER_TEMP 'probe.jsonl'
+          $messages = @(
+              '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}',
+              '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_tools","arguments":{"refresh":true,"detail":true}}}'
+          )
+          [System.IO.File]::WriteAllLines(
+              $wire, $messages, (New-Object System.Text.UTF8Encoding $false))
+
+          $raw = Get-Content -LiteralPath $wire | & $exe 2>$null
+          $line = $raw | Where-Object { $_ -match '"id"\s*:\s*2' }
+          if (-not $line) { throw 'no get_tools response' }
+          $payload = ($line | ConvertFrom-Json).result.content[0].text | ConvertFrom-Json
+
+          $aliases = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps'
+          foreach ($name in $payload.tools.PSObject.Properties.Name) {
+              $path = $payload.tools.$name
+              if (-not (Test-Path -LiteralPath $path)) {
+                  throw "reported $name at a path that does not exist: $path"
+              }
+              # A reported tool under WindowsApps must actually run. The file
+              # cannot settle this -- a live alias (winget.exe) and a dead one
+              # (a Store-only python3.exe) are both zero-byte reparse points --
+              # so the check runs the alias and looks for the Store advert the
+              # redirector prints instead of a version.
+              if ($path.StartsWith($aliases, 'OrdinalIgnoreCase')) {
+                  $output = ''
+                  try {
+                      $output = (& $path --version 2>&1 | Select-Object -First 1) -join ' '
+                  } catch {
+                      $output = ''
+                  }
+                  if ($output -match 'Microsoft Store') {
+                      throw "reported a Store advert as a tool: $name -> $output"
+                  }
+              }
+          }
+
+          foreach ($dead in @('python', 'python3', 'pip', 'pip3')) {
+              if ($payload.tools.PSObject.Properties.Name -contains $dead) {
+                  $path = $payload.tools.$dead
+                  if ($path -like '*\WindowsApps\*') {
+                      $output = ''
+                      try {
+                          $output = (& $path --version 2>&1 | Select-Object -First 1) -join ' '
+                      } catch {
+                          $output = ''
+                      }
+                      if (-not $output -or $output -match 'Microsoft Store') {
+                          throw "reported dead Store alias as a tool: $dead"
+                      }
+                  }
+              }
+          }
+          Write-Host 'alias classification: OK'
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: machine-env-cpp-${{ matrix.config }}
+          path: build/${{ matrix.config }}/machine-env-cpp.exe
+          if-no-files-found: error
