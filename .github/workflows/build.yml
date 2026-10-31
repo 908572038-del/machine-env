@@ -1,4 +1,4 @@
-name: build
+﻿name: build
 
 on:
   push:
@@ -20,7 +20,7 @@ jobs:
         config: [Release, Debug]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Configure
         run: >
@@ -106,7 +106,7 @@ jobs:
           Write-Host 'alias classification: OK'
 
       - name: Upload binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: machine-env-cpp-${{ matrix.config }}
           path: build/${{ matrix.config }}/machine-env-cpp.exe
