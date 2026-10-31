@@ -72,19 +72,36 @@ New-Item -ItemType Directory -Path $installDirectory -Force | Out-Null
 # An editor that has already started the server holds the executable open, and
 # the raw failure for that is a bare IOException on Copy-Item, which says
 # nothing about what to close. Upgrading under a running client is the normal
-# case, not an exotic one, so it is worth naming.
-try {
-    Copy-Item -LiteralPath $builtServer -Destination $server -Force
-} catch [System.IO.IOException] {
-    $holders = @(Get-Process -Name 'machine-env-cpp' -ErrorAction SilentlyContinue |
-        Select-Object -ExpandProperty Id)
-    $who = if ($holders.Count -gt 0) {
-        "The server is running as process $($holders -join ', ')"
-    } else {
-        'The installed executable is in use'
+# case, not an exotic one: Windows will not let a running executable be
+# overwritten, but it will let it be renamed, so the old copy is moved aside and
+# the new one takes its place without asking the user to close the editor.
+if (Test-Path -LiteralPath $server) {
+    $retired = "$server.old-$PID"
+    try {
+        Move-Item -LiteralPath $server -Destination $retired -Force
+    } catch {
+        $holders = @(Get-Process -Name 'machine-env-cpp' -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty Id)
+        $who = if ($holders.Count -gt 0) {
+            "The server is running as process $($holders -join ', ')"
+        } else {
+            'The installed executable is in use'
+        }
+        throw "$who, so the installed copy at $server cannot be replaced. Close the editor or client that runs it (or stop that process) and run this again."
     }
-    throw "$who, so the installed copy at $server cannot be replaced. Close the editor or client that runs it (or stop that process) and run this again."
+    try {
+        Remove-Item -LiteralPath $retired -Force -ErrorAction Stop
+    } catch {
+        # Still running, so the file cannot be removed yet. A leftover beside the
+        # install is harmless and the next install clears it.
+        Write-Host "The previous server is still running; its file is removed on the next install: $retired" -ForegroundColor Yellow
+    }
 }
+Get-ChildItem -LiteralPath $installDirectory -Filter 'machine-env-cpp.exe.old-*' -ErrorAction SilentlyContinue |
+    ForEach-Object {
+        try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop } catch { }
+    }
+Copy-Item -LiteralPath $builtServer -Destination $server -Force
 Copy-Item -LiteralPath $configScriptSource -Destination $installDirectory -Force
 Copy-Item -LiteralPath $uninstallScriptSource -Destination $installDirectory -Force
 Copy-Item -LiteralPath $registrySource -Destination $installDirectory -Force

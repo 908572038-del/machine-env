@@ -24,14 +24,9 @@ Capability fields report how the answer was obtained: `measured` was observed by
 running a harmless probe, `derived` follows from a version, and `unknown` means
 it was not verified and must not be read as support.
 
-Shell syntax support defaults to `derived`: starting Windows PowerShell costs
-about 1.7s on a low-power machine, which is most of the system probe, and the
-version rules have no exceptions (`&&` and `||` arrived in 7.0, a here-string
-predates every supported version, and only the Desktop edition pipes through the
-console code page). Pass `measure_syntax: true` to have each construct actually
-parsed and the non-ASCII round-trip run; those answers are `measured` and cached
-under their own key, so neither answer is ever served for the other. The same
-call returns the shell's own version rather than the one its installer recorded.
+Pass `measure_syntax: true` to `get_system` to have shell syntax support parsed
+rather than derived; the answer then says `measured` and reports the shell's own
+version. The trade and its cost are described under [Build and install](#build-and-install).
 
 Uncertainty is always stated rather than smoothed over: an unexpandable
 `REG_EXPAND_SZ` value counts as unknown instead of being reported as a literal
@@ -246,12 +241,24 @@ preferred when it is installed, so `shell_path` and `shell_kind` are what tell a
 caller which executable the probed values describe; the capability values
 themselves live under `shell.capabilities` (`ampersand_ampersand`, `here_string`,
 `non_ascii_pipe_utf8`), and `windows_powershell_version` records the legacy
-version whenever the legacy shell can be found and queried. All of those facts
-come from a single shell invocation — version, edition, host, execution policy,
-and the capability probes are answered by one script that tags each line — and
-the legacy version is queried in parallel when both shells exist, so the answer
-costs two processes at most instead of four in sequence. The preference is a
+version whenever the legacy shell can be found and queried. The preference is a
 choice of shell to probe, not a detection of the terminal a caller is using.
+
+A default probe starts no shell at all. The version, edition and host come from
+`HKLM\SOFTWARE\Microsoft\PowerShell\3\PowerShellEngine`, which is what the
+installer recorded, and the execution policy from the same registry tree; the
+capability fields are then decided from those values and say `source: derived`.
+That matters because starting Windows PowerShell costs about 1.7s on a low-power
+machine before it runs a single statement: reading the registry turned a 2.6s
+system probe into 46ms (measured on a Celeron N5095A). `measure_syntax: true`
+buys the measurement back: it starts the shell once, parses `&&` and a
+here-string, runs the non-ASCII round-trip, and reports `source: measured`
+together with the shell's own version rather than the recorded one. The two
+answers are cached under separate keys, so a derived result is never served to a
+caller who asked for a measurement. The engine key records the version at
+installation and Windows updates the files without rewriting it, which is why a
+derived probe can report a slightly older build: only the major version is
+compared, and that is what every rule here depends on.
 
 `build-installer.ps1` creates `build\installer\machine-env-cpp-setup.exe`
 using NSIS. The installer is per-user, includes the prebuilt server and the

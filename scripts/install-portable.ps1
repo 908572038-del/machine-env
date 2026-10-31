@@ -50,6 +50,30 @@ if ($LASTEXITCODE -ne 0) {
 $installDirectory = Join-Path $env:LOCALAPPDATA 'Programs\machine-env-cpp'
 $installedServer = Join-Path $installDirectory 'machine-env-cpp.exe'
 New-Item -ItemType Directory -Path $installDirectory -Force | Out-Null
+# An MCP server is started by its client and stays running while that client is
+# open, which is exactly when someone installs an upgrade. Windows will not let a
+# running executable be overwritten, but it will let it be renamed, so the old
+# copy is moved aside first and the new one takes its place. The old file cannot
+# be deleted while it still runs; a leftover is harmless and is cleaned up by the
+# next install, which is better than failing the upgrade and leaving the user
+# with a server they cannot update without knowing to close the editor.
+if (Test-Path -LiteralPath $installedServer) {
+    $retired = "$installedServer.old-$PID"
+    try {
+        Move-Item -LiteralPath $installedServer -Destination $retired -Force
+    } catch {
+        throw "Could not replace the running server at $installedServer. Close the editor or client that started it, then run this script again."
+    }
+    try {
+        Remove-Item -LiteralPath $retired -Force -ErrorAction Stop
+    } catch {
+        Write-Host "The previous server is still running; its file is removed on the next install: $retired" -ForegroundColor Yellow
+    }
+}
+Get-ChildItem -LiteralPath $installDirectory -Filter 'machine-env-cpp.exe.old-*' -ErrorAction SilentlyContinue |
+    ForEach-Object {
+        try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop } catch { }
+    }
 Copy-Item -LiteralPath $sourceServer -Destination $installedServer -Force
 Copy-Item -LiteralPath $configScript -Destination $installDirectory -Force
 Copy-Item -LiteralPath $uninstallScript -Destination $installDirectory -Force

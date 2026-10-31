@@ -33,7 +33,7 @@ namespace machine_env {
 namespace {
 
 namespace fs = std::filesystem;
-constexpr char kServerVersion[] = "0.3.1";
+constexpr char kServerVersion[] = "0.3.2";
 constexpr int kDefaultTtl = 24 * 60 * 60;
 constexpr int kNetworkTtl = 10 * 60;
 // Installing a compiler or a package manager and then being told it is not
