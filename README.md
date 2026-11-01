@@ -4,7 +4,7 @@ A native Windows MCP server that reports observed machine facts to coding
 agents: CPU instruction-set support, installed developer tools, Windows and
 shell details, filesystem paths, and optional network reachability.
 
-The MCP server and probes are implemented in C++17. The PowerShell scripts are
+The MCP server and probes are implemented in C++20. The PowerShell scripts are
 used as Windows build/setup glue. Tool discovery covers common language
 runtimes, compilers, build systems, JavaScript package managers, container and
 WSL commands, editors, Windows package managers, archive utilities, installer
@@ -136,7 +136,7 @@ rather than an error: VS Code reads `servers` while the others read
 installers, the portable scripts, and the NSIS package all read it instead of
 each carrying their own copy.
 
-`CMakeLists.txt` defines the C++17 target and Windows system libraries.
+`CMakeLists.txt` defines the C++20 target and Windows system libraries.
 `build.ps1` locates Visual Studio and Ninja, configures/builds with CMake,
 produces `build\machine-env-cpp.exe`, and runs its native self-test. `install.ps1`
 copies the server to `%LOCALAPPDATA%\Programs\machine-env-cpp` and updates the
