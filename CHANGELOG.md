@@ -9,65 +9,82 @@ generated header carries it to `--version` and the fingerprint, and
 
 ### Added
 
-- LICENSE (MIT) and status badges for the build, the latest release, the licence
-  and the platform. The repository had no licence, so the front page said "No
-  license" and nothing granted anyone the right to use it.
-
-### Fixed
-
-- The README's opening paragraph said the server is written in C++17, which
-  stopped being true in a3e55c7. That line is what a reader checks to decide
-  whether their toolset can build this.
-
-### Added
-
 - `.github/workflows/release.yml` publishes what a person actually installs from
   a `v*` tag: the portable ZIP, the desktop installer, the bare executable, and a
   `SHA256SUMS.txt`. It refuses a tag that does not match the project version,
   because a `v0.5.0` tag shipping a `0.4.0` binary is invisible until someone
   reads `--version` on a fresh install.
-- The portable package and the installer are named after the version, so two
-  downloads cannot be confused for each other.
+- LICENSE (MIT) and status badges for the build, the latest release, the licence
+  and the platform. The repository had no licence, so the front page said "No
+  license" and nothing granted anyone the right to use it.
+- `docs/build.md` and `docs/design.md` hold the build walkthrough and the cache
+  and concurrency design, so the README can stay a page a visitor reads.
 
 ### Changed
 
-- The version is written once, in `CMakeLists.txt`. `src/version.hpp.in` is
-  generated from `project(... VERSION ...)` and every consumer reads it:
-  `--version`, the source fingerprint, the portable package name, and
-  `build-installer.ps1`, which passes it to NSIS so the uninstall entry names the
-  server it actually contains. Changing the version in one place now moves all of
-  them -- verified by building 9.9.9 and watching `--version` follow.
-- The project is now C++20, and CMake requires it: `CMAKE_CXX_STANDARD 20` with
+- The project is C++20, and CMake requires it: `CMAKE_CXX_STANDARD 20` with
   `CMAKE_CXX_STANDARD_REQUIRED ON`. There is no C++17 fallback, because two
   spellings of the same code would mean one of them is never compiled and never
   tested. A toolset without `<format>`, `<span>` or `<bit>` now fails to build
   instead of silently taking a different path.
 - `/Zc:__cplusplus` is set for MSVC. Without it `__cplusplus` reports 199711L on
-  every toolset, so a feature test written in the source would answer about
-  C++98 and be wrong on a compiler that supports more.
+  every toolset, so a feature test written in the source answers about C++98.
+- The version is written once, in `CMakeLists.txt`. `src/version.hpp.in` is
+  generated from `project(... VERSION ...)` and every consumer reads it:
+  `--version`, the source fingerprint, the portable package name, and
+  `build-installer.ps1`, which passes it to NSIS so the uninstall entry names the
+  server it actually contains.
+- `get_system` starts no shell by default. The version, edition and host come
+  from `HKLM\SOFTWARE\Microsoft\PowerShell\3\PowerShellEngine`, and the execution
+  policy from the same registry tree. A cold probe went from 2.6s to 46ms on a
+  Celeron N5095A, because starting Windows PowerShell costs about 1.7s before it
+  runs a statement. The capability fields say `source: derived`;
+  `measure_syntax: true` parses each construct and says `measured` instead, and
+  the two answers are cached under separate keys.
+- The README was cut from 465 lines to about 100. The build walkthrough and the
+  cache design moved to `docs/`, where a reader who wants them can find them
+  without scrolling past them.
 
 ### Fixed
 
-- Reading an app execution alias no longer relies on pointer arithmetic over a
-  fixed buffer. The bytes the kernel reported are held in a `std::span` and every
-  read goes through it, the tag is read with `std::bit_cast` instead of a
-  `reinterpret_cast` to a misaligned `uint32_t*`, and the payload is split on NUL
-  through a `std::wstring_view` rather than by advancing an offset by hand.
-  Behaviour is unchanged -- the values it returns were checked field by field
-  against 0.3.2 -- but the bound now lives in one place instead of in each loop
-  condition.
-- The redirector test compares the application name rather than searching the
-  whole entry point. An entry point is `<package>!<application>`, so a package
-  whose name contained the shim would have matched before.
+- `get_tools` answered two ways for the same question. A catalogued tool that is
+  not installed vanished from `tools` and appeared nowhere, so
+  `name: "python, node"` returned an empty map with no explanation, while a name
+  the catalog never heard of came back in `unresolved_tools`. Every requested
+  name that resolved to nothing is now listed, whether or not the catalog covered
+  it.
+- `get_network` called a timeout "unreachable". WinHTTP 12002 means the request
+  did not finish in time, and a larger budget might answer differently; that is a
+  claim about the attempt, not about the host. An endpoint that ran out of time
+  now says so, and the tally counts it apart: `3/4 reachable, 1 did not answer in
+  time`, not `3/4`.
+- A dead Windows Store alias was reported as an installed tool. `python3.exe`
+  under `WindowsApps` is a zero-byte reparse point that only opens the Store, and
+  `SearchPathW` returns it like any other executable. The reparse payload names
+  the entry point behind the alias, and a live tool resolves to its own
+  (`!winget`) while a Store advert resolves to `!PythonRedirector`, so only the
+  redirector entries are dropped.
+- The alias reader no longer walks a fixed buffer by hand. The reported bytes are
+  held in a `std::span`, the tag is read with `std::bit_cast`, and the payload is
+  split through a `std::wstring_view`.
+- `install.ps1` and `install-portable.ps1` could not replace a server that was
+  running, which is the normal state during an upgrade: a client holds it open
+  for as long as the client is open. Windows will not let a running executable be
+  overwritten but will let it be renamed, so the old copy is moved aside first.
+- Uninstall left the portable scripts and its own binary behind.
+- The packaging scripts only looked for `build\machine-env-cpp.exe`, which is
+  where the Ninja build leaves it. CMake's Visual Studio generator writes
+  `build\Release\`, so the scripts were unusable in exactly the CI job that
+  needed them.
+- The README's opening paragraph still claimed C++17 after the project moved.
 
 ### Internal
 
-- `starts_with` replaces six `rfind(..., 0) == 0` calls. `std::string_view` gains
-  it in C++23, not C++20, so it is one constexpr function in `machine.hpp` rather
-  than an index search written out at each site.
-- `std::format` replaces the `std::ostringstream` and `std::to_string`
-  concatenation used for machine identifiers, fingerprints, cache filenames,
-  Windows error messages and the synthesized application names in the self-test.
+- Six `rfind(..., 0) == 0` calls became `starts_with`, written once in
+  `machine.hpp` because `string_view` gains it in C++23 rather than C++20.
+- `std::format` replaced the `ostringstream` and `to_string` concatenation used
+  for machine ids, fingerprints, cache filenames, Windows error messages, and the
+  synthesized application names in the self-test.
 ## 0.3.2
 
 ### Fixed

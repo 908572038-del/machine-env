@@ -500,8 +500,20 @@ std::string summarize_network(const Json& value) {
             if (status.is_number())
                 output << "（HTTP " << status.as_integer() << "）";
         } else {
-            output << "不可达";
             const std::string reason = string_field(endpoint, "reason");
+            // "Unreachable" is a claim about the host; a timeout is a claim
+            // about this attempt. A caller who reads "unreachable (timeout)"
+            // concludes the host is down, when the honest reading is that the
+            // measurement ran out of time and a larger one might say
+            // something else. Only the reasons that show the host answered --
+            // or refused -- are reported as unreachable, and the ones that show
+            // it merely did not answer in time are counted apart.
+            if (reason == "timeout" || reason == "budget") {
+                ++over_budget;
+                output << "未在时限内答复";
+            } else {
+                output << "不可达";
+            }
             if (!reason.empty()) output << "（原因：" << reason << "）";
         }
         const Json& ms = endpoint.get("ms");
@@ -511,10 +523,16 @@ std::string summarize_network(const Json& value) {
         output << "\n全部端点已跳过";
     else
         output << "\n可达 " << reachable << "/" << checked << " 个目标";
+    // An attempt that ran out of time is counted apart from the hosts that
+    // answered. "3/4 reachable" reads as one host being down; "3/4 answered, 1
+    // did not answer in time" says what was actually established, and a caller
+    // can decide whether to spend a larger budget rather than concluding the
+    // network is broken.
+    if (over_budget > 0 && checked > 0)
+        output << "，其中 " << over_budget << " 个未在时限内答复";
     if (skipped_count > 0 && checked > 0)
         output << "，跳过 " << skipped_count << " 个";
     if (over_budget > 0) {
-        output << "，其中 " << over_budget << " 个超过预算未完成";
         const Json& budget = value.get("budget_ms");
         if (budget.is_number())
             // The old wording promised that a bigger timeout would finish the
@@ -933,6 +951,29 @@ void narrow_tools(Json& payload, const std::vector<std::string>& filter) {
     narrow_listed("version_unknown");
     narrow_listed("not_on_path");
     narrow_listed("unresolved_tools");
+
+    // A name in the catalog that is not installed disappears from `tools` when it
+    // is narrowed, and it was never in `unresolved_tools` because that field only
+    // collects names the catalog does not know. The answer to "do I have python"
+    // and "do I have frobnicate" then have different shapes -- an empty map versus
+    // a named list -- and a caller has to guess which silence it is looking at.
+    // Every requested name that resolved to nothing belongs in the same list,
+    // whether or not the catalog covered it.
+    {
+        const Json& resolved = payload.get("tools");
+        Json& unresolved = payload["unresolved_tools"];
+        if (!unresolved.is_array()) unresolved = Json::array();
+        const auto already_listed = [&unresolved](const std::string& name) {
+            for (const auto& item : unresolved.as_array())
+                if (item.is_string() && item.as_string() == name) return true;
+            return false;
+        };
+        for (const auto& name : filter) {
+            if (resolved.is_object() && resolved.contains(name)) continue;
+            if (already_listed(name)) continue;
+            unresolved.as_array().emplace_back(name);
+        }
+    }
 
     // tool_count deliberately keeps meaning "how many tools this probe found"
     // -- it is the frame the payload was cut out of, the same role count plays
@@ -1606,6 +1647,33 @@ int selftest() {
                           parse_filter("no such phrase"))
             .find("没有匹配的工具") == std::string::npos)
         throw std::runtime_error("a filter matching nothing did not say so");
+
+    // A catalogued tool that is not installed and a name the catalog never heard
+    // of must reach a caller the same way. They did not: the first vanished from
+    // `tools` and appeared nowhere, so "do I have python" answered with an empty
+    // map and no explanation, while "do I have frobnicate" answered with a named
+    // entry. narrow_tools now lists both.
+    {
+        Json narrowed = Json::object();
+        narrowed["tools"] = Json::object();
+        narrowed["tools"]["cmake"] = "C:\\cmake.exe";
+        narrow_tools(narrowed, parse_filter("cmake, python"));
+        const Json& unresolved_after = narrowed.get("unresolved_tools");
+        if (!unresolved_after.is_array())
+            throw std::runtime_error("narrowing dropped unresolved_tools");
+        bool listed_python = false;
+        for (const auto& item : unresolved_after.as_array())
+            if (item.is_string() && item.as_string() == "python")
+                listed_python = true;
+        if (!listed_python)
+            throw std::runtime_error(
+                "a requested but absent catalogued tool was not reported");
+        // The one that was found must not be claimed as missing.
+        for (const auto& item : unresolved_after.as_array())
+            if (item.is_string() && item.as_string() == "cmake")
+                throw std::runtime_error(
+                    "a resolved tool was also reported as unresolved");
+    }
 
     // An app list must keep the version distinguishable from the name, and a
     // truncated list must state how many matched, not how many are installed.
