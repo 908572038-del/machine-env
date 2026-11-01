@@ -1,0 +1,20 @@
+# Keep the language bar describing what the project is written in. GitHub counts
+# every tracked file by extension, and a Chinese-titled Markdown file came out as
+# an unrecognised entry in the bar, which says nothing useful about the code.
+#
+# Documentation is not a language, so it is excluded from the statistics rather
+# than allowed to compete with the source.
+*.md linguist-documentation
+*.txt linguist-documentation
+
+# Line-ending behaviour, kept explicit so a checkout on this machine and a CI
+# checkout on a Windows runner produce the same bytes. The PowerShell scripts are
+# read by Windows PowerShell 5.1, which needs a BOM to read them as UTF-8;
+# rewriting them with a plain LF would silently break the Chinese strings they
+# contain, so they keep CRLF and no encoding override is declared.
+*.ps1 text eol=crlf
+*.cpp text eol=crlf
+*.hpp text eol=crlf
+*.in text eol=crlf
+*.yml text eol=lf
+*.md text eol=lf
