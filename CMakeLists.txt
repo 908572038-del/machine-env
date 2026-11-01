@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.21)
+﻿cmake_minimum_required(VERSION 3.21)
 
 project(machine-env-cpp VERSION 0.4.0 LANGUAGES CXX)
 
@@ -10,6 +10,17 @@ add_executable(machine-env-cpp
     src/main.cpp
     src/machine.cpp
 )
+
+# project(... VERSION ...) is the only place the version is written. Generating a
+# header from it means --version, the fingerprint, the installer's uninstall
+# entry and the release tag cannot drift apart -- a release that reports the
+# previous version is a claim about the machine that is simply wrong.
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/version.hpp.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/version.hpp"
+    @ONLY)
+target_include_directories(machine-env-cpp PRIVATE
+    "${CMAKE_CURRENT_BINARY_DIR}/generated")
 
 target_compile_features(machine-env-cpp PRIVATE cxx_std_20)
 target_compile_definitions(machine-env-cpp PRIVATE UNICODE _UNICODE)

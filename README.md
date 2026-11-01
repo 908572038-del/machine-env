@@ -75,6 +75,22 @@ later probe, including one that asked to refresh. `path_source` records which of
 the two was used, and `process_path_differs` reports whether they currently
 disagree.
 
+## Download
+
+Releases carry the two artifacts a person installs, built from the tagged commit
+on a clean Windows runner:
+
+| File | Use |
+| --- | --- |
+| `machine-env-cpp-<version>-windows-x64.zip` | Portable. Extract, run `install-portable.ps1`. Needs nothing installed |
+| `machine-env-cpp-<version>-setup.exe` | Per-user install with an uninstall entry in Apps & features |
+| `SHA256SUMS.txt` | Verify either download without trusting the transport |
+
+Neither needs Visual Studio, CMake, Ninja or NSIS. Releases are produced by
+`.github/workflows/release.yml` from a `v*` tag, and it refuses a tag that does
+not match the project version: the version is written once in `CMakeLists.txt`,
+and `--version`, the fingerprint, the portable package name and the installer's
+uninstall entry all read it from there.
 ## Build and install
 
 Requirements: Windows x64 and Visual Studio with the C++ workload, and a

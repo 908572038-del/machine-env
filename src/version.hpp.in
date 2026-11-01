@@ -1,0 +1,8 @@
+#pragma once
+
+// Written by CMake from project(... VERSION ...), which is the only place the
+// version is spelled. Every consumer -- --version, the fingerprint, the
+// installer's uninstall entry -- reads this, so they cannot disagree.
+namespace machine_env {
+inline constexpr char kServerVersion[] = "@PROJECT_VERSION@";
+}  // namespace machine_env

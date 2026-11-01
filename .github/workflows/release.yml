@@ -1,0 +1,126 @@
+# Publishes the two artifacts a person actually installs, and attaches them to a
+# GitHub Release so a download needs no build tools.
+#
+# Triggered by a tag rather than by a push to main: a release is a decision, and
+# the tag is where that decision is recorded. The tag is checked against the
+# version in CMakeLists.txt first -- a v0.5.0 tag that shipped a 0.4.0 binary
+# would be a claim about the machine that is simply wrong, and it is the kind of
+# mistake that is invisible until someone reads --version on a fresh install.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to publish, for example v0.4.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: windows-2022
+    permissions:
+      # Only the step that creates the release needs this; the build steps above
+      # it run with the default read-only token.
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Check the tag names the version it builds
+        shell: pwsh
+        run: |
+          $tag = '${{ inputs.tag || github.ref_name }}'
+          $declared = (Select-String -Path CMakeLists.txt `
+              -Pattern 'project\s*\([^)]*VERSION\s+([0-9]+\.[0-9]+\.[0-9]+)' |
+              Select-Object -First 1).Matches[0].Groups[1].Value
+          if (-not $declared) { throw 'no version in CMakeLists.txt' }
+          if ($tag -ne "v$declared") {
+              throw "tag '$tag' does not match the project version 'v$declared'"
+          }
+          Write-Host "releasing v$declared"
+
+      - name: Configure
+        run: cmake -S . -B build -A x64 -DCMAKE_CONFIGURATION_TYPES=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Self-test
+        shell: pwsh
+        run: |
+          & ./build/Release/machine-env-cpp.exe --selftest
+          if ($LASTEXITCODE -ne 0) { throw "selftest failed" }
+
+      # The portable ZIP is the artifact this repository owns end to end: it is
+      # produced by a script in the tree and needs nothing installed. The NSIS
+      # installer is built only when NSIS is present, so a missing packaging tool
+      # cannot turn a good build into a failed release.
+      - name: Portable package
+        shell: pwsh
+        run: ./scripts/package-portable.ps1 -SkipBuild
+
+      - name: Desktop installer
+        shell: pwsh
+        run: |
+          $nsis = Join-Path ${env:ProgramFiles(x86)} 'NSIS\makensis.exe'
+          if (-not (Test-Path -LiteralPath $nsis)) {
+              Write-Host 'NSIS not present; skipping the desktop installer' -ForegroundColor Yellow
+              return
+          }
+          ./scripts/build-installer.ps1 -SkipBuild
+
+      - name: Collect
+        shell: pwsh
+        run: |
+          $stage = Join-Path $env:RUNNER_TEMP 'stage'
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          $version = (Select-String -Path CMakeLists.txt `
+              -Pattern 'project\s*\([^)]*VERSION\s+([0-9]+\.[0-9]+\.[0-9]+)' |
+              Select-Object -First 1).Matches[0].Groups[1].Value
+
+          $zip = 'build/release/machine-env-cpp-windows-x64.zip'
+          if (-not (Test-Path -LiteralPath $zip)) { throw "missing $zip" }
+          Copy-Item $zip (Join-Path $stage "machine-env-cpp-$version-windows-x64.zip")
+
+          foreach ($setup in @('build/installer/machine-env-cpp-setup.exe',
+                               'build/machine-env-cpp-setup.exe')) {
+              if (Test-Path -LiteralPath $setup) {
+                  Copy-Item $setup (Join-Path $stage "machine-env-cpp-$version-setup.exe")
+                  break
+              }
+          }
+
+          Copy-Item 'build/Release/machine-env-cpp.exe' (Join-Path $stage 'machine-env-cpp.exe')
+
+          # A checksum is what makes a download verifiable without trusting the
+          # transport, and it costs one line to publish.
+          Get-ChildItem $stage -File | ForEach-Object {
+              $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
+              "$hash  $($_.Name)"
+          } | Set-Content (Join-Path $stage 'SHA256SUMS.txt') -Encoding ascii
+
+          Get-ChildItem $stage | Format-Table Name, Length
+
+      - name: Publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = '${{ inputs.tag || github.ref_name }}'
+          $stage = Join-Path $env:RUNNER_TEMP 'stage'
+          $existing = gh release view $tag 2>$null
+          if ($LASTEXITCODE -eq 0) {
+              gh release upload $tag (Join-Path $stage '*') --clobber
+          } else {
+              gh release create $tag (Join-Path $stage '*') `
+                  --title $tag `
+                  --notes "Windows x64 build of machine-env-cpp. Download the ZIP for a portable install that needs no build tools, or the setup EXE for a per-user install with an uninstall entry. Verify against SHA256SUMS.txt."
+          }

@@ -25,7 +25,12 @@ Unicode true
 !endif
 
 !define AppName "machine-env-cpp"
-!define AppVersion "0.4.0"
+; Passed in by build-installer.ps1 from CMake's project VERSION, so the installer
+; and the server it installs cannot report different versions. The default keeps
+; a bare `makensis scripts\machine-env-cpp.nsi` working.
+!ifndef AppVersion
+  !define AppVersion "0.4.0"
+!endif
 !define UninstallKey "Software\Microsoft\Windows\CurrentVersion\Uninstall\machine-env-cpp"
 
 Name "${AppName}"

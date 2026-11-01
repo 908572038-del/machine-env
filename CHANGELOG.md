@@ -1,12 +1,30 @@
 # Changelog
 
 Notable changes to machine-env-cpp. Versions follow the one in
-`project(... VERSION ...)` and in `kServerVersion`, which `--version` reports.
+`project(... VERSION ...)`, which is the only place the number is written: a
+generated header carries it to `--version` and the fingerprint, and
+`build-installer.ps1` passes it to NSIS.
 
 ## 0.4.0
 
+### Added
+
+- `.github/workflows/release.yml` publishes what a person actually installs from
+  a `v*` tag: the portable ZIP, the desktop installer, the bare executable, and a
+  `SHA256SUMS.txt`. It refuses a tag that does not match the project version,
+  because a `v0.5.0` tag shipping a `0.4.0` binary is invisible until someone
+  reads `--version` on a fresh install.
+- The portable package and the installer are named after the version, so two
+  downloads cannot be confused for each other.
+
 ### Changed
 
+- The version is written once, in `CMakeLists.txt`. `src/version.hpp.in` is
+  generated from `project(... VERSION ...)` and every consumer reads it:
+  `--version`, the source fingerprint, the portable package name, and
+  `build-installer.ps1`, which passes it to NSIS so the uninstall entry names the
+  server it actually contains. Changing the version in one place now moves all of
+  them -- verified by building 9.9.9 and watching `--version` follow.
 - The project is now C++20, and CMake requires it: `CMAKE_CXX_STANDARD 20` with
   `CMAKE_CXX_STANDARD_REQUIRED ON`. There is no C++17 fallback, because two
   spellings of the same code would mean one of them is never compiled and never

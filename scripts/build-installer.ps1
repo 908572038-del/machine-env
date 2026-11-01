@@ -51,8 +51,25 @@ if (-not $makensis) {
 }
 
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
+# The version is read from CMake rather than repeated here, so the installer's
+# uninstall entry always names the server it actually contains. Reading it from
+# the CMakeLists keeps this script working without configuring the project first.
+$CMakeLists = Join-Path $Root 'CMakeLists.txt'
+$AppVersion = '0.0.0'
+if (Test-Path -LiteralPath $CMakeLists) {
+    $match = Select-String -LiteralPath $CMakeLists -Pattern 'project\s*\([^)]*VERSION\s+([0-9]+\.[0-9]+\.[0-9]+)' |
+        Select-Object -First 1
+    if ($match) {
+        $AppVersion = $match.Matches[0].Groups[1].Value
+    }
+}
+if ($AppVersion -eq '0.0.0') {
+    throw "Could not read the project version from $CMakeLists"
+}
+Write-Host "Packaging machine-env-cpp $AppVersion" -ForegroundColor Cyan
 & $makensis '/V2' "/DSourceExe=$SourceExe" "/DConfigScript=$ConfigScript" `
-    "/DRegistryScript=$RegistryScript" "/DOutputFile=$OutputFile" $InstallerScript
+    "/DRegistryScript=$RegistryScript" "/DOutputFile=$OutputFile" `
+    "/DAppVersion=$AppVersion" $InstallerScript
 if ($LASTEXITCODE -ne 0) {
     throw "NSIS compilation failed with exit code $LASTEXITCODE"
 }
