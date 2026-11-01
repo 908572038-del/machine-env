@@ -1663,7 +1663,10 @@ Json probe_toolchain(bool include_versions) {
     const std::wstring vs_root = visual_studio_root(vs_detection);
     result["vs_path"] = utf8(vs_root);
     result["vs_detection"] = vs_detection;
-    result["python_root"] = "";
+    // python_root is only written when an interpreter was found. Emitting an
+    // empty string for "not found" makes the field look answered and silent at
+    // once: a caller cannot tell "no python" from "python exists but its
+    // directory could not be derived", and both read as an empty path.
     std::wstring python_directory;
     bool pip_mismatch = false;
     int tool_count = 0;

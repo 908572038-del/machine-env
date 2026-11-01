@@ -532,20 +532,24 @@ std::string summarize_network(const Json& value) {
         output << "，其中 " << over_budget << " 个未在时限内答复";
     if (skipped_count > 0 && checked > 0)
         output << "，跳过 " << skipped_count << " 个";
-    if (over_budget > 0) {
-        const Json& budget = value.get("budget_ms");
-        if (budget.is_number())
-            // The old wording promised that a bigger timeout would finish the
-            // job. It does not: each endpoint also has its own per-phase
-            // timeout, so above roughly 4.8 s a larger budget only changes the
-            // reason from "budget" to "timeout". Saying so is the difference
-            // between a caller who retries once and gets a definite answer and
-            // one who concludes the network is broken when it is not.
-            output << "（预算 " << budget.as_integer()
-                   << "ms；超预算不等于不可达，端点自身也在超时：要确定结论"
-                      "可传 timeout_ms 5000 以上，届时慢端点会记为 timeout）";
-    }
-    return output.str();
+    if (over_budget > 0 && value.get("budget_ms").is_number()) {
+        // A bigger timeout does not always finish the job: each endpoint also has
+        // its own per-phase timeout, so above roughly 4.8 s a larger budget only
+        // changes the reason from "budget" to "timeout". That is worth saying
+        // once, to a caller whose budget is still below the point where it stops
+        // helping. Telling someone already on an 8 s budget to try 5 s is advice
+        // they have taken, so past that point the honest note is that more budget
+        // will not change the answer.
+        const auto budget_ms = value.get("budget_ms").as_integer();
+        output << "（预算 " << budget_ms << "ms；";
+        if (budget_ms < 5000)
+            output << "超预算不等于不可达，端点自身也在超时：要确定结论"
+                      "可传 timeout_ms 5000 以上，届时慢端点会记为 timeout";
+        else
+            output << "预算已超过端点自身的超时，加大预算不会改变结论，"
+                      "该端点这次确实没有答复";
+        output << "）";
+    }    return output.str();
 }
 
 std::string summarize_payload(const std::string& name, const Json& value,
@@ -606,8 +610,30 @@ std::string summarize_payload(const std::string& name, const Json& value,
         const Json& hardware = value.get("hardware");
         if (hardware.is_object()) {
             const Json& width = hardware.get("vector_width_bits");
-            if (width.is_number())
+            if (width.is_number()) {
                 output << "\n可用向量宽度：" << width.as_integer() << " 位";
+                // "128 bits" alone is not actionable: it is the answer both
+                // for a CPU that has no AVX and for one whose OS never
+                // enabled XSAVE, and those want different build flags. The
+                // instruction-set flags say which one this is, so they are
+                // reported instead of being left for the caller to dig out
+                // of the structured body.
+                const Json& isa = hardware.get("isa");
+                if (isa.is_object()) {
+                    output << "（";
+                    if (isa.get("avx2").is_bool() && isa.get("avx2").as_bool())
+                        output << "支持 AVX2";
+                    else if (isa.get("avx").is_bool() &&
+                             isa.get("avx").as_bool())
+                        output << "支持 AVX，不支持 AVX2";
+                    else
+                        output << "不支持 AVX";
+                    if (isa.get("sse4_2").is_bool() &&
+                        isa.get("sse4_2").as_bool())
+                        output << "；有 SSE4.2";
+                    output << "）";
+                }
+            }
             const Json& adapters = hardware.get("gpu");
             if (adapters.is_array()) {
                 std::size_t indirect_count = 0;

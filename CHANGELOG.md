@@ -78,6 +78,19 @@ generated header carries it to `--version` and the fingerprint, and
   needed them.
 - The README's opening paragraph still claimed C++17 after the project moved.
 
+### Fixed
+
+- The `get_system` summary said "usable vector width: 128 bits" and stopped
+  there. That is the answer both for a CPU with no AVX and for one whose OS never
+  enabled XSAVE, and the two want different build flags -- so the line invites a
+  wrong decision. It now says which: `128 bits (no AVX)`, or `AVX but not AVX2`.
+- `get_network` told a caller on an 8 s budget to try 5 s. Past roughly 4.8 s each
+  endpoint hits its own per-phase timeout, so more budget cannot change the
+  answer; the note now says that instead of repeating advice already taken.
+- `get_tools` emitted `python_root: ""` when no interpreter was found, which
+  reads as an answered field. A caller cannot tell "no python" from "python
+  exists but its directory could not be derived". The field is now absent unless
+  there is a path to report.
 ### Internal
 
 - Six `rfind(..., 0) == 0` calls became `starts_with`, written once in
