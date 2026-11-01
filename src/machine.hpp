@@ -89,5 +89,8 @@ std::uint64_t probe_inflight_peak();
 // success and a description of the failure otherwise. Kept here because the
 // classification lives in an anonymous namespace in machine.cpp.
 std::string appexec_alias_selftest();
+// Self-test hook for the PATH comparison: it has to name the entries that
+// differ, and it has to stay silent when the two copies agree.
+std::string path_source_selftest();
 
 }  // namespace machine_env

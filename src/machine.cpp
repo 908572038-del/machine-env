@@ -400,6 +400,78 @@ bool is_existing_directory(const std::wstring& path) {
            (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
 }
 
+// Both PATH values as a list, in the order they were written and with the same
+// quote and empty-entry handling, so the comparison below is about content
+// rather than about formatting.
+std::vector<std::wstring> path_directories(const std::wstring& value) {
+    std::vector<std::wstring> directories;
+    std::size_t start = 0;
+    while (start <= value.size()) {
+        const auto end = value.find(L';', start);
+        std::wstring entry = value.substr(
+            start, end == std::wstring::npos ? std::wstring::npos : end - start);
+        if (entry.size() >= 2 && entry.front() == L'"' && entry.back() == L'"')
+            entry = entry.substr(1, entry.size() - 2);
+        if (!entry.empty()) directories.push_back(entry);
+        if (end == std::wstring::npos) break;
+        start = end + 1;
+    }
+    return directories;
+}
+
+// A bare bool only raises a question ("which entries?"), and answering it used
+// to mean diffing two strings by hand. Naming the entries makes the flag useful
+// on its own: the process copy is what a tool lookup actually searches, so an
+// entry present only there is visible to this server and not to a new shell,
+// and one present only in the registry is the reverse.
+Json compare_path_sources(const std::wstring& registry_path,
+                          const std::wstring& process_path) {
+    Json result = Json::object();
+    if (registry_path.empty() || process_path.empty()) return result;
+    const auto registry = path_directories(registry_path);
+    const auto process = path_directories(process_path);
+    const auto contains = [](const std::vector<std::wstring>& list,
+                             const std::wstring& entry) {
+        for (const auto& candidate : list)
+            if (_wcsicmp(candidate.c_str(), entry.c_str()) == 0) return true;
+        return false;
+    };
+    // Order is reported separately from content, so "the same directories in a
+    // different order" is not mixed in with entries that really are missing.
+    bool same_order = registry.size() == process.size();
+    for (std::size_t index = 0; same_order && index < registry.size(); ++index)
+        if (_wcsicmp(registry[index].c_str(), process[index].c_str()) != 0)
+            same_order = false;
+    Json only_in_process = Json::array();
+    for (const auto& entry : process)
+        if (!contains(registry, entry))
+            only_in_process.as_array().emplace_back(utf8(entry));
+    Json only_in_registry = Json::array();
+    for (const auto& entry : registry)
+        if (!contains(process, entry))
+            only_in_registry.as_array().emplace_back(utf8(entry));
+    // Same entries, different case or letter quoting: a formatting difference,
+    // and naming entries that exist in both copies would be worse than silence.
+    if (only_in_process.as_array().empty() && only_in_registry.as_array().empty()) {
+        if (!same_order) result["order_differs"] = true;
+        return result;
+    }
+    // Past a handful of entries the payload stops being an explanation and
+    // becomes a dump. The count keeps the fact that something was left out, so
+    // an empty list beside it is not read as "no entries on that side".
+    if (only_in_process.as_array().size() > 8) {
+        result["only_in_process_truncated"] = true;
+        only_in_process = Json::array();
+    }
+    if (only_in_registry.as_array().size() > 8) {
+        result["only_in_registry_truncated"] = true;
+        only_in_registry = Json::array();
+    }
+    result["only_in_process"] = only_in_process;
+    result["only_in_registry"] = only_in_registry;
+    return result;
+}
+
 // Version components are compared as numbers, not as text: otherwise "3.9"
 // would outrank "3.14" and an older toolset would be preferred.
 std::vector<long long> numeric_parts(const std::wstring& text) {
@@ -811,11 +883,20 @@ std::string normalize_version(const std::string& raw) {
     return raw;
 }
 
-Json cache_metadata(const std::string& reason, bool hit,
-                    std::int64_t cached_at = 0) {
+Json cache_metadata(const std::string& question, const std::string& answer,
+                    bool hit, std::int64_t cached_at = 0) {
     Json result = Json::object();
     result["hit"] = hit;
-    result["reason"] = reason;
+    // Three fields used to be written by different parts of the cache and had
+    // to be reconciled by the reader: `cached`, `hit` and `reason` could say
+    // "true", "false" and "server binary changed" at once, which reads as a
+    // contradiction because it is one sentence spread over three keys. Two
+    // questions are what a caller actually asks -- was this measured now or
+    // read from somewhere, and why -- so they are answered once.
+    //   answer: fresh | cache | shared | stale
+    //   question: why this answer rather than a new probe
+    result["answer"] = answer;
+    result["question"] = question;
     if (cached_at > 0) {
         result["cached_at"] = cached_at;
         result["age_seconds"] =
@@ -1084,8 +1165,13 @@ Json read_cache_entry(const std::string& kind, int ttl,
     }
 }
 
-bool write_cache_entry(const std::string& kind, const Json& payload,
-                       std::string& error) {
+bool write_cache_entry(const std::string& kind, Json& payload, std::string& error) {
+    // The answer is written into the entry precisely because the payload is then
+    // stored. That made the entry depend on the metadata of the call that wrote
+    // it: the same facts, with "shared" in them, could be served later as a
+    // cache hit. Metadata describes the call, so it is removed before the bytes
+    // go to disk and re-added from the reader's own perspective.
+    payload.erase("_cache");
     NamedMutex mutex(kCacheMutexName, kCacheMutexWaitMs);
     if (!mutex.acquired()) {
         // Skipping the write is the point of the bound: waiting any longer
@@ -1139,7 +1225,6 @@ bool write_cache_entry(const std::string& kind, const Json& payload,
 void annotate_cache(Json& payload, const Json& metadata) {
     payload["_cache"] = metadata;
 }
-
 Json cacheable_probe(const std::string& kind, Json payload,
                      const Json& old_metadata) {
     Json result_metadata = old_metadata;
@@ -1150,22 +1235,21 @@ Json cacheable_probe(const std::string& kind, Json payload,
     const bool partial = over_budget.is_bool() && over_budget.as_bool();
     if (!payload.contains("error") && !partial) {
         std::string error;
-        if (write_cache_entry(kind, payload, error)) {
-            Json cache = Json::object();
-            cache["cached"] = true;
-            result_metadata.as_object().insert(cache.as_object().begin(),
-                                                cache.as_object().end());
-        } else {
-            result_metadata["cached"] = false;
-            result_metadata["not_cached_because"] = error;
-        }
+        Json stored_payload = payload;
+        if (write_cache_entry(kind, stored_payload, error))
+            result_metadata["stored"] = true;
+        else
+            result_metadata["not_stored_because"] = error;
     } else if (payload.contains("error")) {
-        result_metadata["cached"] = false;
-        result_metadata["not_cached_because"] = payload.get("error");
+        result_metadata["not_stored_because"] = payload.get("error");
     } else {
-        result_metadata["cached"] = false;
-        result_metadata["not_cached_because"] = "budget exhausted";
+        result_metadata["not_stored_because"] = "budget exhausted";
     }
+    result_metadata["answer"] = "fresh";
+    // Storing is a property of this call, not of the answer, so it is written
+    // beside the answer rather than folded into it: a fresh measurement that
+    // could not be persisted is still a fresh measurement.
+    if (!result_metadata.contains("stored")) result_metadata["stored"] = false;
     annotate_cache(payload, result_metadata);
     return payload;
 }
@@ -1628,6 +1712,37 @@ std::string appexec_alias_selftest() {
     return {};
 }
 
+std::string path_source_selftest() {
+    // The two copies differ in one entry each, so a correct answer names both:
+    // asserting one side only is how the direction of the diff went untested.
+    const Json difference =
+        compare_path_sources(L"C:\\A;C:\\B", L"C:\\A;C:\\Extra");
+    if (!difference.is_object())
+        return "a PATH difference went unreported";
+    const Json& extra = difference.get("only_in_process");
+    const Json& absent = difference.get("only_in_registry");
+    if (!extra.is_array() || extra.as_array().size() != 1 ||
+        extra.as_array()[0].as_string() != "C:\\Extra")
+        return "the entry found only in the process PATH was not named";
+    if (!absent.is_array() || absent.as_array().size() != 1 ||
+        absent.as_array()[0].as_string() != "C:\\B")
+        return "the entry found only in the registry PATH was not named";
+    // Same entries, written differently: that is a formatting difference, and
+    // naming entries that exist in both copies would be worse than the flag.
+    const Json casing = compare_path_sources(L"C:\\A;c:\\b", L"C:\\a;C:\\B");
+    if (casing.contains("only_in_process") || casing.contains("only_in_registry"))
+        return "a case-only PATH difference was reported as a real one";
+    // Same entries, written in a different order: that is a difference in what
+    // gets searched first, not in what can be found.
+    const Json reordered = compare_path_sources(L"C:\\A;C:\\B", L"C:\\B;C:\\A");
+    if (!reordered.get("order_differs").is_bool() ||
+        !reordered.get("order_differs").as_bool())
+        return "a reordered PATH was not reported as reordered";
+    if (compare_path_sources(L"C:\\A", L"C:\\A").contains("only_in_process"))
+        return "an identical PATH was reported as different";
+    return {};
+}
+
 Json locate_tool(const std::string& name) {
     Json result = Json::object();
     const std::wstring base = wide(name);
@@ -1651,6 +1766,23 @@ Json locate_tool(const std::string& name) {
     return result;
 }
 
+// A WindowsApps python.exe is a reparse point the store installs: the entry is
+// there, the interpreter is not. It is looked for in the alias directory rather
+// than on PATH, because the process PATH that a tool lookup searches does not
+// necessarily contain it, and the absence being explained is exactly that.
+bool python_alias_exists() {
+    const std::wstring local = environment_variable(L"LOCALAPPDATA");
+    if (local.empty()) return false;
+    std::error_code ec;
+    for (const wchar_t* name : {L"python.exe", L"python3.exe"})
+        if (fs::exists(fs::path(local) / L"Microsoft" / L"WindowsApps" / name,
+                       ec))
+            return true;
+        else
+            ec.clear();
+    return false;
+}
+
 Json probe_toolchain(bool include_versions) {
     // One PATH read for every executable this probe looks for.
     const PathSnapshot path_snapshot;
@@ -1659,6 +1791,13 @@ Json probe_toolchain(bool include_versions) {
     Json versions = Json::object();
     Json version_unknown = Json::array();
     Json not_on_path = Json::array();
+    // "Not found" is four different answers, and only one of them means the
+    // tool is not installed. A tool shipped by Visual Studio, its own version
+    // manager, or the WindowsApps alias is on this machine and still absent
+    // from PATH; reporting those in the same list as a name that does not exist
+    // sends a caller to reinstall something they already have.
+    Json missing = Json::array();
+    Json missing_elsewhere = Json::object();
     std::string vs_detection;
     const std::wstring vs_root = visual_studio_root(vs_detection);
     result["vs_path"] = utf8(vs_root);
@@ -1757,7 +1896,38 @@ Json probe_toolchain(bool include_versions) {
             if (_wcsicmp(pip_root.c_str(), python_directory.c_str()) != 0)
                 pip_mismatch = true;
         }
-        if (path.empty()) continue;
+        if (path.empty()) {
+            // Every lookup above is by exact file name, so a name that is
+            // answered here is answered with the reason it was not located.
+            const std::string name = utf8(tool.first);
+            missing.as_array().emplace_back(name);
+            if (tool.first == std::wstring(L"python")) {
+                // python has its own discovery order, so "a Store alias with no
+                // interpreter behind it" and "never installed" must not read the
+                // same. The alias is the finding, so its presence is the reason.
+                if (python_alias_exists())
+                    missing_elsewhere[name] = "windows_alias";
+            } else if (tool.first == std::wstring(L"cl") ||
+                       tool.first == std::wstring(L"ninja") ||
+                       tool.first == std::wstring(L"msbuild") ||
+                       tool.first == std::wstring(L"signtool") ||
+                       tool.first == std::wstring(L"makeappx") ||
+                       tool.first == std::wstring(L"candle") ||
+                       tool.first == std::wstring(L"light")) {
+                // These ship inside Visual Studio and are only reachable from a
+                // developer prompt even when the whole toolset is installed.
+                if (!vs_root.empty()) missing_elsewhere[name] = "visual_studio";
+            } else if (tool.first == std::wstring(L"scoop") ||
+                       tool.first == std::wstring(L"pnpm") ||
+                       tool.first == std::wstring(L"yarn") ||
+                       tool.first == std::wstring(L"corepack")) {
+                // A per-user install that is either absent or installed for an
+                // account this process cannot see.
+                if (!environment_variable(L"USERPROFILE").empty())
+                    missing_elsewhere[name] = "user_install";
+            }
+            continue;
+        }
         found[utf8(tool.first)] = utf8(path);
         ++tool_count;
         if (off_path) not_on_path.as_array().emplace_back(utf8(tool.first));
@@ -1818,6 +1988,11 @@ Json probe_toolchain(bool include_versions) {
     // from reading "not asked" as "unknown".
     result["versions_included"] = include_versions;
     result["not_on_path"] = not_on_path;
+    result["missing_tools"] = missing;
+    // Only non-empty explanations are emitted: an empty map would look like a
+    // claim about tools nobody asked about.
+    if (missing_elsewhere.as_object().size() > 0)
+        result["missing_reasons"] = missing_elsewhere;
     result["python_pip_mismatch"] = pip_mismatch;
     if (found.contains("python")) {
         result["python_root"] =
@@ -2377,22 +2552,22 @@ Json probe_system(bool measure_syntax) {
     paths["process_path_differs"] =
         !path.empty() && !process_path.empty() &&
         _wcsicmp(path.c_str(), process_path.c_str()) != 0;
-    std::size_t start = 0;
-    while (start <= path.size()) {
-        const auto end = path.find(L';', start);
-        std::wstring entry = path.substr(start, end == std::wstring::npos
-                                                    ? std::wstring::npos
-                                                    : end - start);
-        if (entry.size() >= 2 && entry.front() == L'"' &&
-            entry.back() == L'"')
-            entry = entry.substr(1, entry.size() - 2);
-        if (!entry.empty() && is_existing_directory(entry)) {
+    const Json path_difference =
+        compare_path_sources(registry_path, process_path);
+    if (path_difference.is_object()) {
+        for (const auto& field : path_difference.as_object())
+            paths[field.first] = field.second;
+        // A caller reading path_entries is reading the registry copy; the probe
+        // itself searched the process copy, so which one each answer came from
+        // has to be stated rather than inferred.
+        paths["path_differs_note"] =
+            "宸ュ叿鎺㈡祴浣跨敤杩涚▼ PATH锛沺ath_entries 鏉ヨ嚜绯荤粺 PATH";
+    }
+    for (const auto& entry : path_directories(path)) {
+        if (is_existing_directory(entry))
             path_entries.as_array().emplace_back(utf8(entry));
-        } else if (!entry.empty()) {
+        else
             ++ignored_path_entries;
-        }
-        if (end == std::wstring::npos) break;
-        start = end + 1;
     }
     paths["path_entries"] = path_entries;
     paths["ignored_path_entry_count"] = ignored_path_entries;
@@ -2662,7 +2837,7 @@ Json cached_probe(const std::string& kind, bool refresh, int network_budget_ms,
         if (entry.is_object()) {
             Json payload = entry.get("payload");
             const auto timestamp = entry.get("cached_at").as_integer();
-            annotate_cache(payload, cache_metadata("fresh", true, timestamp));
+            annotate_cache(payload, cache_metadata("fresh", "cache", true, timestamp));
             return with_live_session_facts(kind, std::move(payload));
         }
     }
@@ -2670,7 +2845,7 @@ Json cached_probe(const std::string& kind, bool refresh, int network_budget_ms,
     const auto run_probe = [&]() {
         ProbeAttemptScope attempt_scope;
         const Json metadata = cache_metadata(
-            refresh ? "refresh requested" : cache_read_failure, false);
+            "fresh", refresh ? "refresh requested" : cache_read_failure, false);
         Json payload = kind == "system"      ? probe_system(measure_syntax)
                        : kind == "toolchain" ? probe_toolchain(false)
                        : kind == "toolchain_versions" ? probe_toolchain(true)
@@ -2710,10 +2885,7 @@ Json cached_probe(const std::string& kind, bool refresh, int network_budget_ms,
         const auto age_ms =
             (static_cast<std::int64_t>(std::time(nullptr)) - cached_at) * 1000;
         if (age_ms < 0 || age_ms >= kRefreshMinIntervalMs) return false;
-        Json cache = cache_metadata("refresh coalesced", true, cached_at);
-        // cached stays true: the refreshed answer the caller asked for is in
-        // the cache. reason says the probe itself was skipped.
-        cache["cached"] = true;
+        Json cache = cache_metadata("refresh coalesced", "cache", true, cached_at);
         annotate_cache(payload, cache);
         result = with_live_session_facts(kind, std::move(payload));
         return true;
@@ -2775,16 +2947,12 @@ Json cached_probe(const std::string& kind, bool refresh, int network_budget_ms,
             }
         }
         if (reuse) {
-            // A probe ran while this caller waited, so the answer is as fresh as
-            // one it ran itself: zero seconds old. `cached` says "this call wrote
-            // an entry", and this one did not -- the probe's owner did -- so it
-            // stays false; `shared` carries the part that is true. `hit` is also
-            // false: nothing was read from an entry. A reader who wants to count
-            // real probes counts answers with hit, shared and stale all false.
-            Json cache =
-                cache_metadata("attempt shared", false, std::time(nullptr));
-            cache["cached"] = false;
-            cache["shared"] = true;
+            // A probe ran while this caller waited, so the answer is as fresh
+            // as one it ran itself: zero seconds old, and "shared" says where
+            // it came from instead of leaving a reader to infer it from a hit
+            // of false beside an age of zero.
+            Json cache = cache_metadata("attempt shared", "shared", false,
+                                        std::time(nullptr));
             annotate_cache(shared, cache);
             return shared;
         }
@@ -2799,10 +2967,10 @@ Json cached_probe(const std::string& kind, bool refresh, int network_budget_ms,
             Json payload = stale.get("payload");
             if (payload.is_object() && !payload.contains("error")) {
                 // hit stays true: this answer did come out of an entry, and the
-                // reader must be told its age. The reason separates the two ways
-                // of arriving here -- a probe still in flight, or one that ran
-                // and failed -- because "still running" invites a retry that a
-                // failed probe would only repeat.
+                // reader must be told its age. The question separates the two
+                // ways of arriving here -- a probe still in flight, or one that
+                // ran and failed -- because "still running" invites a retry that
+                // a failed probe would only repeat.
                 //
                 // The timestamp is read defensively. This is the branch that runs
                 // when a probe is wedged, against an entry somebody else wrote,
@@ -2815,10 +2983,9 @@ Json cached_probe(const std::string& kind, bool refresh, int network_budget_ms,
                     stale.contains("cached_at") ? stale.get("cached_at").as_integer()
                                                 : 0;
                 Json cache = cache_metadata(
+                    "stale",
                     answered ? "probe failed, stale kept" : "probe still running",
                     true, stale_at);
-                cache["cached"] = false;
-                cache["stale"] = true;
                 annotate_cache(payload, cache);
                 return with_live_session_facts(kind, std::move(payload));
             }
@@ -2830,7 +2997,7 @@ Json cached_probe(const std::string& kind, bool refresh, int network_budget_ms,
     // waiter always sees either a fresh entry (handled above) or an attempt to
     // join. It is separate from the cache lock on purpose: that one orders file
     // writes, this one orders probes. If it cannot be acquired the other
-    // process is still probing, and probing anyway is deliberate — a stalled
+    // process is still probing, and probing anyway is deliberate 鈥?a stalled
     // holder must not cost this caller its answer.
     AttemptClaim claim(attempt_key, attempt);
     NamedMutex probe_lock(probe_mutex_name(kind).c_str(), kProbeMutexWaitMs);

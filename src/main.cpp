@@ -162,11 +162,16 @@ std::string memory_gb(const Json& value, const std::string& key) {
     return output.str();
 }
 
+// The cache block answers two questions: where the answer came from, and how
+// old it is. Both are said in words a reader can act on, because the raw pair
+// "hit true, age 0" describes a shared probe and "hit false, fresh" describes a
+// measurement, and neither is obvious from the fields alone.
 std::string cache_note(const Json& value) {
     const Json& cache = value.get("_cache");
     if (!cache.is_object()) return {};
     std::ostringstream output;
-    if (cache.get("hit").is_bool() && cache.get("hit").as_bool()) {
+    const std::string answer = string_field(cache, "answer");
+    if (answer == "cache") {
         output << "\n（缓存命中";
         const Json& age = cache.get("age_seconds");
         // Seconds are what the cache stores, but they are not what a reader can
@@ -182,7 +187,27 @@ std::string cache_note(const Json& value) {
                 output << "，" << seconds / 3600 << " 小时前";
         }
         output << "；要现场重测加 refresh:true）";
+    } else if (answer == "stale") {
+        // Not a hit and not fresh: an old entry was kept because the probe did
+        // not answer. Saying which is what stops a wedged probe from being
+        // retried as if it had simply failed once.
+        const std::string question = string_field(cache, "question");
+        output << "\n（改用旧结果";
+        const Json& age = cache.get("age_seconds");
+        if (age.is_number()) output << "，" << age.as_integer() << " 秒前";
+        if (question.find("still running") != std::string::npos)
+            output << "；新探测仍在进行，稍后再试";
+        else
+            output << "；新探测已失败";
+        output << "）";
+    } else if (answer == "shared") {
+        output << "\n（与同期请求共用了这次探测的结果）";
     }
+    // Why a fresh answer could not be stored is worth one line: the next call
+    // will pay for the probe again, and this is the only place that says so.
+    const std::string store_failure = string_field(cache, "not_stored_because");
+    if (answer == "fresh" && !store_failure.empty())
+        output << "\n（本次结果未写入缓存：" << store_failure << "）";
     return output.str();
 }
 
@@ -287,7 +312,6 @@ std::string summarize_toolchain(const Json& value,
                                 const std::vector<std::string>& filter) {
     std::ostringstream output;
     const Json& tools = value.get("tools");
-    const Json& not_on_path = value.get("not_on_path");
     // The catalog supplies the set and the order, so a tool cannot be probed and
     // then be missing from the concise answer. A tool that was looked up by name
     // because the catalog does not know it is appended to that order.
@@ -300,6 +324,7 @@ std::string summarize_toolchain(const Json& value,
         }
     }
 
+    const Json& not_on_path = value.get("not_on_path");
     const auto is_off_path = [&not_on_path](const std::string& name) {
         return array_contains(not_on_path, name);
     };
@@ -307,6 +332,40 @@ std::string summarize_toolchain(const Json& value,
     bool first = true;
     bool selected_known = false;
     int off_path_shown = 0;
+
+    // The list below answers "where is each tool"; this line answers the
+    // question a caller usually has first -- what can I build with right now --
+    // so it does not have to be reassembled from a dozen paths. It is present
+    // only in an unfiltered answer, where "what does this machine have" is the
+    // question being asked.
+    if (filter.empty() && tools.is_object()) {
+        const auto usable = [&tools](const char* name) {
+            return !string_field(tools, name).empty();
+        };
+        std::vector<std::string> capabilities;
+        if (usable("cl") || usable("clang") || usable("gcc"))
+            capabilities.emplace_back("C/C++ 编译器");
+        if (usable("cmake") || usable("ninja") || usable("make") ||
+            usable("meson"))
+            capabilities.emplace_back("构建工具");
+        if (usable("node") || usable("npm") || usable("pnpm") || usable("yarn"))
+            capabilities.emplace_back("Node.js");
+        if (usable("python") || usable("pip")) capabilities.emplace_back("Python");
+        if (usable("dotnet")) capabilities.emplace_back(".NET");
+        if (usable("go")) capabilities.emplace_back("Go");
+        if (usable("cargo") || usable("rustc")) capabilities.emplace_back("Rust");
+        if (usable("git")) capabilities.emplace_back("Git");
+        if (!capabilities.empty()) {
+            output << "可用：";
+            for (std::size_t index = 0; index < capabilities.size(); ++index) {
+                if (index) output << "、";
+                output << capabilities[index];
+            }
+            // Each entry below starts with "\n", so the line needs no terminator
+            // of its own; adding one produced a blank line in every summary.
+            first = false;
+        }
+    }
     if (tools.is_object()) {
         for (const auto& name : order) {
             const std::string path = string_field(tools, name);
@@ -349,8 +408,12 @@ std::string summarize_toolchain(const Json& value,
         output << "\n（「不在PATH」= 已定位到文件，只是 PATH 中没有它的目录："
                   "需用绝对路径，或在开发者命令提示符下运行）";
     // A requested name that is not on PATH is still an answer: saying so is the
-    // difference between "it is not there" and "nothing was looked for".
+    // difference between "it is not there" and "nothing was looked for". The
+    // reason goes beside the name when there is one, because "not found" covers
+    // a tool that is simply absent and a tool that ships with something already
+    // installed but is not on PATH, and only the second is worth acting on.
     const Json& unresolved = value.get("unresolved_tools");
+    const Json& missing_reasons = value.get("missing_reasons");
     if (unresolved.is_array()) {
         for (const auto& item : unresolved.as_array()) {
             if (!item.is_string()) continue;
@@ -359,6 +422,13 @@ std::string summarize_toolchain(const Json& value,
             if (!first) output << "\n";
             first = false;
             output << "- " << upper_ascii(name) << " = 未在 PATH 中找到";
+            const std::string reason = string_field(missing_reasons, name);
+            if (reason == "visual_studio")
+                output << "（Visual Studio 已安装，需在开发者命令提示符下运行）";
+            else if (reason == "windows_alias")
+                output << "（存在应用执行别名，但并未安装解释器）";
+            else if (reason == "user_install")
+                output << "（可能只装在另一个用户下）";
         }
     }
     // Saying that nothing matched is the difference between nothing being there
@@ -369,8 +439,22 @@ std::string summarize_toolchain(const Json& value,
             output << "未检测到任何已知工具";
         } else if (selected_known) {
             // The filter named something the probe covers, so the tool is
-            // absent; that is not the same as the filter matching nothing.
+            // absent; that is not the same as the filter matching nothing. The
+            // detail lines above are skipped here, so the reasons for the same
+            // absence are repeated -- a name in a sentence is not actionable.
             output << "未检测到：" << join_tokens(filter);
+            for (const auto& name : filter) {
+                const std::string reason = string_field(missing_reasons, name);
+                if (reason == "visual_studio")
+                    output << "\n  " << upper_ascii(name)
+                           << "：Visual Studio 已安装，需在开发者命令提示符下运行";
+                else if (reason == "windows_alias")
+                    output << "\n  " << upper_ascii(name)
+                           << "：存在应用执行别名，但并未安装解释器";
+                else if (reason == "user_install")
+                    output << "\n  " << upper_ascii(name)
+                           << "：可能只装在另一个用户下";
+            }
         } else {
             output << "没有匹配的工具：" << join_tokens(filter);
         }
@@ -598,9 +682,30 @@ std::string summarize_payload(const std::string& name, const Json& value,
                 output << "\n权限：" << (admin.as_bool() ? "管理员" : "标准用户");
         }
         const Json& paths = value.get("paths");
-        if (paths.is_object() &&
-            string_field(paths, "path_source") == "process")
+        if (paths.is_object() && string_field(paths, "path_source") == "process")
             output << "\nPATH：取自进程环境，可能过期";
+        // A bare flag raised a question and left the answer to a manual diff.
+        // Naming the entries says what to trust for a tool lookup: the process
+        // copy is what gets searched, so an entry that only exists there is
+        // visible now and gone from the next shell.
+        if (paths.is_object() && paths.get("process_path_differs").is_bool() &&
+            paths.get("process_path_differs").as_bool()) {
+            output << "\nPATH：进程环境与系统设置不同（工具探测按进程 PATH）";
+            const auto list = [](const Json& array) {
+                std::string joined;
+                if (!array.is_array()) return joined;
+                for (const auto& item : array.as_array()) {
+                    if (!item.is_string()) continue;
+                    if (!joined.empty()) joined += "；";
+                    joined += item.as_string();
+                }
+                return joined;
+            };
+            const std::string extra = list(paths.get("only_in_process"));
+            const std::string absent = list(paths.get("only_in_registry"));
+            if (!extra.empty()) output << "\n  仅在进程 PATH：" << extra;
+            if (!absent.empty()) output << "\n  仅在系统 PATH：" << absent;
+        }
         const Json& policies = value.get("policies");
         if (policies.is_object()) {
             const Json& acp = policies.get("acp");
@@ -692,10 +797,14 @@ Json tool_result(const std::string& name, Json value, bool detail,
     meta["brief_payload_bytes"] = static_cast<std::int64_t>(text.size());
     const Json& cache = value.get("_cache");
     if (cache.is_object()) {
-        const Json& hit = cache.get("hit");
-        if (hit.is_bool()) meta["cache_hit"] = hit.as_bool();
-        const std::string reason = string_field(cache, "not_cached_because");
-        if (!reason.empty()) meta["not_cached_because"] = reason;
+        // Two fields instead of three that could disagree: where the answer came
+        // from, and why that rather than a new probe.
+        const std::string answer = string_field(cache, "answer");
+        if (!answer.empty()) meta["cache_answer"] = answer;
+        const std::string question = string_field(cache, "question");
+        if (!question.empty()) meta["cache_question"] = question;
+        const std::string reason = string_field(cache, "not_stored_because");
+        if (!reason.empty()) meta["not_stored_because"] = reason;
     }
     const Json& budget = value.get("budget_exhausted");
     if (budget.is_bool()) meta["budget_exhausted"] = budget.as_bool();
@@ -974,8 +1083,10 @@ void narrow_tools(Json& payload, const std::vector<std::string>& filter) {
     };
     narrow_named("tools");
     narrow_named("versions");
+    narrow_named("missing_reasons");
     narrow_listed("version_unknown");
     narrow_listed("not_on_path");
+    narrow_listed("missing_tools");
     narrow_listed("unresolved_tools");
 
     // A name in the catalog that is not installed disappears from `tools` when it
@@ -1451,9 +1562,13 @@ int selftest() {
     // build on a machine that merely has two clients open. Nothing can hide
     // behind this branch: "cache busy" is produced only when the named mutex was
     // not acquired, so a genuine write failure reports a different reason.
+    //
+    // A refresh that lands inside the coalescing window is answered from the
+    // entry the previous run wrote, which is the documented behaviour and not a
+    // failure to persist: that run's own persistence was asserted when it ran.
     Json refreshed_system = cached_probe("system", true, kNetworkBudgetMs, false);
     const auto write_reason = [](const Json& probe) {
-        return string_field(probe.get("_cache"), "not_cached_because");
+        return string_field(probe.get("_cache"), "not_stored_because");
     };
     for (int attempt = 0; attempt < 2 && write_reason(refreshed_system) == "cache busy";
          ++attempt) {
@@ -1461,22 +1576,45 @@ int selftest() {
         refreshed_system = cached_probe("system", true, kNetworkBudgetMs, false);
     }
     const bool persistence_skipped = write_reason(refreshed_system) == "cache busy";
-    if (refreshed_system.contains("error") ||
-        (!persistence_skipped &&
-         !refreshed_system.get("_cache").get("cached").as_bool()))
-        throw std::runtime_error("system cache write test failed");
+    const bool answered_by_coalescing =
+        string_field(refreshed_system.get("_cache"), "question") ==
+        "refresh coalesced";
+    // The two questions are asserted separately, because the old pair of fields
+    // is what made a caller reconcile "cached" with "hit" to find out whether an
+    // answer was measured: a probe this call ran must be fresh whether or not it
+    // persisted, and a coalesced answer must say so rather than claim freshness.
+    const std::string refreshed_answer =
+        string_field(refreshed_system.get("_cache"), "answer");
+    const std::string expected_answer =
+        answered_by_coalescing ? "cache" : "fresh";
+    if (refreshed_system.contains("error") || refreshed_answer != expected_answer)
+        throw std::runtime_error("system cache write test failed: " +
+                                 dump_json(refreshed_system.get("_cache")));
+    if (!persistence_skipped && !answered_by_coalescing &&
+        !refreshed_system.get("_cache").get("stored").as_bool())
+        throw std::runtime_error("system cache write was not recorded");
     if (persistence_skipped)
         std::cerr << "machine-env-cpp selftest: cache persistence skipped "
                      "(another instance holds the cache)\n";
+    if (answered_by_coalescing)
+        std::cerr << "machine-env-cpp selftest: refresh coalesced with the "
+                     "previous run's entry\n";
     // A local system probe must never carry network data, cached or fresh.
     if (refreshed_system.contains("network"))
         throw std::runtime_error("system probe leaked network data");
     if (!persistence_skipped) {
         const Json cached_system = cached_probe("system", false, kNetworkBudgetMs, false);
-        if (!cached_system.get("_cache").get("hit").as_bool() ||
-            cached_system.get("os").get("caption").as_string() !=
-                refreshed_system.get("os").get("caption").as_string())
-            throw std::runtime_error("system cache round-trip test failed");
+        const std::string cached_answer =
+            string_field(cached_system.get("_cache"), "answer");
+        const std::string cached_question =
+            string_field(cached_system.get("_cache"), "question");
+        const std::string cached_caption =
+            cached_system.get("os").get("caption").as_string();
+        if (cached_answer != "cache" || !cached_system.get("_cache").get("hit").as_bool() ||
+            cached_caption != refreshed_system.get("os").get("caption").as_string())
+            throw std::runtime_error(std::format(
+                "system cache round-trip test failed (answer={} question={} caption={})",
+                cached_answer, cached_question, cached_caption));
         if (cached_system.contains("network"))
             throw std::runtime_error("system probe leaked network data");
     }
@@ -1616,6 +1754,7 @@ int selftest() {
     const std::string toolchain_summary =
         summarize_payload("get_tools", sample_toolchain, {});
     const std::string expected_toolchain_summary =
+        "可用：C/C++ 编译器、Node.js、Python、Git\n"
         "- PYTHON = C:\\Python\\python.exe (3.14.0)\n"
         "- GIT = C:\\Git\\git.exe\n"
         "- CL = C:\\VS\\cl.exe 不在PATH\n"
@@ -1630,7 +1769,8 @@ int selftest() {
         "（「不在PATH」= 已定位到文件，只是 PATH 中没有它的目录："
         "需用绝对路径，或在开发者命令提示符下运行）";
     if (toolchain_summary != expected_toolchain_summary)
-        throw std::runtime_error("toolchain memory format/order test failed");
+        throw std::runtime_error("toolchain memory format/order test failed:\n" +
+                                 toolchain_summary);
 
     // A version that could not be read must not look like a tool that has no
     // version, and it must not make an installed tool disappear either.
@@ -1661,6 +1801,36 @@ int selftest() {
     if (summarize_payload("get_tools", unresolved_sample, parse_filter("gh"))
             .find("GH = 未在 PATH 中找到") == std::string::npos)
         throw std::runtime_error("an unresolved requested tool was omitted");
+
+    // Two absences that look alike are not alike: the reason travels with the
+    // name, so a tool that ships inside Visual Studio is not reported as
+    // something to install.
+    {
+        Json reasoned = Json::object();
+        reasoned["tools"] = Json::object();
+        reasoned["missing_tools"] = Json::array();
+        reasoned["missing_tools"].as_array().emplace_back("cl");
+        reasoned["missing_tools"].as_array().emplace_back("python");
+        reasoned["missing_reasons"]["cl"] = "visual_studio";
+        reasoned["missing_reasons"]["python"] = "windows_alias";
+        const std::string text =
+            summarize_payload("get_tools", reasoned, parse_filter("cl, python"));
+        if (text.find("需在开发者命令提示符下运行") == std::string::npos ||
+            text.find("存在应用执行别名") == std::string::npos)
+            throw std::runtime_error("a missing tool lost its reason:\n" + text);
+        // A filter must not leave an explanation behind for a tool it dropped.
+        Json narrowed = reasoned;
+        narrow_tools(narrowed, parse_filter("python"));
+        if (narrowed.contains("missing_reasons") &&
+            narrowed.get("missing_reasons").contains("cl"))
+            throw std::runtime_error(
+                "narrowing kept a reason for a tool that was filtered out");
+    }
+
+    // The comparison says which entries differ; a flag alone leaves the caller
+    // to diff two strings by hand.
+    if (!path_source_selftest().empty())
+        throw std::runtime_error(path_source_selftest());
 
     // A filter that selected a known tool which is not present is a different
     // answer from a filter that matched nothing at all.

@@ -21,43 +21,51 @@ take no lock at all, because a write publishes by renaming a temporary file over
 the destination, so a reader sees either the previous complete entry or the new
 one and never a half-written file; the checksum then rejects anything that was
 truncated or mixed by another writer. A write that cannot take the lock is
-skipped and reported as `not_cached_because: "cache busy"` rather than blocking,
+skipped and reported as `not_stored_because: "cache busy"` rather than blocking,
 because freezing every instance behind one stuck writer is worse than
 re-probing.
 
 `refresh` is coalesced rather than taken literally. A refresh that arrives within
 five seconds of a completed probe of the same kind is answered from that entry and
-says so (`_cache.reason: "refresh coalesced"`), so a client cannot make the server
-re-probe by asking twice. Across processes, one probe per kind is elected through a
-named lock, so five editors opening at once cost one probe instead of five. Waiting
-for that lock is bounded: a stalled holder costs a duplicate probe, never the
-answer. A partial result (one that ran out of its budget) is never served as a
-refresh and never stored.
+says so (`_cache.question: "refresh coalesced"`), so a client cannot make the
+server re-probe by asking twice. Across processes, one probe per kind is elected
+through a named lock, so five editors opening at once cost one probe instead of
+five. Waiting for that lock is bounded: a stalled holder costs a duplicate probe,
+never the answer. A partial result (one that ran out of its budget) is never
+served as a refresh and never stored.
 
 Inside one process, a call that needs a probe of a kind already being probed joins
 that probe instead of starting a second one, and reports what happened rather than
-passing the answer off as its own work. Which of those it was is readable from
-`_cache`, so a client can count real probes without inferring them from a counter.
-The four flags answer four different questions and none of them implies another:
+passing the answer off as its own work. `_cache` answers two questions, one field
+each, and a client never has to reconcile three flags that could disagree:
 
-- `hit` — the answer came out of a cache entry;
-- `stale` — that entry was older than its TTL, and its `age_seconds` says by how
-  much;
-- `shared` — the answer came from a probe another caller was already running;
-- `cached` — **this call wrote an entry**. It says nothing about where the data
-  came from, and a call can be answered from an entry while writing nothing.
+- `answer` — where this answer came from: `fresh` (a probe this call waited for),
+  `cache` (an entry, still inside its TTL), `shared` (a probe another caller was
+  already running) or `stale` (an older entry, kept because the new probe did not
+  answer). `hit` stays as a plain "came out of an entry" boolean beside it.
+- `question` — why that rather than a new probe: `fresh`, `cache`, `refresh
+  requested`, `refresh coalesced`, `attempt shared`, `probe still running` or
+  `probe failed, stale kept`.
+- `age_seconds` — present whenever the answer came from an entry, including a
+  `stale` one.
+- `stored` / `not_stored_because` — whether **this** call persisted a fresh
+  measurement, and why not. Storing says nothing about where the data came from.
 
-| what the caller got | `_cache` |
-|---|---|
-| the answer of a probe it ran itself, stored | `reason: "refresh requested"`, `hit: false`, `cached: true` |
-| the answer of a probe it ran itself, not stored (budget ran out, or it failed) | same, with `cached: false` and `not_cached_because` |
-| a fresh entry | `reason: "fresh"`, `hit: true`, no `cached` field |
-| an entry from inside the coalescing window | `reason: "refresh coalesced"`, `hit: true`, `cached: true` |
-| the answer of a probe already running for someone else | `reason: "attempt shared"`, `hit: false`, `shared: true`, `cached: false` |
-| an older entry, because the probe it waited on is still running past its patience | `reason: "probe still running"`, `hit: true`, `stale: true`, with `age_seconds` |
-| an older entry, because the probe it waited on failed | `reason: "probe failed, stale kept"`, `hit: true`, `stale: true`, with `age_seconds` |
+`_cache` describes the call, so it is stripped before a payload is written: an
+entry that carried one call's metadata would later be served as a hit with
+another call's `answer` in it.
 
-A real probe is exactly `hit: false`, `shared: false`, `stale: false`.
+| what the caller got | `_cache.answer` | `_cache.question` |
+|---|---|---|
+| the answer of a probe it ran itself, stored | `fresh` | `refresh requested`, or the reason the entry was not read |
+| the answer of a probe it ran itself, not stored (budget ran out, or it failed) | `fresh` | same, with `stored: false` and `not_stored_because` |
+| a fresh entry | `cache` | `cache`, with `hit: true` |
+| an entry from inside the coalescing window | `cache` | `refresh coalesced` |
+| the answer of a probe already running for someone else | `shared` | `attempt shared` |
+| an older entry, because the probe it waited on is still running past its patience | `stale` | `probe still running` |
+| an older entry, because the probe it waited on failed | `stale` | `probe failed, stale kept` |
+
+A real probe is exactly `answer: "fresh"` with `stored: true`.
 
 Joining is why a burst of identical refreshes costs one probe rather than one per
 caller: measured on this machine, 100 concurrent `get_network` refreshes went from

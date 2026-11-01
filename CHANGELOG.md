@@ -5,6 +5,47 @@ Notable changes to machine-env-cpp. Versions follow the one in
 generated header carries it to `--version` and the fingerprint, and
 `build-installer.ps1` passes it to NSIS.
 
+## 0.5.0
+
+An answer is only useful if the caller can act on it. These changes are about the
+answers that were true but could not be acted on: a missing tool with no reason, a
+PATH flag with no difference, a cache block whose three fields disagreed, and a
+version list that made the caller read twelve paths to learn what can be built.
+
+### Added
+
+- `get_tools` starts with what the machine can actually do
+  (`可用：C/C++ 编译器、构建工具、Git`), so the capability does not have to be
+  reassembled from a dozen paths.
+- `get_tools` reports `missing_reasons` beside the name for the absences that have
+  one: `visual_studio` for tools that ship inside Visual Studio and need a
+  developer prompt, `windows_alias` for a python App Execution Alias with no
+  interpreter behind it, `user_install` for per-user tools that may belong to
+  another account. A bare "not found" sent the caller to install something that
+  was already there.
+- `get_system` names the PATH entries that differ between the process copy and the
+  system copy (`only_in_process`, `only_in_registry`, `order_differs`), because
+  the flag alone required diffing two strings by hand. The probe searches the
+  process copy, which is what the note says.
+
+### Changed
+
+- `_cache` answers two questions with two fields instead of asking a reader to
+  reconcile three that could disagree. `cached: true`, `hit: false` and
+  `reason: "server binary changed"` used to appear together. Now:
+  `answer` is `fresh` | `cache` | `shared` | `stale`, and `question` says why that
+  rather than a new probe. Storing is reported separately as `stored` /
+  `not_stored_because`, because it describes the call and not the data.
+- Cache metadata is no longer written into the entry. It became part of the stored
+  bytes, so one call's `shared` label could be served to a later caller as a hit.
+- The concise summaries say when an answer is stale and why, instead of reporting
+  an old result as if it were current.
+
+### Fixed
+
+- Narrowing `get_tools` with `name` kept `missing_reasons` entries for tools the
+  filter had removed.
+
 ## 0.4.1
 
 Found by using the server for the work it exists for.
