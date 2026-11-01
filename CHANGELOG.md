@@ -5,6 +5,26 @@ Notable changes to machine-env-cpp. Versions follow the one in
 generated header carries it to `--version` and the fingerprint, and
 `build-installer.ps1` passes it to NSIS.
 
+## 0.4.1
+
+Found by using the server for the work it exists for.
+
+### Fixed
+
+- `get_system` said "usable vector width: 128 bits" and stopped. That is the
+  answer both for a CPU with no AVX and for one whose OS never enabled XSAVE, and
+  those want different build flags. The summary now names the instruction set:
+  `128 bits (no AVX)`.
+- `get_network` told a caller already on an 8 s budget to pass 5 s. Past roughly
+  4.8 s every endpoint hits its own per-phase timeout, so more budget cannot
+  change the answer, and the note now says that.
+- `get_tools` emitted `python_root: ""` when no interpreter was found, which
+  reads as an answered field. It is now absent unless there is a path to report.
+- `get_tools` answered two shapes for one fact: an absent catalogued tool
+  vanished, while a name outside the catalog came back in `unresolved_tools`.
+  Every requested name that resolved to nothing is now listed.
+- `get_network` called a timeout "unreachable". WinHTTP 12002 means the request
+  did not finish in time; the tally now counts it apart from hosts that answered.
 ## 0.4.0
 
 ### Added

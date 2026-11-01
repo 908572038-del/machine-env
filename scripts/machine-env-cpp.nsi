@@ -1,4 +1,4 @@
-Unicode true
+﻿Unicode true
 !include "MUI2.nsh"
 !include "LogicLib.nsh"
 
@@ -29,7 +29,7 @@ Unicode true
 ; and the server it installs cannot report different versions. The default keeps
 ; a bare `makensis scripts\machine-env-cpp.nsi` working.
 !ifndef AppVersion
-  !define AppVersion "0.4.0"
+  !define AppVersion "0.4.1"
 !endif
 !define UninstallKey "Software\Microsoft\Windows\CurrentVersion\Uninstall\machine-env-cpp"
 
