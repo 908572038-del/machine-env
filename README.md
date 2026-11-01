@@ -1,5 +1,10 @@
 # machine-env-cpp MCP server
 
+[![build](https://github.com/908572038-del/machine-env/actions/workflows/build.yml/badge.svg)](https://github.com/908572038-del/machine-env/actions/workflows/build.yml)
+[![release](https://img.shields.io/github/v/release/908572038-del/machine-env)](https://github.com/908572038-del/machine-env/releases/latest)
+[![license](https://img.shields.io/github/license/908572038-del/machine-env)](LICENSE)
+[![platform](https://img.shields.io/badge/platform-Windows%20x64-blue)](https://github.com/908572038-del/machine-env/releases/latest)
+
 A native Windows MCP server that reports observed machine facts to coding
 agents: CPU instruction-set support, installed developer tools, Windows and
 shell details, filesystem paths, and optional network reachability.

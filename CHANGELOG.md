@@ -9,6 +9,18 @@ generated header carries it to `--version` and the fingerprint, and
 
 ### Added
 
+- LICENSE (MIT) and status badges for the build, the latest release, the licence
+  and the platform. The repository had no licence, so the front page said "No
+  license" and nothing granted anyone the right to use it.
+
+### Fixed
+
+- The README's opening paragraph said the server is written in C++17, which
+  stopped being true in a3e55c7. That line is what a reader checks to decide
+  whether their toolset can build this.
+
+### Added
+
 - `.github/workflows/release.yml` publishes what a person actually installs from
   a `v*` tag: the portable ZIP, the desktop installer, the bare executable, and a
   `SHA256SUMS.txt`. It refuses a tag that does not match the project version,
