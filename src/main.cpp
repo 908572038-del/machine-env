@@ -18,14 +18,17 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cwctype>
+#include <format>
 #include <iostream>
 #include <iomanip>
 #include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -996,7 +999,7 @@ Json dispatch(const Json& request, bool& has_response) {
         return rpc_error(id, -32600, "request method must be a string");
     }
     const std::string method = method_value.as_string();
-    if (notification && method.rfind("notifications/", 0) == 0) {
+    if (notification && starts_with(method, "notifications/")) {
         has_response = false;
         return Json();
     }
@@ -1610,8 +1613,8 @@ int selftest() {
     apps_sample["apps"] = Json::array();
     for (int index = 0; index < 60; ++index) {
         Json app = Json::object();
-        app["name"] = std::string("Sample App ") + std::to_string(index);
-        app["version"] = std::string("1.0.") + std::to_string(index);
+        app["name"] = std::format("Sample App {}", index);
+        app["version"] = std::format("1.0.{}", index);
         apps_sample["apps"].as_array().push_back(std::move(app));
     }
     const std::string apps_text =

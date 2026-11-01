@@ -77,7 +77,11 @@ disagree.
 
 ## Build and install
 
-Requirements: Windows x64 and Visual Studio with the C++ workload.
+Requirements: Windows x64 and Visual Studio with the C++ workload, and a
+toolset that implements C++20: the code uses <format>, <span>, <bit> and
+concepts directly, and CMake requires the standard rather than falling back to
+C++17. MSVC gets /Zc:__cplusplus, without which __cplusplus reports 199711L
+and a feature test in the source would answer about C++98.
 Building from source also requires CMake and Ninja. End users can use the
 per-user desktop installer without installing the C++ build tools.
 

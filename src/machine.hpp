@@ -4,9 +4,24 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace machine_env {
+
+// std::string_view gains these in C++23; the project targets C++20, so they are
+// spelled once here rather than as an index search at every call site. Free
+// functions keep std::string and std::string_view arguments both usable, and
+// constexpr keeps them usable in constant expressions.
+constexpr bool starts_with(std::string_view text, std::string_view prefix) {
+    return text.size() >= prefix.size() &&
+           text.compare(0, prefix.size(), prefix) == 0;
+}
+
+constexpr bool starts_with(std::wstring_view text, std::wstring_view prefix) {
+    return text.size() >= prefix.size() &&
+           text.compare(0, prefix.size(), prefix) == 0;
+}
 
 std::string machine_guid();
 std::string machine_uuid();

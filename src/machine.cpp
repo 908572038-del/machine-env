@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -19,13 +20,16 @@
 #include <cstring>
 #include <cwctype>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <iomanip>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -33,7 +37,7 @@ namespace machine_env {
 namespace {
 
 namespace fs = std::filesystem;
-constexpr char kServerVersion[] = "0.3.2";
+constexpr char kServerVersion[] = "0.4.0";
 constexpr int kDefaultTtl = 24 * 60 * 60;
 constexpr int kNetworkTtl = 10 * 60;
 // Installing a compiler or a package manager and then being told it is not
@@ -186,8 +190,8 @@ ProcessResult run_process(const std::wstring& executable,
     if (!created) {
         if (job) CloseHandle(job);
         CloseHandle(read_pipe);
-        result.error = "CreateProcess failed with code " +
-                       std::to_string(GetLastError());
+        result.error =
+            std::format("CreateProcess failed with code {}", GetLastError());
         return result;
     }
 
@@ -292,25 +296,40 @@ bool read_app_exec_link(const std::wstring& path, std::wstring& entry_point) {
     CloseHandle(file);
     if (!ok) return false;
 
+    // Only the bytes the call reported are valid, so the span is that prefix
+    // rather than the whole buffer. Every read below goes through it, which is
+    // what keeps the payload walk inside the data instead of relying on each
+    // loop to remember the bound.
+    const std::span<const std::byte> payload{raw.data(),
+                                             std::min<std::size_t>(returned, raw.size())};
+
     // REPARSE_DATA_BUFFER: Tag(4) DataLength(2) Reserved(2), then the
     // FILE_EXEC_LINK payload -- Version(4) followed by four NUL-terminated wide
     // strings: package id, entry point, executable path, application name.
-    if (returned < 8 + 4 + 2) return false;
-    const std::uint32_t tag = *reinterpret_cast<const std::uint32_t*>(raw.data());
+    constexpr std::size_t kHeaderBytes = 8 + 4;
+    if (payload.size() < kHeaderBytes + 2) return false;
+    const std::uint32_t tag =
+        std::bit_cast<std::uint32_t>(std::array<std::byte, 4>{
+            payload[0], payload[1], payload[2], payload[3]});
     if (tag != IO_REPARSE_TAG_APPEXECLINK) return false;
 
-    std::size_t offset = 8 + 4;
-    std::vector<std::wstring> fields;
-    while (fields.size() < 4 && offset + 2 <= returned) {
-        const wchar_t* text = reinterpret_cast<const wchar_t*>(raw.data() + offset);
-        std::size_t length = 0;
-        while (offset + (length + 1) * 2 <= returned && text[length] != L'\0')
-            ++length;
-        fields.emplace_back(text, length);
-        offset += (length + 1) * 2;
+    // The payload is UTF-16, so it is read as one view over the reported bytes
+    // and split on NUL. The trailing odd byte is not part of any character.
+    const std::size_t units = (payload.size() - kHeaderBytes) / 2;
+    const std::wstring_view text{
+        reinterpret_cast<const wchar_t*>(payload.data() + kHeaderBytes), units};
+
+    std::array<std::wstring, 4> fields{};
+    std::size_t filled = 0;
+    std::size_t start = 0;
+    while (filled < fields.size() && start <= text.size()) {
+        const std::size_t end = text.find(L'\0', start);
+        if (end == std::wstring_view::npos) break;
+        fields[filled++] = text.substr(start, end - start);
+        start = end + 1;
     }
-    if (fields.size() < 2) return false;
-    entry_point = fields[1];
+    if (filled < 2) return false;
+    entry_point = std::move(fields[1]);
     return true;
 }
 
@@ -324,9 +343,14 @@ bool is_store_alias_stub(const std::wstring& path) {
     std::wstring entry_point;
     if (!read_app_exec_link(path, entry_point)) return true;
     // The redirector entry point belongs to the Store installer, not to an
-    // installation: it exists to offer a download.
-    for (const wchar_t* shim : {L"PythonRedirector", L"StoreRedirector"}) {
-        if (entry_point.find(shim) != std::wstring::npos) return true;
+    // installation: it exists to offer a download. The entry point is
+    // "<package>!<application>", so the application is what decides.
+    const std::wstring_view entry{entry_point};
+    const std::size_t bang = entry.find(L'!');
+    const std::wstring_view application =
+        bang == std::wstring_view::npos ? entry : entry.substr(bang + 1);
+    for (const std::wstring_view shim : {L"PythonRedirector", L"StoreRedirector"}) {
+        if (application == shim) return true;
     }
     return false;
 }
@@ -364,8 +388,8 @@ bool is_python_install_directory(const std::wstring& name) {
     std::wstring normalized = name;
     std::transform(normalized.begin(), normalized.end(), normalized.begin(),
                    [](wchar_t ch) { return std::towlower(ch); });
-    if (normalized.rfind(L"pythoncore", 0) == 0) return true;
-    if (normalized.rfind(L"python", 0) != 0 || normalized.size() <= 6)
+    if (starts_with(normalized, L"pythoncore")) return true;
+    if (!starts_with(normalized, L"python") || normalized.size() <= 6)
         return false;
     return std::iswdigit(normalized[6]) != 0;
 }
@@ -414,7 +438,7 @@ std::vector<fs::path> directories_by_newest(const fs::path& parent,
         std::error_code entry_error;
         if (!it->is_directory(entry_error)) continue;
         const std::wstring name = it->path().filename().wstring();
-        if (!prefix.empty() && name.rfind(prefix, 0) != 0) continue;
+        if (!prefix.empty() && !starts_with(name, prefix)) continue;
         found.push_back(it->path());
     }
     sort_newest_first(found);
@@ -777,7 +801,7 @@ std::string normalize_version(const std::string& raw) {
         "git version ", "cmake version ", "bsdtar ", "GNU bash, version ",
         "Python ", "tar (", "wget ", "curl ", "v"}};
     for (const auto& prefix : prefixes) {
-        if (value.rfind(prefix, 0) == 0) {
+        if (starts_with(value, prefix)) {
             value.erase(0, prefix.size());
             break;
         }
@@ -1049,7 +1073,7 @@ Json read_cache_entry(const std::string& kind, int ttl,
             return Json();
         }
         if (!ignore_expiry && now - cached_at > ttl) {
-            cache_read_failure = "expired (ttl " + std::to_string(ttl) + "s)";
+            cache_read_failure = std::format("expired (ttl {}s)", ttl);
             return Json();
         }
         cache_read_failure = "fresh";
@@ -1088,10 +1112,11 @@ bool write_cache_entry(const std::string& kind, const Json& payload,
     const std::string serialized = dump_json(entry);
 
     const fs::path destination = cache_file(kind);
+    // One name per write attempt, so two processes racing for the same entry
+    // never share a temporary file and one cannot truncate the other's.
     const fs::path temporary =
-        destination.wstring() + L"." + wide(std::to_string(GetCurrentProcessId()) +
-                                           "-" + std::to_string(GetTickCount64())) +
-        L".tmp";
+        destination.wstring() +
+        wide(std::format(".{}-{}.tmp", GetCurrentProcessId(), GetTickCount64()));
     {
         std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
         if (!stream || !stream.write(serialized.data(),
@@ -1103,8 +1128,8 @@ bool write_cache_entry(const std::string& kind, const Json& payload,
     }
     if (!MoveFileExW(temporary.c_str(), destination.c_str(),
                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        error = "cannot replace cache file (Windows error " +
-                std::to_string(GetLastError()) + ")";
+        error = std::format("cannot replace cache file (Windows error {})",
+                            GetLastError());
         fs::remove(temporary, ec);
         return false;
     }
@@ -1301,8 +1326,8 @@ Json probe_one_endpoint(const wchar_t* host) {
         result["status"] = static_cast<int>(status);
     } else {
         result["reason"] = network_failure_reason(error_code);
-        result["error"] = "HTTPS request failed (WinHTTP " +
-                          std::to_string(error_code) + ")";
+        result["error"] =
+            std::format("HTTPS request failed (WinHTTP {})", error_code);
     }
     return result;
 }
@@ -1344,9 +1369,7 @@ std::string machine_uuid() {
         hash ^= ch;
         hash *= 1099511628211ull;
     }
-    std::ostringstream output;
-    output << "m-" << std::hex << hash;
-    return output.str();
+    return std::format("m-{:x}", hash);
 }
 
 // An empty result means the running executable could not be read, so its
@@ -1370,9 +1393,7 @@ std::string source_fingerprint() {
         }
         // A partial read must not masquerade as a complete fingerprint.
         if (stream.bad()) return std::string();
-        std::ostringstream output;
-        output << kServerVersion << '-' << std::hex << hash;
-        return output.str();
+        return std::format("{}-{:x}", kServerVersion, hash);
     }();
     return fingerprint;
 }
@@ -1948,7 +1969,7 @@ Json probe_shell_capabilities(const ProcessResult& probe, bool measured) {
     std::string line;
     while (std::getline(lines, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (line.rfind("caps=", 0) == 0) {
+        if (starts_with(line, "caps=")) {
             answers = line.substr(5);
             break;
         }
@@ -2156,8 +2177,8 @@ Json probe_system(bool measure_syntax) {
     version.dwOSVersionInfoSize = sizeof(version);
     std::uint32_t build_number = 0;
     if (rtl_get_version && rtl_get_version(&version) == 0) {
-        os["version"] = std::to_string(version.dwMajorVersion) + "." +
-                        std::to_string(version.dwMinorVersion);
+        os["version"] =
+            std::format("{}.{}", version.dwMajorVersion, version.dwMinorVersion);
         build_number = version.dwBuildNumber;
         os["build"] = static_cast<int>(build_number);
     }
@@ -2169,7 +2190,7 @@ Json probe_system(bool measure_syntax) {
     // The registry ProductName still reports "Windows 10" on Windows 11, so the
     // build number (22000 and above) is authoritative for the marketing name.
     const std::string legacy_caption = "Windows 10";
-    if (build_number >= 22000 && caption.rfind(legacy_caption, 0) == 0)
+    if (build_number >= 22000 && starts_with(caption, legacy_caption))
         caption.replace(0, legacy_caption.size(), "Windows 11");
     os["caption"] = caption;
     SYSTEM_INFO info{};
@@ -2708,7 +2729,7 @@ Json cached_probe(const std::string& kind, bool refresh, int network_budget_ms,
     // wait. Everything else has exactly one shape per kind.
     const std::string attempt_key =
         (kind == "network" && network_budget_ms > 0)
-            ? kind + "#" + std::to_string(network_budget_ms)
+            ? std::format("{}#{}", kind, network_budget_ms)
             : cache_kind;
     std::shared_ptr<Attempt> attempt;
     bool probing_here = false;

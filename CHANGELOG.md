@@ -3,6 +3,41 @@
 Notable changes to machine-env-cpp. Versions follow the one in
 `project(... VERSION ...)` and in `kServerVersion`, which `--version` reports.
 
+## 0.4.0
+
+### Changed
+
+- The project is now C++20, and CMake requires it: `CMAKE_CXX_STANDARD 20` with
+  `CMAKE_CXX_STANDARD_REQUIRED ON`. There is no C++17 fallback, because two
+  spellings of the same code would mean one of them is never compiled and never
+  tested. A toolset without `<format>`, `<span>` or `<bit>` now fails to build
+  instead of silently taking a different path.
+- `/Zc:__cplusplus` is set for MSVC. Without it `__cplusplus` reports 199711L on
+  every toolset, so a feature test written in the source would answer about
+  C++98 and be wrong on a compiler that supports more.
+
+### Fixed
+
+- Reading an app execution alias no longer relies on pointer arithmetic over a
+  fixed buffer. The bytes the kernel reported are held in a `std::span` and every
+  read goes through it, the tag is read with `std::bit_cast` instead of a
+  `reinterpret_cast` to a misaligned `uint32_t*`, and the payload is split on NUL
+  through a `std::wstring_view` rather than by advancing an offset by hand.
+  Behaviour is unchanged -- the values it returns were checked field by field
+  against 0.3.2 -- but the bound now lives in one place instead of in each loop
+  condition.
+- The redirector test compares the application name rather than searching the
+  whole entry point. An entry point is `<package>!<application>`, so a package
+  whose name contained the shim would have matched before.
+
+### Internal
+
+- `starts_with` replaces six `rfind(..., 0) == 0` calls. `std::string_view` gains
+  it in C++23, not C++20, so it is one constexpr function in `machine.hpp` rather
+  than an index search written out at each site.
+- `std::format` replaces the `std::ostringstream` and `std::to_string`
+  concatenation used for machine identifiers, fingerprints, cache filenames,
+  Windows error messages and the synthesized application names in the self-test.
 ## 0.3.2
 
 ### Fixed

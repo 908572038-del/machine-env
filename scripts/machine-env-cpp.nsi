@@ -25,7 +25,7 @@ Unicode true
 !endif
 
 !define AppName "machine-env-cpp"
-!define AppVersion "0.3.2"
+!define AppVersion "0.4.0"
 !define UninstallKey "Software\Microsoft\Windows\CurrentVersion\Uninstall\machine-env-cpp"
 
 Name "${AppName}"
