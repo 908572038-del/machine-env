@@ -15,6 +15,10 @@ foreach ($required in @($InstallerScript, $ConfigScript, $RegistryScript)) {
 $BuildDirectory = Join-Path $Root 'build\installer-build'
 $StagedExe = Join-Path $BuildDirectory 'machine-env-cpp.exe'
 $DefaultExe = Join-Path $Root 'build\machine-env-cpp.exe'
+# CMake's Visual Studio generator writes into a per-configuration directory,
+# which is what a CI job gets from `cmake -A x64`. Accepting it here means the
+# installer can be built from the same build tree the ZIP came from.
+$ConfigExe = Join-Path $Root 'build\Release\machine-env-cpp.exe'
 $OutputDirectory = Join-Path $Root 'build\installer'
 $OutputFile = Join-Path $OutputDirectory 'machine-env-cpp-setup.exe'
 
@@ -29,14 +33,20 @@ if (-not $SkipBuild) {
 # default build output is the same artifact as the staged one. Falling back to
 # it keeps -SkipBuild meaning "do not compile" instead of "you must have run a
 # full installer build at least once".
-$SourceExe = $StagedExe
-if (-not (Test-Path -LiteralPath $SourceExe -PathType Leaf) -and
-    (Test-Path -LiteralPath $DefaultExe -PathType Leaf)) {
-    $SourceExe = $DefaultExe
-    Write-Host "Reusing the build output at $SourceExe" -ForegroundColor Yellow
+# The staged build is preferred, then the two layouts a plain build can leave.
+$SourceExe = $null
+foreach ($candidate in @($StagedExe, $DefaultExe, $ConfigExe)) {
+    if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+        $SourceExe = $candidate
+        break
+    }
 }
-if (-not (Test-Path -LiteralPath $SourceExe -PathType Leaf)) {
-    throw "No built server to package. Run scripts\build.ps1, or omit -SkipBuild to compile now. Looked for: $StagedExe and $DefaultExe"
+if (-not $SourceExe) {
+    throw ("No built server to package. Run scripts\build.ps1, or omit -SkipBuild to compile now. Looked for:`n  " +
+        (@($StagedExe, $DefaultExe, $ConfigExe) -join "`n  "))
+}
+if ($SourceExe -ne $StagedExe) {
+    Write-Host "Reusing the build output at $SourceExe" -ForegroundColor Yellow
 }
 
 $makensis = (Get-Command makensis -ErrorAction SilentlyContinue).Source

@@ -5,7 +5,14 @@ param(
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
 $BuildScript = Join-Path $PSScriptRoot 'build.ps1'
-$SourceServer = Join-Path $Root 'build\machine-env-cpp.exe'
+# Two layouts are legitimate. build.ps1 uses Ninja and writes build\ directly;
+# CMake's Visual Studio generator writes into a per-configuration subdirectory,
+# which is what a CI job gets from `cmake -A x64`. Looking in both keeps this
+# script usable from either without the caller having to copy files around.
+$SourceCandidates = @(
+    (Join-Path $Root 'build\machine-env-cpp.exe'),
+    (Join-Path $Root 'build\Release\machine-env-cpp.exe')
+)
 $OutputDirectory = Join-Path $Root 'build\release'
 $PackagePath = Join-Path $OutputDirectory 'machine-env-cpp-windows-x64.zip'
 $StageDirectory = Join-Path $OutputDirectory ".stage-$PID"
@@ -16,8 +23,12 @@ if (-not $SkipBuild) {
         throw "Native build failed with exit code $LASTEXITCODE"
     }
 }
-if (-not (Test-Path -LiteralPath $SourceServer -PathType Leaf)) {
-    throw "Native executable not found: $SourceServer"
+$SourceServer = $SourceCandidates | Where-Object {
+    Test-Path -LiteralPath $_ -PathType Leaf
+} | Select-Object -First 1
+if (-not $SourceServer) {
+    throw ("Native executable not found. Looked in:`n  " +
+        ($SourceCandidates -join "`n  "))
 }
 
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
