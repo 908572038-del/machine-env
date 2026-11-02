@@ -5,6 +5,56 @@ Notable changes to machine-env-cpp. Versions follow the one in
 generated header carries it to `--version` and the fingerprint, and
 `build-installer.ps1` passes it to NSIS.
 
+## 0.6.0
+
+Two tools instead of four, and both answer in the space the answer needs.
+
+The test a feature has to pass is not "is this faster than a shell command" --
+nothing here beats `Get-ItemProperty` on speed in a way that matters. It is "does
+asking a shell the same question bury the answer". Listing every executable on
+PATH costs 10,940 characters and 716 entries to answer what a dozen lines can
+say; that is the problem this serves.
+
+### Removed
+
+- `get_apps`. An installed-application inventory is ~178 registry rows, and the
+  one command that produces them is shorter than the tool description.
+- `get_network`. HTTPS reachability is `curl -I` and two lines of output. This was
+  the only tool that made outbound requests, so the server now makes none.
+- Both are refused with `unknown tool` rather than answered from a stale
+  description a client may still hold.
+
+### Changed
+
+- `get_tools` answers one line per tool, name then absolute path:
+  `makensis C:\Program Files (x86)\NSIS\makensis.exe`. Measured on this machine:
+  983 characters before, 749 after. The saving is not the prefix and the capital
+  letters; it is the "not on PATH" label on six lines plus the 96-character
+  legend that explained it, all of which repeated what the absolute path already
+  said.
+- Absence is one line (`not installed: python`) instead of a list of 34 names.
+- A missing reason is given only for a tool the caller named. Printing all six
+  reasons made the first "compact" version 1065 bytes against the 983 it
+  replaced: a shorter format that grew.
+- `get_system` answers five facts that change what a command looks like -- shell
+  and version, elevation, execution policy, code page, and tools that exist only
+  on this process's PATH. CPU model, memory, GPU and the OS build are gone from
+  the summary; they are free from any shell and pushed the answer out of sight.
+
+### Fixed
+
+- `python` was reported as installed on a machine that only had the Store's App
+  Execution Alias. `discover_python_executable` returned the alias as if it were
+  an interpreter, so `pip` was then aimed at nothing. The alias is skipped now,
+  and reported as a reason instead.
+- The Store-alias check itself could never fire: `fs::exists()` returns false for
+  an App Execution Alias with "The file cannot be accessed by the system". It
+  reads the reparse attribute with `GetFileAttributesW` now, and a self-test
+  asserts the two agree.
+- `paths.path_differs_note` returned mojibake. A file rewrite had transcoded the
+  Chinese literal through the ANSI code page. The field is gone: the structured
+  body carries `searched_path_source` and the summary puts it into words.
+
 ## 0.5.0
 
 An answer is only useful if the caller can act on it. These changes are about the

@@ -526,7 +526,9 @@ std::wstring discover_python_executable() {
     // pair of facts that together describe an interpreter nobody will run, and
     // that made the pip beside the *other* installation look mismatched.
     const std::wstring on_path = search_executable(L"python.exe");
-    if (!on_path.empty()) return on_path;
+    if (!on_path.empty() &&
+        on_path.find(L"\\Microsoft\\WindowsApps\\") == std::wstring::npos)
+        return on_path;
 
     const std::wstring local_app_data = environment_variable(L"LOCALAPPDATA");
     const std::wstring user_profile = environment_variable(L"USERPROFILE");
@@ -1770,16 +1772,23 @@ Json locate_tool(const std::string& name) {
 // there, the interpreter is not. It is looked for in the alias directory rather
 // than on PATH, because the process PATH that a tool lookup searches does not
 // necessarily contain it, and the absence being explained is exactly that.
+//
+// std::filesystem cannot answer this. An App Execution Alias fails fs::exists()
+// with "The file cannot be accessed by the system" and returns false, so the
+// check silently reported "no alias" for an alias that is plainly there.
+// GetFileAttributesW reads the reparse attribute itself, which is the question
+// being asked.
 bool python_alias_exists() {
     const std::wstring local = environment_variable(L"LOCALAPPDATA");
     if (local.empty()) return false;
-    std::error_code ec;
-    for (const wchar_t* name : {L"python.exe", L"python3.exe"})
-        if (fs::exists(fs::path(local) / L"Microsoft" / L"WindowsApps" / name,
-                       ec))
+    for (const wchar_t* name : {L"python.exe", L"python3.exe"}) {
+        const std::wstring alias =
+            (fs::path(local) / L"Microsoft" / L"WindowsApps" / name).wstring();
+        const DWORD attributes = GetFileAttributesW(alias.c_str());
+        if (attributes != INVALID_FILE_ATTRIBUTES &&
+            (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
             return true;
-        else
-            ec.clear();
+    }
     return false;
 }
 
@@ -2559,9 +2568,10 @@ Json probe_system(bool measure_syntax) {
             paths[field.first] = field.second;
         // A caller reading path_entries is reading the registry copy; the probe
         // itself searched the process copy, so which one each answer came from
-        // has to be stated rather than inferred.
-        paths["path_differs_note"] =
-            "宸ュ叿鎺㈡祴浣跨敤杩涚▼ PATH锛沺ath_entries 鏉ヨ嚜绯荤粺 PATH";
+        // is stated rather than inferred. Kept as a field of its own rather than
+        // a sentence: the structured body carries facts, and the summary is
+        // where they are put into words.
+        paths["searched_path_source"] = "process";
     }
     for (const auto& entry : path_directories(path)) {
         if (is_existing_directory(entry))

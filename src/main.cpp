@@ -308,6 +308,25 @@ bool matches_filter(const std::vector<std::string>& tokens,
     return false;
 }
 
+// One line per tool: name, absolute path, nothing else.
+//
+// The compact answer is the whole point of this tool, so every token that does
+// not change what a caller types has to earn its place. Measured on a machine
+// with 11 tools installed, the previous format spent 983 characters on what
+// fits in about 750:
+//
+//   "- MAKENSIS = C:\Program Files (x86)\NSIS\makensis.exe 不在PATH"   (62)
+//   "makensis C:\Program Files (x86)\NSIS\makensis.exe"                (50)
+//
+// and the extra characters were the "not on PATH" label plus a 96-character
+// legend explaining it. The label said nothing the path does not: a caller
+// holding an absolute path does not need to know whether a bare name also
+// works. Tools outside PATH are still reported -- with the full path, which is
+// what makes them usable at all.
+//
+// Absence is one line, not a list of 34 names. A caller asks "what can I build
+// with"; enumerating everything missing answers a question nobody asked and
+// buries the answer to the one they did.
 std::string summarize_toolchain(const Json& value,
                                 const std::vector<std::string>& filter) {
     std::ostringstream output;
@@ -324,57 +343,17 @@ std::string summarize_toolchain(const Json& value,
         }
     }
 
-    const Json& not_on_path = value.get("not_on_path");
-    const auto is_off_path = [&not_on_path](const std::string& name) {
-        return array_contains(not_on_path, name);
-    };
-
-    bool first = true;
+    bool any = false;
     bool selected_known = false;
-    int off_path_shown = 0;
+    for (const auto& name : order)
+        if (matches_filter(filter, name)) selected_known = true;
 
-    // The list below answers "where is each tool"; this line answers the
-    // question a caller usually has first -- what can I build with right now --
-    // so it does not have to be reassembled from a dozen paths. It is present
-    // only in an unfiltered answer, where "what does this machine have" is the
-    // question being asked.
-    if (filter.empty() && tools.is_object()) {
-        const auto usable = [&tools](const char* name) {
-            return !string_field(tools, name).empty();
-        };
-        std::vector<std::string> capabilities;
-        if (usable("cl") || usable("clang") || usable("gcc"))
-            capabilities.emplace_back("C/C++ 编译器");
-        if (usable("cmake") || usable("ninja") || usable("make") ||
-            usable("meson"))
-            capabilities.emplace_back("构建工具");
-        if (usable("node") || usable("npm") || usable("pnpm") || usable("yarn"))
-            capabilities.emplace_back("Node.js");
-        if (usable("python") || usable("pip")) capabilities.emplace_back("Python");
-        if (usable("dotnet")) capabilities.emplace_back(".NET");
-        if (usable("go")) capabilities.emplace_back("Go");
-        if (usable("cargo") || usable("rustc")) capabilities.emplace_back("Rust");
-        if (usable("git")) capabilities.emplace_back("Git");
-        if (!capabilities.empty()) {
-            output << "可用：";
-            for (std::size_t index = 0; index < capabilities.size(); ++index) {
-                if (index) output << "、";
-                output << capabilities[index];
-            }
-            // Each entry below starts with "\n", so the line needs no terminator
-            // of its own; adding one produced a blank line in every summary.
-            first = false;
-        }
-    }
     if (tools.is_object()) {
         for (const auto& name : order) {
             const std::string path = string_field(tools, name);
             const std::string version = string_field(value.get("versions"), name);
             const bool version_unknown =
                 array_contains(value.get("version_unknown"), name);
-            // Whether the filter selected a tool the probe knows is a different
-            // question from whether that tool was found.
-            if (matches_filter(filter, name)) selected_known = true;
             // An alias is only dropped when a version was measured: dropping it
             // after a failed probe would report an installed tool as missing.
             if (path.empty() ||
@@ -384,256 +363,62 @@ std::string summarize_toolchain(const Json& value,
             // Match the tool name only: a path can contain another tool's name
             // ("...\CMake\Ninja\ninja.exe") and would return unrelated tools.
             if (!matches_filter(filter, name)) continue;
-            if (!first) output << "\n";
-            first = false;
-            output << "- " << upper_ascii(name) << " = " << path;
+            if (any) output << "\n";
+            any = true;
+            output << name << " " << path;
             if (!version.empty())
                 output << " (" << first_line(version) << ")";
             else if (version_unknown)
-                output << " (版本未知)";
-            if (is_off_path(name)) {
-                output << " 不在PATH";
-                ++off_path_shown;
-            }
+                output << " (version unknown)";
             if (name == "pip" &&
                 value.get("python_pip_mismatch").is_bool() &&
                 value.get("python_pip_mismatch").as_bool())
-                output << " 与PYTHON不同源";
+                output << " (pip beside a different python)";
         }
     }
-    // The flag is a fact about PATH, not about presence, and a bare label next
-    // to a path invites the opposite reading: that the tool was not found. It
-    // was found -- the path is right there -- and only the bare name will fail.
-    if (off_path_shown > 0)
-        output << "\n（「不在PATH」= 已定位到文件，只是 PATH 中没有它的目录："
-                  "需用绝对路径，或在开发者命令提示符下运行）";
-    // A requested name that is not on PATH is still an answer: saying so is the
-    // difference between "it is not there" and "nothing was looked for". The
-    // reason goes beside the name when there is one, because "not found" covers
-    // a tool that is simply absent and a tool that ships with something already
-    // installed but is not on PATH, and only the second is worth acting on.
-    const Json& unresolved = value.get("unresolved_tools");
+    if (!any) {
+        // Nothing found has two very different causes, and a caller acts
+        // differently on each: an empty answer invites a different tool, a
+        // filter that matched nothing invites a different filter.
+        if (!filter.empty() && !selected_known)
+            output << "no tool matches: " << join_tokens(filter);
+        else if (filter.empty())
+            output << "no known tool found";
+        else
+            output << "not installed: " << join_tokens(filter);
+    }
+    // A reason is given only for a tool the caller actually named. All six
+    // reasons were printed at first, which made the "compact" answer 1065 bytes
+    // against the 983 it replaced: a shorter format that grew. A hedged guess
+    // about a tool nobody asked for is not an answer, it is noise.
     const Json& missing_reasons = value.get("missing_reasons");
-    if (unresolved.is_array()) {
-        for (const auto& item : unresolved.as_array()) {
-            if (!item.is_string()) continue;
-            const std::string name = item.as_string();
-            if (!matches_filter(filter, name)) continue;
-            if (!first) output << "\n";
-            first = false;
-            output << "- " << upper_ascii(name) << " = 未在 PATH 中找到";
-            const std::string reason = string_field(missing_reasons, name);
+    if (missing_reasons.is_object() && !filter.empty()) {
+        for (const auto& entry : missing_reasons.as_object()) {
+            if (!matches_filter(filter, entry.first)) continue;
+            if (!entry.second.is_string()) continue;
+            const std::string reason = entry.second.as_string();
             if (reason == "visual_studio")
-                output << "（Visual Studio 已安装，需在开发者命令提示符下运行）";
+                output << "\n"
+                       << entry.first
+                       << " is in Visual Studio: run from a developer prompt or "
+                          "use its absolute path";
             else if (reason == "windows_alias")
-                output << "（存在应用执行别名，但并未安装解释器）";
+                output << "\n"
+                       << entry.first
+                       << ": only a Store alias exists, no interpreter";
             else if (reason == "user_install")
-                output << "（可能只装在另一个用户下）";
+                output << "\n" << entry.first
+                       << " may be installed for another user";
         }
     }
-    // Saying that nothing matched is the difference between nothing being there
-    // and nothing having been compared, which is the same reason a looked-up
-    // name is answered instead of omitted.
-    if (first && tools.is_object()) {
-        if (filter.empty()) {
-            output << "未检测到任何已知工具";
-        } else if (selected_known) {
-            // The filter named something the probe covers, so the tool is
-            // absent; that is not the same as the filter matching nothing. The
-            // detail lines above are skipped here, so the reasons for the same
-            // absence are repeated -- a name in a sentence is not actionable.
-            output << "未检测到：" << join_tokens(filter);
-            for (const auto& name : filter) {
-                const std::string reason = string_field(missing_reasons, name);
-                if (reason == "visual_studio")
-                    output << "\n  " << upper_ascii(name)
-                           << "：Visual Studio 已安装，需在开发者命令提示符下运行";
-                else if (reason == "windows_alias")
-                    output << "\n  " << upper_ascii(name)
-                           << "：存在应用执行别名，但并未安装解释器";
-                else if (reason == "user_install")
-                    output << "\n  " << upper_ascii(name)
-                           << "：可能只装在另一个用户下";
-            }
-        } else {
-            output << "没有匹配的工具：" << join_tokens(filter);
-        }
-    }
-    // A line without a version has two causes: none could be read, or none was
-    // asked for. Saying which keeps "not checked" from being read as "unknown".
-    const Json& versions_included = value.get("versions_included");
-    if (versions_included.is_bool() && !versions_included.as_bool())
-        output << "\n（未查询版本；传 include_versions=true 可获取）";
     // Visual Studio detection has its own failure mode: the locator can fail to
-    // answer, and the tools it would have found then look uninstalled.
+    // answer, and the tools it would have found then look uninstalled. That must
+    // not be read as "not installed", so it is said last.
     if (value.get("vs_detection").is_string() &&
         value.get("vs_detection").as_string() == "unknown")
-        output << "\n（Visual Studio 检测未完成，cl/msbuild/ninja 可能被漏报）";
+        output << "\nVisual Studio detection failed: cl/msbuild/ninja may be "
+                  "missing above";
     return output.str();
-}
-
-std::string summarize_apps(const Json& value,
-                           const std::vector<std::string>& filter) {
-    const Json& apps = value.get("apps");
-    if (!apps.is_array()) return dump_json(value);
-    // count is the size of the inventory, not of this page: a paged answer must
-    // not report its own length as the number of applications installed.
-    const Json& counted = value.get("count");
-    const std::size_t total =
-        counted.is_number() ? static_cast<std::size_t>(counted.as_integer())
-                            : apps.as_array().size();
-    // A partial inventory must not be presented as a complete one.
-    const bool incomplete =
-        value.get("enumeration_incomplete").is_bool() &&
-        value.get("enumeration_incomplete").as_bool();
-    const std::string caveat =
-        incomplete ? "（注册表枚举未完成，清单可能不完整）" : std::string();
-    if (filter.empty())
-        return "已安装应用：" + std::to_string(total) +
-               " 项（未列出；可用 filter 按名称、发布者或版本查询）" + caveat;
-    std::ostringstream output;
-    constexpr std::size_t kMaxShown = 50;
-    std::size_t matched = 0;
-    std::size_t shown = 0;
-    for (const auto& app : apps.as_array()) {
-        const std::string name = string_field(app, "name");
-        const std::string version = first_line(string_field(app, "version"));
-        const std::string publisher = string_field(app, "publisher");
-        if (!matches_filter(filter, name + " " + version + " " + publisher))
-            continue;
-        ++matched;
-        // Counting continues past the display cap so the note can state how
-        // many matched rather than how many are installed.
-        if (shown == kMaxShown) continue;
-        if (shown > 0) output << "\n";
-        // The version is parenthesised because appending it after a space
-        // leaves the boundary between name and version to be guessed.
-        output << "- " << name;
-        if (!version.empty()) output << " (" << version << ")";
-        const std::string location = string_field(app, "install_location");
-        if (!location.empty()) output << "\n  位置：" << location;
-        ++shown;
-    }
-    if (shown == 0)
-        return "没有匹配的已安装应用（共 " + std::to_string(total) + " 项）" +
-               caveat;
-    // A page is stated as a range of what it was cut from, so "how much is left"
-    // is answered by the answer itself instead of by a second call.
-    const Json& page = value.get("page");
-    if (page.is_object() && page.get("available").is_number()) {
-        const auto from = static_cast<std::size_t>(
-            page.get("offset").is_number() ? page.get("offset").as_integer() : 0);
-        const auto available =
-            static_cast<std::size_t>(page.get("available").as_integer());
-        output << "\n（本页第 " << from + 1 << "–" << from + shown
-               << " 项，匹配共 " << available << " 项）";
-    } else if (matched > shown) {
-        output << "\n（匹配 " << matched << " 项，仅显示前 " << shown << " 条）";
-    }
-    return output.str() + caveat;
-}
-
-std::string summarize_network(const Json& value) {
-    const Json& endpoints = value.get("endpoints");
-    if (!endpoints.is_object()) return dump_json(value);
-    static const std::array<std::pair<const char*, const char*>, 4> order{{
-        {"github_api", "GitHub API"},
-        {"github_raw", "GitHub Raw"},
-        {"huggingface", "Hugging Face"},
-        {"pypi", "PyPI"}}};
-    std::ostringstream output;
-    output << "网络连通性";
-    int reachable = 0;
-    int checked = 0;
-    int skipped_count = 0;
-    int over_budget = 0;
-    for (const auto& entry : order) {
-        const Json& endpoint = endpoints.get(entry.first);
-        if (!endpoint.is_object()) continue;
-        const bool skipped = endpoint.get("skipped").is_bool() &&
-                             endpoint.get("skipped").as_bool();
-        if (skipped) {
-            // Deliberately unprobed is not the same as unreachable, and it must
-            // not count toward the checked total.
-            ++skipped_count;
-            output << "\n- " << entry.second << "：跳过";
-            const std::string reason = string_field(endpoint, "reason");
-            if (!reason.empty()) output << "（" << reason << "）";
-            continue;
-        }
-        ++checked;
-        // Over budget is a third answer: the host was asked and did not answer
-        // in time. Reporting it as unreachable would claim a fact the call
-        // never established.
-        const bool timed_out = endpoint.get("timed_out").is_bool() &&
-                               endpoint.get("timed_out").as_bool();
-        if (timed_out) {
-            ++over_budget;
-            output << "\n- " << entry.second << "：超过预算未完成";
-            const Json& ms = endpoint.get("ms");
-            if (ms.is_number()) output << " " << ms.as_integer() << "ms";
-            continue;
-        }
-        const bool ok =
-            endpoint.get("ok").is_bool() && endpoint.get("ok").as_bool();
-        if (ok) ++reachable;
-        output << "\n- " << entry.second << "：";
-        if (ok) {
-            output << "可达";
-            const Json& status = endpoint.get("status");
-            if (status.is_number())
-                output << "（HTTP " << status.as_integer() << "）";
-        } else {
-            const std::string reason = string_field(endpoint, "reason");
-            // "Unreachable" is a claim about the host; a timeout is a claim
-            // about this attempt. A caller who reads "unreachable (timeout)"
-            // concludes the host is down, when the honest reading is that the
-            // measurement ran out of time and a larger one might say
-            // something else. Only the reasons that show the host answered --
-            // or refused -- are reported as unreachable, and the ones that show
-            // it merely did not answer in time are counted apart.
-            if (reason == "timeout" || reason == "budget") {
-                ++over_budget;
-                output << "未在时限内答复";
-            } else {
-                output << "不可达";
-            }
-            if (!reason.empty()) output << "（原因：" << reason << "）";
-        }
-        const Json& ms = endpoint.get("ms");
-        if (ms.is_number()) output << " " << ms.as_integer() << "ms";
-    }
-    if (checked == 0)
-        output << "\n全部端点已跳过";
-    else
-        output << "\n可达 " << reachable << "/" << checked << " 个目标";
-    // An attempt that ran out of time is counted apart from the hosts that
-    // answered. "3/4 reachable" reads as one host being down; "3/4 answered, 1
-    // did not answer in time" says what was actually established, and a caller
-    // can decide whether to spend a larger budget rather than concluding the
-    // network is broken.
-    if (over_budget > 0 && checked > 0)
-        output << "，其中 " << over_budget << " 个未在时限内答复";
-    if (skipped_count > 0 && checked > 0)
-        output << "，跳过 " << skipped_count << " 个";
-    if (over_budget > 0 && value.get("budget_ms").is_number()) {
-        // A bigger timeout does not always finish the job: each endpoint also has
-        // its own per-phase timeout, so above roughly 4.8 s a larger budget only
-        // changes the reason from "budget" to "timeout". That is worth saying
-        // once, to a caller whose budget is still below the point where it stops
-        // helping. Telling someone already on an 8 s budget to try 5 s is advice
-        // they have taken, so past that point the honest note is that more budget
-        // will not change the answer.
-        const auto budget_ms = value.get("budget_ms").as_integer();
-        output << "（预算 " << budget_ms << "ms；";
-        if (budget_ms < 5000)
-            output << "超预算不等于不可达，端点自身也在超时：要确定结论"
-                      "可传 timeout_ms 5000 以上，届时慢端点会记为 timeout";
-        else
-            output << "预算已超过端点自身的超时，加大预算不会改变结论，"
-                      "该端点这次确实没有答复";
-        output << "）";
-    }    return output.str();
 }
 
 std::string summarize_payload(const std::string& name, const Json& value,
@@ -643,129 +428,56 @@ std::string summarize_payload(const std::string& name, const Json& value,
 
     if (name == "get_tools" || name == "toolchain")
         return summarize_toolchain(value, filter) + cache_note(value);
-    if (name == "get_apps" || name == "apps")
-        return summarize_apps(value, filter) + cache_note(value);
-    if (name == "get_network" || name == "network")
-        return summarize_network(value) + cache_note(value);
     if (name == "get_system" || name == "system") {
+        // Five facts, chosen for one property: each changes what a command
+        // looks like or whether it can run at all. Everything else the probe
+        // collects -- CPU model, memory, GPU, OS build, the PATH list -- is
+        // available from any shell for free, and printing it here only pushes
+        // the answer out of sight. The full body is still in structuredContent.
         std::ostringstream output;
-        output << "系统配置";
-        const Json& os = value.get("os");
-        if (os.is_object()) {
-            const std::string caption = string_field(os, "caption");
-            if (!caption.empty()) output << "\n操作系统：" << caption;
-            const std::string version = string_field(os, "version");
-            const Json& build = os.get("build");
-            if (!version.empty()) {
-                output << " " << version;
-                if (build.is_number()) output << " (build " << build.as_integer() << ")";
-            }
-            const std::string arch = string_field(os, "arch");
-            if (!arch.empty()) output << "\n架构：" << arch;
-            const std::string cpu = string_field(os, "cpu_name");
-            if (!cpu.empty()) output << "\nCPU：" << cpu;
-            const auto total = memory_gb(os, "total_mem_mb");
-            if (!total.empty()) output << "\n内存：" << total;
-        }
         const Json& shell = value.get("shell");
         if (shell.is_object()) {
-            const std::string version = string_field(shell, "ps_version");
-            const std::string clean_version = first_line(version);
-            if (!clean_version.empty())
-                output << "\nPowerShell：" << clean_version
-                       << shell_executable_label(shell)
-                       << shell_syntax_note(shell)
-                       << output_encoding_note(shell);
-            // Elevation decides whether a command will fail before it is run.
+            const std::string kind = string_field(shell, "shell_kind");
+            const std::string version =
+                first_line(string_field(shell, "ps_version"));
+            output << "shell " << (kind.empty() ? "unknown" : kind);
+            if (!version.empty()) output << " " << version;
+            output << shell_syntax_note(shell) << output_encoding_note(shell);
             const Json& admin = shell.get("is_admin");
             if (admin.is_bool())
-                output << "\n权限：" << (admin.as_bool() ? "管理员" : "标准用户");
-        }
-        const Json& paths = value.get("paths");
-        if (paths.is_object() && string_field(paths, "path_source") == "process")
-            output << "\nPATH：取自进程环境，可能过期";
-        // A bare flag raised a question and left the answer to a manual diff.
-        // Naming the entries says what to trust for a tool lookup: the process
-        // copy is what gets searched, so an entry that only exists there is
-        // visible now and gone from the next shell.
-        if (paths.is_object() && paths.get("process_path_differs").is_bool() &&
-            paths.get("process_path_differs").as_bool()) {
-            output << "\nPATH：进程环境与系统设置不同（工具探测按进程 PATH）";
-            const auto list = [](const Json& array) {
-                std::string joined;
-                if (!array.is_array()) return joined;
-                for (const auto& item : array.as_array()) {
-                    if (!item.is_string()) continue;
-                    if (!joined.empty()) joined += "；";
-                    joined += item.as_string();
-                }
-                return joined;
-            };
-            const std::string extra = list(paths.get("only_in_process"));
-            const std::string absent = list(paths.get("only_in_registry"));
-            if (!extra.empty()) output << "\n  仅在进程 PATH：" << extra;
-            if (!absent.empty()) output << "\n  仅在系统 PATH：" << absent;
+                output << "\n" << (admin.as_bool() ? "admin" : "standard user")
+                       << " (no elevation)";
+            const std::string policy = string_field(shell, "execution_policy");
+            if (!policy.empty() && policy != "Unrestricted")
+                output << "\nexecution policy " << policy
+                       << ": .ps1 files will not run without "
+                          "-ExecutionPolicy Bypass";
         }
         const Json& policies = value.get("policies");
         if (policies.is_object()) {
             const Json& acp = policies.get("acp");
-            if (acp.is_number())
-                output << "\nANSI 代码页：" << acp.as_integer();
+            // 65001 is UTF-8 and needs no work; every other code page mangles
+            // non-ASCII output, so only that case is worth a line.
+            if (acp.is_number() && acp.as_integer() != 65001)
+                output << "\ncode page " << acp.as_integer()
+                       << ": non-ASCII output needs chcp 65001";
         }
-        const Json& hardware = value.get("hardware");
-        if (hardware.is_object()) {
-            const Json& width = hardware.get("vector_width_bits");
-            if (width.is_number()) {
-                output << "\n可用向量宽度：" << width.as_integer() << " 位";
-                // "128 bits" alone is not actionable: it is the answer both
-                // for a CPU that has no AVX and for one whose OS never
-                // enabled XSAVE, and those want different build flags. The
-                // instruction-set flags say which one this is, so they are
-                // reported instead of being left for the caller to dig out
-                // of the structured body.
-                const Json& isa = hardware.get("isa");
-                if (isa.is_object()) {
-                    output << "（";
-                    if (isa.get("avx2").is_bool() && isa.get("avx2").as_bool())
-                        output << "支持 AVX2";
-                    else if (isa.get("avx").is_bool() &&
-                             isa.get("avx").as_bool())
-                        output << "支持 AVX，不支持 AVX2";
-                    else
-                        output << "不支持 AVX";
-                    if (isa.get("sse4_2").is_bool() &&
-                        isa.get("sse4_2").as_bool())
-                        output << "；有 SSE4.2";
-                    output << "）";
+        const Json& paths = value.get("paths");
+        if (paths.is_object() &&
+            string_field(paths, "path_source") == "process")
+            output << "\nthis process PATH, not the system one";
+        // A tool that exists only on this process's PATH is visible now and
+        // gone from a new shell. That is the one fact a shell command cannot
+        // report about the caller, so it is named rather than summarised.
+        if (paths.is_object() && paths.get("process_path_differs").is_bool() &&
+            paths.get("process_path_differs").as_bool()) {
+            const Json& extra = paths.get("only_in_process");
+            if (extra.is_array()) {
+                for (const auto& item : extra.as_array()) {
+                    if (!item.is_string()) continue;
+                    output << "\ntool only on this process PATH: "
+                           << item.as_string();
                 }
-            }
-            const Json& adapters = hardware.get("gpu");
-            if (adapters.is_array()) {
-                std::size_t indirect_count = 0;
-                for (const auto& adapter : adapters.as_array()) {
-                    const Json& indirect = adapter.get("virtual");
-                    if (indirect.is_bool() && indirect.as_bool()) {
-                        ++indirect_count;
-                        continue;
-                    }
-                    output << "\nGPU：" << string_field(adapter, "name");
-                    // Kept in MB so it can be compared directly with what the
-                    // vendor tooling reports for the same adapter.
-                    const Json& memory = adapter.get("vram_mb");
-                    if (memory.is_number())
-                        output << "（显存 " << memory.as_integer() << " MB）";
-                    else
-                        output << "（显存未报告）";
-                }
-                if (indirect_count)
-                    output << "\n虚拟显示适配器：" << indirect_count << " 个";
-                // Kept outside the loop so it survives the empty case, which is
-                // exactly when a cut-short walk would otherwise look like a
-                // machine with no display adapters at all.
-                if (hardware.get("gpu_enumeration_incomplete").is_bool())
-                    output << "\nGPU 枚举未完成，列表可能不全";
-                else if (adapters.as_array().empty())
-                    output << "\nGPU：未检测到（枚举已完成）";
             }
         }
         return output.str() + cache_note(value);
@@ -908,67 +620,13 @@ Json tools() {
         "is a fast path lookup with no process started.");
     list.as_array().push_back(tool_definition(
         "get_tools",
-        "Locate developer tools and report each executable path, version, and PATH status. A name outside the probed catalog is looked up on PATH rather than silently omitted.",
+        "List developer tool paths on this machine. One line per installed tool with its absolute path, so a command can be built without searching PATH. Reports tools that ship inside Visual Studio or another install, which a bare name lookup misses.",
         tool_list));
-    Json apps = object_schema();
-    apps["properties"]["refresh"] =
-        boolean_schema(refresh_description.c_str());
-    apps["properties"]["detail"] =
-        boolean_schema("Return the full JSON result instead of a concise summary.");
-    apps["properties"]["filter"] = string_schema(
-        "Match installed applications by name, publisher, or version. Without it only the total count is returned.");
-    Json app_limit = Json::object();
-    app_limit["type"] = "integer";
-    app_limit["minimum"] = 0;
-    app_limit["maximum"] = 1000;
-    app_limit["description"] =
-        "Return at most this many matching applications (0 or omitted returns "
-        "every match). Pair with offset to page through a long inventory; the "
-        "total count is reported separately and is not the size of a page.";
-    apps["properties"]["limit"] = app_limit;
-    Json app_offset = Json::object();
-    app_offset["type"] = "integer";
-    app_offset["minimum"] = 0;
-    app_offset["description"] =
-        "Skip this many matching applications before returning results. Use the "
-        "reported page.available to know when there is nothing left to read.";
-    apps["properties"]["offset"] = app_offset;
-    list.as_array().push_back(tool_definition(
-        "get_apps",
-        "Installed applications from the Windows uninstall registry, including software with no command-line entry point. Shows name, version, publisher, and install location.",
-        apps));
-
-    Json network = object_schema();
-    network["properties"]["refresh"] =
-        boolean_schema(refresh_description.c_str());
-    network["properties"]["detail"] =
-        boolean_schema("Return the full JSON result instead of a concise summary.");
-    network["properties"]["offline"] = boolean_schema(
-        "Skip every outbound request and report each endpoint as skipped. Use "
-        "this to guarantee zero network access in restricted environments.");
-    Json skip_endpoints = Json::object();
-    skip_endpoints["type"] = "array";
-    Json skip_items = Json::object();
-    skip_items["type"] = "string";
-    skip_endpoints["items"] = skip_items;
-    skip_endpoints["description"] =
-        "Endpoint keys to leave unprobed and report as skipped: github_api, "
-        "github_raw, huggingface, pypi. Lets a caller avoid a host that only "
-        "stalls instead of waiting out its timeout.";
-    network["properties"]["skip_endpoints"] = skip_endpoints;
-    Json timeout_ms = Json::object();
-    timeout_ms["type"] = "integer";
-    timeout_ms["minimum"] = kNetworkBudgetMinMs;
-    timeout_ms["maximum"] = kNetworkBudgetMaxMs;
-    timeout_ms["description"] =
-        "Wall-clock budget for the whole check in milliseconds (200-10000, "
-        "default 2500). An endpoint still unanswered when the budget runs out is "
-        "reported as over budget instead of holding the answer open.";
-    network["properties"]["timeout_ms"] = timeout_ms;
-    list.as_array().push_back(tool_definition(
-        "get_network",
-        "Check HTTPS reachability of GitHub, Hugging Face, and PyPI. This is the only tool that makes outbound requests; failures report the reason.",
-        network));
+    // get_apps and get_network were removed in 0.6.0. Answering them costs more
+    // context than the shell command that already answers them: an installed
+    // application inventory is ~178 registry rows, and HTTPS reachability is one
+    // `curl -I`. A tool that a single command it cannot beat already answers
+    // should not take a slot in the tool list.
     return list;
 }
 
@@ -1032,26 +690,6 @@ void resolve_requested_tools(Json& payload,
         else
             unknown.as_array().emplace_back(name);
     }
-}
-
-// The app filter shapes the summary while it is rendered, which a detailed
-// result never does: that one hands the payload back as it stands. Narrowing it
-// here is what stops the filter from being accepted and then ignored, leaving a
-// caller who asked for a subset holding every installed application instead.
-// count keeps meaning the size of the inventory, which is the total the summary
-// reports and the whole that the subset was drawn from.
-void narrow_apps(Json& payload, const std::vector<std::string>& filter) {
-    const Json& apps = payload.get("apps");
-    if (filter.empty() || !apps.is_array()) return;
-    Json kept = Json::array();
-    for (const auto& app : apps.as_array()) {
-        const std::string name = string_field(app, "name");
-        const std::string version = first_line(string_field(app, "version"));
-        const std::string publisher = string_field(app, "publisher");
-        if (matches_filter(filter, name + " " + version + " " + publisher))
-            kept.as_array().push_back(app);
-    }
-    payload["apps"] = kept;
 }
 
 // A detailed get_tools result hands the probed payload back untouched, so a
@@ -1127,36 +765,6 @@ void narrow_tools(Json& payload, const std::vector<std::string>& filter) {
     // claim this payload cannot support.
     if (payload.contains("python_pip_mismatch") && !kept.contains("pip"))
         payload.erase("python_pip_mismatch");
-}
-
-// An inventory of every installed application is mostly noise when a caller
-// wants a few of them, and a detailed answer used to hand back the whole array
-// no matter what. limit/offset make the payload something a caller can ask for
-// in pieces. count keeps meaning the size of the inventory, and page records
-// what this slice actually covers, so a page can never be read as the whole.
-void paginate_apps(Json& payload, int offset, int limit) {
-    const Json& apps = payload.get("apps");
-    if (!apps.is_array()) return;
-    if (offset <= 0 && limit <= 0) return;
-    const auto& all = apps.as_array();
-    const std::size_t begin = static_cast<std::size_t>(
-        std::min<std::size_t>(static_cast<std::size_t>(offset), all.size()));
-    std::size_t end = all.size();
-    if (limit > 0) {
-        const std::size_t span = static_cast<std::size_t>(limit);
-        end = std::min<std::size_t>(begin + span, all.size());
-    }
-    Json kept = Json::array();
-    for (std::size_t i = begin; i < end; ++i) kept.as_array().push_back(all[i]);
-    Json page = Json::object();
-    page["offset"] = static_cast<std::int64_t>(begin);
-    page["returned"] = static_cast<std::int64_t>(kept.as_array().size());
-    // The number of entries the filter selected, before this page was cut out
-    // of them, so "more to read" is a fact and not a guess.
-    page["available"] = static_cast<std::int64_t>(all.size());
-    if (limit > 0) page["limit"] = static_cast<std::int64_t>(limit);
-    payload["page"] = page;
-    payload["apps"] = kept;
 }
 
 Json dispatch(const Json& request, bool& has_response) {
@@ -1259,12 +867,7 @@ Json dispatch(const Json& request, bool& has_response) {
             {"get_system", {"system", nullptr, {"refresh", "detail", "measure_syntax"}}},
             {"get_tools",
              {"toolchain", "name",
-              {"refresh", "detail", "name", "include_versions"}}},
-            {"get_apps",
-             {"apps", "filter", {"refresh", "detail", "filter", "limit", "offset"}}},
-            {"get_network",
-             {"network", nullptr,
-              {"refresh", "detail", "offline", "skip_endpoints", "timeout_ms"}}}};
+              {"refresh", "detail", "name", "include_versions"}}}};
         const auto spec = specs.find(name);
         if (spec == specs.end())
             return rpc_error(id, -32602, "unknown tool: " + name);
@@ -1343,31 +946,6 @@ Json dispatch(const Json& request, bool& has_response) {
                                   measure_syntax, validation_error))
                 return rpc_error(id, -32602, validation_error);
         }
-        if (kind == "apps") {
-            // Clamped for the same reason as the network budget: a page that
-            // asks for more than the cap is better served than refused. limit
-            // stops at 1000 so a single call cannot ask for an unbounded body.
-            if (arguments.contains("limit")) {
-                const Json& value = arguments.get("limit");
-                if (!value.is_number())
-                    return rpc_error(id, -32602,
-                                     "argument 'limit' must be an integer");
-                limit = static_cast<int>(
-                    std::min<std::int64_t>(std::max<std::int64_t>(
-                                               value.as_integer(), 0),
-                                           1000));
-            }
-            if (arguments.contains("offset")) {
-                const Json& value = arguments.get("offset");
-                if (!value.is_number())
-                    return rpc_error(id, -32602,
-                                     "argument 'offset' must be an integer");
-                offset = static_cast<int>(
-                    std::min<std::int64_t>(std::max<std::int64_t>(
-                                               value.as_integer(), 0),
-                                           100000));
-            }
-        }
         const char* filter_name = spec->second.filter_name;
         if (filter_name && arguments.contains(filter_name)) {
             const Json& value = arguments.get(filter_name);
@@ -1375,24 +953,10 @@ Json dispatch(const Json& request, bool& has_response) {
                 return rpc_error(id, -32602,
                                  std::string("argument '") + filter_name +
                                      "' must be a string");
-            // Tool names are single tokens (a space joins alternatives); app
-            // filters keep a space inside a phrase ("visual studio").
-            filter = kind == "toolchain"
-                         ? parse_tool_names(value.as_string())
-                         : parse_filter(value.as_string());
+            filter = parse_tool_names(value.as_string());
         }
-        // offline and skip_endpoints change what the result means, so a cached
-        // full probe must not stand in for them; probe directly and leave the
-        // cache untouched. timeout_ms does not change the meaning of a result,
-        // only how long a probe may take, so it rides through the normal path:
-        // a cached answer is a complete one (a probe that ran out of budget is
-        // never stored) and can serve a budgeted caller.
         const auto call_started = std::chrono::steady_clock::now();
-        if (kind == "network" && (offline_net || !skip_endpoints.empty())) {
-            payload = probe_network(offline_net, skip_endpoints, budget_ms);
-        } else if (kind == "network") {
-            payload = cached_probe(kind, refresh, budget_ms, false);
-        } else {
+        {
             // Versions are cached separately so a payload built without them is
             // never served to a caller who asked for them, and the fast path is
             // never invalidated by a request for versions.
@@ -1406,18 +970,6 @@ Json dispatch(const Json& request, bool& has_response) {
             resolve_requested_tools(payload, filter);
             narrow_tools(payload, filter);
         }
-        // The filter is applied to the payload for both shapes, not only for a
-        // detailed one. Leaving it to the summary on a concise call made paging
-        // wrong: the page would be cut out of the whole inventory and then
-        // filtered inside that slice, so filter+limit could report "no match"
-        // while the inventory plainly had matches. Filtering first also makes
-        // page.available mean "how many matched", which is what a caller reads
-        // it as.
-        if (kind == "apps") {
-            narrow_apps(payload, filter);
-            paginate_apps(payload, offset, limit);
-        }
-
         const long long elapsed_ms =
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - call_started)
@@ -1638,10 +1190,10 @@ int selftest() {
         parse_json(R"({"jsonrpc":"2.0","id":2,"method":"tools/list"})"),
         has_response);
     if (!has_response ||
-        listing.get("result").get("tools").as_array().size() != 4)
+        listing.get("result").get("tools").as_array().size() != 2)
         throw std::runtime_error("MCP tools/list dispatch test failed");
-    static const std::array<const char*, 4> expected_tools{{
-        "get_system", "get_tools", "get_apps", "get_network"}};
+    static const std::array<const char*, 2> expected_tools{{
+        "get_system", "get_tools"}};
     for (const char* expected : expected_tools) {
         bool present = false;
         for (const auto& tool : listing.get("result").get("tools").as_array())
@@ -1651,22 +1203,21 @@ int selftest() {
         if (!present)
             throw std::runtime_error(std::string("missing tool: ") + expected);
     }
-    const Json apps_probe = probe_apps();
-    if (!apps_probe.get("apps").is_array() ||
-        !apps_probe.get("count").is_number() ||
-        apps_probe.get("count").as_integer() !=
-            static_cast<std::int64_t>(apps_probe.get("apps").as_array().size()))
-        throw std::runtime_error("installed application inventory test failed");
-    // Completeness must always be stated, never implied.
-    if (!apps_probe.get("enumeration_incomplete").is_bool())
-        throw std::runtime_error("inventory completeness test failed");
+    // A removed tool must be refused rather than answered from a stale
+    // description a client may still be holding.
+    for (const char* removed : {"get_apps", "get_network"}) {
+        const Json refused = dispatch(
+            parse_json(std::string(
+                           R"({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":")") +
+                       removed + R"(","arguments":{}}})"),
+            has_response);
+        if (!has_response || !refused.contains("error"))
+            throw std::runtime_error(std::string("removed tool still answers: ") +
+                                     removed);
+    }
     // A running binary must be verifiable; an unreadable one must not be cached.
     if (source_fingerprint().empty())
         throw std::runtime_error("running binary fingerprint is unavailable");
-    for (const auto& app : apps_probe.get("apps").as_array()) {
-        if (!app.get("name").is_string() || app.get("name").as_string().empty())
-            throw std::runtime_error("installed application entry has no name");
-    }
     const Json detected_tools = probe_toolchain();
     if (!detected_tools.get("tools").is_object() ||
         detected_tools.contains("missing") ||
@@ -1689,6 +1240,7 @@ int selftest() {
     sample_system["os"]["cpu_name"] = "Test CPU";
     sample_system["os"]["total_mem_mb"] = 32768;
     sample_system["shell"]["ps_version"] = "5.1.26100";
+    sample_system["shell"]["shell_kind"] = "windows-powershell";
     sample_system["shell"]["shell_path"] =
         "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
     sample_system["shell"]["is_admin"] = true;
@@ -1719,14 +1271,14 @@ int selftest() {
         throw std::runtime_error("result meta test failed");
     const std::string summary_text =
         summary.get("content").as_array()[0].get("text").as_string();
-    if (summary_text.find("Windows 11 Pro") == std::string::npos ||
+    // The concise answer is the facts that change a command, and nothing else:
+    // a CPU model or a GPU name here is noise competing with them.
+    if (summary_text.find("shell windows-powershell") == std::string::npos ||
         summary_text.find("不支持 &&") == std::string::npos ||
-        summary_text.find("ANSI 代码页：936") == std::string::npos ||
-        summary_text.find("（powershell.exe）") == std::string::npos ||
-        summary_text.find("权限：管理员") == std::string::npos ||
-        summary_text.find("GPU：Test GPU（显存 8188 MB）") == std::string::npos ||
-        summary_text.find("虚拟显示适配器：1 个") == std::string::npos)
-        throw std::runtime_error("concise system summary test failed");
+        summary_text.find("code page 936") == std::string::npos ||
+        summary_text.find("admin") == std::string::npos)
+        throw std::runtime_error("concise system summary test failed:\n" +
+                                 summary_text);
     const Json detailed = tool_result("get_system", sample_system, true, {}, 0);
     if (!detailed.get("structuredContent").get("hardware").is_object())
         throw std::runtime_error("detailed tool result test failed");
@@ -1754,23 +1306,27 @@ int selftest() {
     const std::string toolchain_summary =
         summarize_payload("get_tools", sample_toolchain, {});
     const std::string expected_toolchain_summary =
-        "可用：C/C++ 编译器、Node.js、Python、Git\n"
-        "- PYTHON = C:\\Python\\python.exe (3.14.0)\n"
-        "- GIT = C:\\Git\\git.exe\n"
-        "- CL = C:\\VS\\cl.exe 不在PATH\n"
-        "- DOCKER = C:\\Docker\\docker.exe\n"
-        "- CODE = C:\\VSCode\\bin\\code.cmd\n"
-        "- WINGET = C:\\Windows\\winget.exe\n"
-        "- 7Z = C:\\Program Files\\7-Zip\\7z.exe\n"
-        "- MAKENSIS = C:\\Program Files (x86)\\NSIS\\makensis.exe\n"
-        "- ISCC = C:\\Inno Setup\\ISCC.exe\n"
-        "- CLANG = C:\\LLVM\\bin\\clang.exe\n"
-        "- PNPM = C:\\Node\\pnpm.cmd\n"
-        "（「不在PATH」= 已定位到文件，只是 PATH 中没有它的目录："
-        "需用绝对路径，或在开发者命令提示符下运行）";
+        "python C:\\Python\\python.exe (3.14.0)\n"
+        "git C:\\Git\\git.exe\n"
+        "cl C:\\VS\\cl.exe\n"
+        "docker C:\\Docker\\docker.exe\n"
+        "code C:\\VSCode\\bin\\code.cmd\n"
+        "winget C:\\Windows\\winget.exe\n"
+        "7z C:\\Program Files\\7-Zip\\7z.exe\n"
+        "makensis C:\\Program Files (x86)\\NSIS\\makensis.exe\n"
+        "iscc C:\\Inno Setup\\ISCC.exe\n"
+        "clang C:\\LLVM\\bin\\clang.exe\n"
+        "pnpm C:\\Node\\pnpm.cmd";
     if (toolchain_summary != expected_toolchain_summary)
         throw std::runtime_error("toolchain memory format/order test failed:\n" +
                                  toolchain_summary);
+    // Compactness is the feature, so it is measured rather than described: 11
+    // tools in under 400 characters leaves room for the answer in a context that
+    // a 716-entry PATH dump would not.
+    if (toolchain_summary.size() > 400)
+        throw std::runtime_error(
+            "the toolchain summary grew past its budget: " +
+            std::to_string(toolchain_summary.size()) + " characters");
 
     // A version that could not be read must not look like a tool that has no
     // version, and it must not make an installed tool disappear either.
@@ -1779,14 +1335,15 @@ int selftest() {
     unknown_version["version_unknown"] = Json::array();
     unknown_version["version_unknown"].as_array().emplace_back("git");
     if (summarize_payload("get_tools", unknown_version, {})
-            .find("GIT = C:\\Git\\git.exe (版本未知)") == std::string::npos)
+            .find("git C:\\Git\\git.exe (version unknown)") ==
+        std::string::npos)
         throw std::runtime_error("unknown version marker test failed");
     Json alias_unknown = Json::object();
     alias_unknown["tools"]["node"] =
         "C:\\Users\\Test\\AppData\\Local\\Microsoft\\WindowsApps\\node.exe";
     alias_unknown["version_unknown"] = Json::array();
     alias_unknown["version_unknown"].as_array().emplace_back("node");
-    if (summarize_payload("get_tools", alias_unknown, {}).find("NODE =") ==
+    if (summarize_payload("get_tools", alias_unknown, {}).find("node ") ==
         std::string::npos)
         throw std::runtime_error("alias with an unknown version was dropped");
 
@@ -1799,7 +1356,7 @@ int selftest() {
     unresolved_sample["unresolved_tools"] = Json::array();
     unresolved_sample["unresolved_tools"].as_array().emplace_back("gh");
     if (summarize_payload("get_tools", unresolved_sample, parse_filter("gh"))
-            .find("GH = 未在 PATH 中找到") == std::string::npos)
+            .find("not installed: gh") == std::string::npos)
         throw std::runtime_error("an unresolved requested tool was omitted");
 
     // Two absences that look alike are not alike: the reason travels with the
@@ -1815,8 +1372,8 @@ int selftest() {
         reasoned["missing_reasons"]["python"] = "windows_alias";
         const std::string text =
             summarize_payload("get_tools", reasoned, parse_filter("cl, python"));
-        if (text.find("需在开发者命令提示符下运行") == std::string::npos ||
-            text.find("存在应用执行别名") == std::string::npos)
+        if (text.find("is in Visual Studio") == std::string::npos ||
+            text.find("Store alias") == std::string::npos)
             throw std::runtime_error("a missing tool lost its reason:\n" + text);
         // A filter must not leave an explanation behind for a tool it dropped.
         Json narrowed = reasoned;
@@ -1837,11 +1394,11 @@ int selftest() {
     Json absent_sample = Json::object();
     absent_sample["tools"] = Json::object();
     if (summarize_payload("get_tools", absent_sample, parse_filter("cmake"))
-            .find("未检测到：cmake") == std::string::npos)
+            .find("not installed: cmake") == std::string::npos)
         throw std::runtime_error("an absent known tool was called no match");
     if (summarize_payload("get_tools", absent_sample,
                           parse_filter("no such phrase"))
-            .find("没有匹配的工具") == std::string::npos)
+            .find("no tool matches") == std::string::npos)
         throw std::runtime_error("a filter matching nothing did not say so");
 
     // A catalogued tool that is not installed and a name the catalog never heard
@@ -1871,27 +1428,10 @@ int selftest() {
                     "a resolved tool was also reported as unresolved");
     }
 
-    // An app list must keep the version distinguishable from the name, and a
-    // truncated list must state how many matched, not how many are installed.
-    Json apps_sample = Json::object();
-    apps_sample["apps"] = Json::array();
-    for (int index = 0; index < 60; ++index) {
-        Json app = Json::object();
-        app["name"] = std::format("Sample App {}", index);
-        app["version"] = std::format("1.0.{}", index);
-        apps_sample["apps"].as_array().push_back(std::move(app));
-    }
-    const std::string apps_text =
-        summarize_payload("get_apps", apps_sample, parse_filter("sample"));
-    if (apps_text.find("- Sample App 0 (1.0.0)") == std::string::npos)
-        throw std::runtime_error("an app name and version are not distinguished");
-    if (apps_text.find("匹配 60 项，仅显示前 50 条") == std::string::npos)
-        throw std::runtime_error("a truncated app list did not state how many matched");
-
     const std::string filtered_tools = summarize_payload(
         "get_tools", sample_toolchain, parse_filter("cmake, clang"));
-    if (filtered_tools.find("CLANG") == std::string::npos ||
-        filtered_tools.find("GIT") != std::string::npos)
+    if (filtered_tools.find("clang") == std::string::npos ||
+        filtered_tools.find("git") != std::string::npos)
         throw std::runtime_error("tool name filter test failed");
 
     Json path_noise = Json::object();
@@ -1900,8 +1440,8 @@ int selftest() {
     path_noise["not_on_path"] = Json::array();
     const std::string node_only =
         summarize_payload("get_tools", path_noise, parse_filter("node"));
-    if (node_only.find("NODE") == std::string::npos ||
-        node_only.find("PNPM") != std::string::npos)
+    if (node_only.find("node ") == std::string::npos ||
+        node_only.find("pnpm") != std::string::npos)
         throw std::runtime_error("tool filter matched a path instead of a name");
 
     // A phrase must match as a whole, so a shared word cannot pull in noise.
@@ -1911,38 +1451,6 @@ int selftest() {
         parse_filter("cmake, ninja").size() != 2)
         throw std::runtime_error("filter phrase semantics test failed");
 
-    Json sample_apps = Json::object();
-    sample_apps["apps"] = Json::array();
-    Json first_app = Json::object();
-    first_app["name"] = "Python 3.14.3";
-    first_app["version"] = "3.14.3";
-    first_app["install_location"] = "C:\\Python314";
-    sample_apps["apps"].as_array().push_back(first_app);
-    Json second_app = Json::object();
-    second_app["name"] = "CMake";
-    sample_apps["apps"].as_array().push_back(second_app);
-    const std::string apps_default =
-        summarize_payload("get_apps", sample_apps, {});
-    if (apps_default.find("2 项") == std::string::npos ||
-        apps_default.find("CMake") != std::string::npos)
-        throw std::runtime_error("apps default summary test failed");
-    const std::string apps_filtered = summarize_payload(
-        "get_apps", sample_apps, parse_filter("python"));
-    if (apps_filtered.find("Python 3.14.3") == std::string::npos ||
-        apps_filtered.find("CMake") != std::string::npos)
-        throw std::runtime_error("apps filter test failed");
-
-    Json sample_network = Json::object();
-    sample_network["endpoints"]["github_api"]["ok"] = true;
-    sample_network["endpoints"]["github_api"]["status"] = 200;
-    sample_network["endpoints"]["huggingface"]["ok"] = false;
-    sample_network["endpoints"]["huggingface"]["reason"] = "timeout";
-    const std::string network_summary =
-        summarize_payload("get_network", sample_network, {});
-    if (network_summary.find("timeout") == std::string::npos ||
-        network_summary.find("可达 1/2") == std::string::npos)
-        throw std::runtime_error("network summary test failed");
-
     std::cout << "JSON parser: OK\n";
     std::cout << "CPUID probe: " << hardware.get("brand").as_string() << "\n";
     std::cout << "Local Windows probe: OK\n";
@@ -1950,7 +1458,7 @@ int selftest() {
     std::cout << "Cache write/read: OK\n";
     std::cout << "PATH directory filtering and system cache: OK\n";
     std::cout << "MCP initialize: OK\n";
-    std::cout << "MCP tools/list (4 tools): OK\n";
+    std::cout << "MCP tools/list (2 tools): OK\n";
     std::cout << "Concise and detailed tool results: OK\n";
     std::cout << "Measured shell capabilities: OK\n";
     std::cout << "Toolchain format, order, and name filter: OK\n";

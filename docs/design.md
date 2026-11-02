@@ -2,11 +2,10 @@
 
 [Back to the README](../README.md)
 
-The tool inventories are cached for an hour and the application inventory for 24
-hours: an inventory that outlives the install it was taken before is the failure
-mode of a long TTL, and locating tools without running them costs well under a
-second, so the shorter window is affordable. System facts and network state are
-cached for 10 minutes. Cache files live under the current
+The tool inventory is cached for an hour: an inventory that outlives the install
+it was taken before is the failure mode of a long TTL, and locating tools without
+running them costs well under a second, so the shorter window is affordable.
+System facts are cached for 10 minutes. Cache files live under the current
 user's `%LOCALAPPDATA%\machine-env\cache`; writes are atomic and protected by a
 named Windows mutex. Entries are invalidated when the server executable
 changes — an entry records the binary's fingerprint, so an upgrade re-probes
@@ -69,20 +68,17 @@ A real probe is exactly `answer: "fresh"` with `stored: true`.
 
 Joining is why a burst of identical refreshes costs one probe rather than one per
 caller: measured on this machine, 100 concurrent `get_network` refreshes went from
-4430 ms at 521 threads to 1690 ms at 136. The patience a joiner gives a probe is
-its own budget, never the holder's speed, and a joiner that runs out of patience
-falls back to an older entry before it falls back to probing.
+4430 ms at 521 threads to 1690 ms at 136. (That tool was removed in 0.6.0, but the
+mechanism it measured is the one every probe still uses.) The patience a joiner
+gives a probe is its own budget, never the holder's speed, and a joiner that runs
+out of patience falls back to an older entry before it falls back to probing.
 
 The default call shape joins too, and there it is a saving in work rather than in
-time: 100 concurrent plain `get_network` calls used to be 100 network probes
+time: 100 concurrent probes of one kind used to be 100 real probes
 (`attempts=100 inflight_peak=100`) and are now one. Wall clock barely moves —
 2510 ms before, 2514 ms after — because that path is bounded by the probe's own
 budget, not by how many probes run. Anyone citing a latency number for joining
 should say which of the two they mean.
-
-A caller with a different `timeout_ms` does not join: the table is keyed by the
-question, not by the kind, so two callers asking for different network budgets
-never receive each other's partial answer.
 
 A ceiling on simultaneous probes of one kind exists as a backstop
 (`MACHINE_ENV_PROBE_CONCURRENCY`, 16 by default, `0` disables it). It is a bound
@@ -96,11 +92,9 @@ job object was unavailable and only the direct child could be terminated.
 
 Registry work is done once per question rather than once per lookup. A toolchain
 probe reads the PATH value from the registry a single time and answers every
-lookup from that snapshot (registry opens for one probe: 113 before, 3 now),
-while an application inventory opens each application's key once instead of once
-per field (667 before, 336 now — one per entry), which cut `get_apps` cold time by
-about a fifth. The snapshot lasts exactly one probe: nothing is cached across
-requests, so `refresh` still sees a PATH edited a moment ago.
+lookup from that snapshot (registry opens for one probe: 113 before, 3 now). The
+snapshot lasts exactly one probe: nothing is cached across requests, so `refresh`
+still sees a PATH edited a moment ago.
 
 Requests are read in 64 KB blocks instead of one byte at a time, which is what
 makes receiving a large message cheap (rejecting a 9 MB message went from ~330ms
@@ -112,33 +106,6 @@ ready". The 8 MiB limit still applies while reading: bytes past it are consumed
 and counted but never stored, so an oversized message is refused without being
 held in memory, and the next message on the stream is still read correctly.
 
-`get_network` uses HTTPS HEAD requests to GitHub, Hugging Face, and PyPI, and
-reports a reason such as `dns`, `connect`, `timeout`, or `tls` when a target is
-unreachable. The four hosts are checked concurrently, so the call costs the
-slowest endpoint rather than their sum. It is the only tool that opens a socket,
-so a local system probe can never cause an unexpected outbound request.
-
-A host blackholed at the resolver can stall past every per-phase WinHTTP
-timeout, which no timeout setting can bound. The call is therefore capped by a
-wall-clock budget: `timeout_ms` (200-10000, default 2500) is the deadline for the
-whole check, and an endpoint still unanswered at the deadline is reported as
-`timed_out` with `reason: "budget"` rather than being waited out. That is a third
-answer, distinct from unreachable: the host was asked and did not answer in time.
-`budget_ms` and `budget_exhausted` appear on the result so a partial answer is
-never mistaken for a complete one. A probe that ran out of budget is returned but
-never cached, so a timeout cannot be served as a fact for the next ten minutes.
-Pass a larger `timeout_ms` for a slow link; a cached answer is always a complete
-one, so a budgeted caller is still served from the cache. Raising the budget does
-not, however, turn an unreachable host into a reachable one — each endpoint carries
-its own WinHTTP timeouts, so past roughly 4.8 s the answer becomes `timed_out`
-instead of `budget_exhausted` without changing whether the host answers at all.
-
-`offline: true` skips every endpoint and reports each one as skipped without
-opening a socket; `skip_endpoints` names individual hosts (`github_api`,
-`github_raw`, `huggingface`, `pypi`) to leave unprobed. Both bypass the cache
-because they change what the result means, and both keep "deliberately not
-checked" distinct from "checked and unreachable".
-## Why the shell facts come from the registry
 
 Starting Windows PowerShell costs about 1.7 seconds on a low-power machine before
 it runs a single statement. The system probe used to pay that twice over: one

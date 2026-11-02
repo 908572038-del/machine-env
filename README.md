@@ -5,13 +5,23 @@
 [![license](https://img.shields.io/github/license/908572038-del/machine-env)](LICENSE)
 [![platform](https://img.shields.io/badge/platform-Windows%20x64-blue)](https://github.com/908572038-del/machine-env/releases/latest)
 
-A native Windows MCP server that tells coding agents what this machine actually
-has: CPU capabilities, installed developer tools, Windows and shell details,
-PATH, and optional network reachability. C++20, no runtime dependencies.
+A native Windows MCP server that answers two questions a coding agent cannot
+answer cheaply by asking a shell: **where is the compiler**, and **what will break
+this command**.
 
-It exists because an agent that guesses at a machine is wrong in ways nobody
-notices until a build fails. Everything it reports was measured on the machine it
-runs on, and every answer says how it was obtained.
+The first is not as obvious as it sounds. `cl.exe`, `ninja` and `msbuild` ship
+inside Visual Studio and are not on `PATH`, so `where cl` finds nothing on a
+machine with a complete C++ toolset installed. Listing everything on `PATH`
+instead costs 716 entries and 10,940 characters to answer what a dozen lines can
+say. This server probes the places a compiler actually lives and answers in
+about 750 characters.
+
+The second is what makes an answer usable: whether the shell is `cmd` or
+PowerShell, whether `&&` works, whether elevation is needed, whether the code
+page will mangle non-ASCII output, and whether a 5.1 execution policy will refuse
+to run a script at all.
+
+C++20, no runtime dependencies.
 
 ## Install
 
@@ -33,26 +43,37 @@ Other clients: `install-portable.ps1 -Client claude-desktop` (or `cursor`,
 
 | Tool | Answers |
 | --- | --- |
-| `get_system` | Windows, CPU (CPUID/XCR0), memory, GPU, shell, PATH, policies. Local only; never makes a network request |
-| `get_tools` | Where a developer tool is. `name` narrows it; a name outside the catalog is looked up on PATH |
-| `get_apps` | Installed applications from the uninstall registry, including software with no command line. `filter` selects; without it only the count is returned |
-| `get_network` | GitHub, Hugging Face and PyPI reachability. The only tool that goes outbound, and a failure says why |
+| `get_tools` | One line per developer tool: `cl C:\...\cl.exe`. Includes tools that ship inside Visual Studio or another install, which a bare name lookup misses. `name` narrows it |
+| `get_system` | The five facts that change how a command must be written: shell and version, elevation, execution policy, code page, and tools that exist only on this process's PATH |
 
-All four accept `refresh` to bypass the cache and `detail` for the full JSON.
+Both accept `refresh` to bypass the cache and `detail` for the full JSON.
+`get_system` also accepts `measure_syntax` to parse shell constructs instead of
+deriving their support from the version.
+
+There were four tools. `get_apps` and `get_network` were removed in 0.6.0: an
+installed-application inventory is shorter to ask the registry for than to
+describe here, and HTTPS reachability is `curl -I`. Answering them cost more
+context than the command it replaced. The server makes no outbound requests now.
 
 ## Reading an answer
+
+`get_tools` prints an absolute path for every tool it finds. A path is usable
+whether or not the tool is on `PATH`, so there is no "not on PATH" label: a
+caller holding the path does not need to know whether the bare name would also
+run. Absence is one line, not a list of everything missing.
 
 Two fields decide how much an answer is worth:
 
 - **`source`** on every capability: `measured` was observed by running a probe,
   `derived` follows from a version, `unknown` was not verified and must not be
   treated as support.
-- **`_cache`** on every result: whether the answer is fresh, how old it is, and
-  whether this call shared a probe another caller was already running.
+- **`_cache`** on every result: `answer` says where the data came from
+  (`fresh`/`cache`/`shared`/`stale`) and `question` says why that rather than a
+  new probe.
 
-A missing tool means missing, not "probably there". A path under `WindowsApps`
-that turns out to be a Store advert rather than an installed program is reported
-as missing, because that is what it is.
+A missing tool means missing, not "probably there". A `WindowsApps` entry that is
+a Store advert rather than an installed program is reported as missing, with the
+reason, because running it only opens a shop page.
 
 Shell syntax support (`&&`, here-strings, whether non-ASCII output survives a
 pipe) is `derived` from the shell version by default, because starting Windows
@@ -61,10 +82,10 @@ PowerShell costs about 1.7s and that is most of the probe. Pass
 
 ## Privacy
 
-Results contain the current user's profile paths and shell identity, and
-`get_network` discloses outbound connectivity to the hosts it checks. The raw
-Windows `MachineGuid` is never reported: `get_tools` identifies a machine with a
-derived id that answers "same machine or not" without naming the installation.
+Results contain the current user's profile paths and shell identity. The server
+makes no network request. The raw Windows `MachineGuid` is never reported:
+`get_tools` identifies a machine with a derived id that answers "same machine or
+not" without naming the installation.
 
 Windows only. It uses Win32, the registry, CPUID and WinHTTP.
 
